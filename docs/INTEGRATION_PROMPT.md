@@ -153,7 +153,10 @@ y cualquier dominio detectado que falte por autorizar.
 - El prompt asume que el **provisionamiento del cliente es externo** a este servicio (no hay
   `POST /api/v1/clients`): el agente solo toca la config del cliente existente vía `PUT`.
 - Si el proyecto necesita **modificar el cuerpo** de las respuestas (no solo headers), eso va
-  por scripting Lua del cliente (`scripting`), no por este prompt — evalúalo aparte.
+  por scripting Lua del cliente (`scripting`): el script recibe el cuerpo como string y devuelve
+  el transformado; tiene JSON nativo (`proxy.json_parse`/`json_stringify`), regex y webhooks
+  validados, con ejecución condicional por expresión. Recetas y límites en
+  `docs/LUA_SCRIPTING.md` — evalúalo aparte.
 - Para proyectos que consumen muchos subdominios de un mismo dominio, recuerda que la
   whitelist matchea por sufijo: basta `ejemplo.com` para `cdn1.ejemplo.com`, etc.
 - Rotación de `crypt_id` (`POST /api/v1/clients/rotate-id`) invalida las URLs públicas:

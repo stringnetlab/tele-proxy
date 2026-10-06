@@ -512,7 +512,9 @@ curl -X PUT "$API/clients/config" \
 ## Scripting Lua
 
 El script de un cliente transforma el **cuerpo** de la respuesta del upstream antes de servirla
-al cliente final. Referencia completa con recetas de mundo real (JSON, HTML, webhooks):
+al cliente final. Referencia completa con recetas de mundo real — JSON (redacción de claves,
+renombrado, filtros, webhooks), HTML (censar correos, inyectar/eliminar scripts, reescribir
+URLs), CSS, Markdown/TXT, y las alternativas para imágenes (binario no procesable en la VM):
 **`docs/LUA_SCRIPTING.md`**.
 
 Contrato: una función que recibe el cuerpo como string y devuelve el cuerpo transformado:
@@ -538,7 +540,7 @@ Expresión vacía = siempre.
 | Función | Descripción |
 |---|---|
 | `proxy.log(level, msg)` | Log estructurado (`info`, `warn`, `error`) hacia `tracing` |
-| `proxy.regex_replace(text, pattern, replacement, limit?)` | Sustitución regex con límite anti-ReDoS de 100 ms |
+| `proxy.regex_replace(text, pattern, replacement, limit?)` | Sustitución regex (sintaxis Rust: grupos `$1`, flags `(?i)`/`(?s)`) con límite anti-ReDoS de 100 ms |
 | `proxy.json_parse(cadena)` / `proxy.json_stringify(valor)` | JSON ⇄ tabla Lua (object ⇄ tabla, array ⇄ secuencia; `null` → `nil`, no sobrevive al round-trip) |
 | `proxy.http_request(url, method, body, timeout_ms)` | Webhook HTTP validado (mismo pipeline anti-SSRF que el proxy; sin redirects). Sticky: `SsrfBlocked`/`DomainNotWhitelisted` abortan la petición aunque se envuelva en `pcall` |
 
