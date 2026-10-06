@@ -511,25 +511,27 @@ curl -X PUT "$API/clients/config" \
 
 ## Scripting Lua
 
-El script de un cliente recibe la respuesta del upstream y puede transformar su cuerpo antes
-de servirla al cliente final.
+El script de un cliente transforma el **cuerpo** de la respuesta del upstream antes de servirla
+al cliente final. Referencia completa con recetas de mundo real (JSON, HTML, webhooks):
+**`docs/LUA_SCRIPTING.md`**.
+
+Contrato: una función que recibe el cuerpo como string y devuelve el cuerpo transformado:
 
 ```lua
--- Ejemplo: reescribir URLs en el HTML del origen
-function handle(req, res)
-  proxy.log("info", "procesando " .. req.url)
-
-  if res.status == 200 and res.headers["content-type"]:find("text/html") then
-    res.body = proxy.regex_replace(res.body, "http://", "https://", 1)
-  end
-
-  -- Webhook: sale por el mismo pipeline anti-SSRF (whitelist + DoT + pinning)
-  local r = proxy.http_request("https://api.example.com/hook", "POST", res.body, 3000)
-  proxy.log("info", "webhook status: " .. tostring(r.status))
-
-  return res
+-- Ejemplo: redactar claves internas y renombrar otras en un JSON
+function(body)
+  local data = proxy.json_parse(body)
+  data.internal_id = nil
+  data.user_name = data.userName
+  data.userName = nil
+  return proxy.json_stringify(data)
 end
 ```
+
+La ejecución es **condicional**: `scripting.expression` (mismo motor de expresiones que
+`header_rules`) decide si el script corre para cada respuesta — p. ej.
+`http.response.status eq 200 and starts_with(http.response.content_type, "application/json")`.
+Expresión vacía = siempre.
 
 ### API disponible en el sandbox
 
@@ -537,15 +539,17 @@ end
 |---|---|
 | `proxy.log(level, msg)` | Log estructurado (`info`, `warn`, `error`) hacia `tracing` |
 | `proxy.regex_replace(text, pattern, replacement, limit?)` | Sustitución regex con límite anti-ReDoS de 100 ms |
+| `proxy.json_parse(cadena)` / `proxy.json_stringify(valor)` | JSON ⇄ tabla Lua (object ⇄ tabla, array ⇄ secuencia; `null` → `nil`, no sobrevive al round-trip) |
 | `proxy.http_request(url, method, body, timeout_ms)` | Webhook HTTP validado (mismo pipeline anti-SSRF que el proxy; sin redirects). Sticky: `SsrfBlocked`/`DomainNotWhitelisted` abortan la petición aunque se envuelva en `pcall` |
 
 ### Garantías del sandbox
 
-- `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `load` están deshabilitados.
+- `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `load` están deshabilitados (no hay `require`).
 - Deadline **real** de ejecución: hook de interrupción por contador de instrucciones (un
   `while true do end` se aborta en <1 s con `script_timeout`), no una comprobación a posteriori.
 - Memoria limitada (`LUA_MEMORY_LIMIT_MB`, default 50 MB).
 - Los cuerpos que superan `max_scripting_body_bytes` no entran a la VM: se sirven sin transformar.
+- Cualquier error del script degrada al cuerpo original (nunca se rompe la respuesta al cliente).
 - El socket nunca se abre en el hilo de la VM: `proxy.http_request` puente a tokio vía
   `Handle::spawn` con su propio timeout.
 
@@ -702,6 +706,7 @@ degradan al body original en lugar de romper la respuesta.
 | `docs/spec.md` | Especificación técnica completa (arquitectura, fases, estado de la migración a Pingora) |
 | `docs/CLIENT_CONFIG.md` | Referencia de cada campo del documento de cliente |
 | `docs/HEADER_RULES.md` | Lenguaje de expresiones de `header_rules` (sintaxis Cloudflare, funciones, ejemplos) |
+| `docs/LUA_SCRIPTING.md` | Scripting Lua: contrato, API (JSON incluido), ejecución condicional y recetas de mundo real |
 | `docs/INTEGRATION_PROMPT.md` | Prompt listo para agentes de codificación que integren TeleProxy en un proyecto existente |
 | `docs/ENVIRONMENT.md` | Lista canónica de variables de entorno y validaciones |
 | `docs/ERROR_DICTIONARY.md` | Diccionario completo de códigos de error |

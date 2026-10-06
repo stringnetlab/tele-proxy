@@ -50,6 +50,10 @@ pub struct ScriptingConfig {
     pub code: String,
     #[serde(default)]
     pub code_hash: String,
+    /// Expresión del motor de reglas (`header_rules`): el script solo se ejecuta cuando la
+    /// respuesta la cumple. Vacía = siempre (compatibilidad con configs anteriores).
+    #[serde(default)]
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +150,7 @@ impl ClientConfig {
                 enabled: false,
                 code: String::new(),
                 code_hash: String::new(),
+                expression: String::new(),
             },
             error_handling: ErrorHandlingConfig {
                 mode: ErrorMode::Transparent,
@@ -194,6 +199,7 @@ pub struct ScriptingUpdate {
     pub enabled: Option<bool>,
     pub code: Option<String>,
     pub code_hash: Option<String>,
+    pub expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +250,7 @@ mod tests {
                 enabled: false,
                 code: String::new(),
                 code_hash: String::new(),
+                expression: String::new(),
             },
             error_handling: ErrorHandlingConfig {
                 mode: ErrorMode::Wrapped,

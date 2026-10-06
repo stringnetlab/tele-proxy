@@ -275,6 +275,21 @@ pub fn validate_config_update(update: &ClientConfigUpdate) -> Result<(), ProxyEr
         if let Some(code_hash) = &scripting.code_hash {
             validate_sha256_hash("scripting.code_hash", code_hash)?;
         }
+        if let Some(expression) = &scripting.expression {
+            if expression.len() > MAX_HEADER_RULE_EXPRESSION_BYTES {
+                return Err(invalid_config(
+                    "scripting.expression",
+                    format!(
+                        "expression has {} bytes, max {} allowed",
+                        expression.len(),
+                        MAX_HEADER_RULE_EXPRESSION_BYTES
+                    ),
+                ));
+            }
+            if let Err(reason) = header_rules::validate_expression(expression) {
+                return Err(invalid_config("scripting.expression", reason));
+            }
+        }
     }
 
     // `error_handling.mode` no se comprueba aquí: `ErrorMode` es un enum serde y un valor
@@ -692,6 +707,7 @@ mod tests {
                 enabled: Some(true),
                 code: Some("function handle(req, res) end".to_string()),
                 code_hash: Some(format!("sha256:{}", "ab".repeat(SHA256_HEX_BYTES / 2))),
+                expression: None,
             }),
             error_handling: None,
             header_rules: None,
@@ -813,6 +829,7 @@ mod tests {
                 enabled: Some(true),
                 code: Some("return body".to_string()),
                 code_hash: None,
+                expression: None,
             }),
             ..base_update()
         };
@@ -827,10 +844,45 @@ mod tests {
                 enabled: Some(false),
                 code: Some(String::new()),
                 code_hash: None,
+                expression: None,
             }),
             ..base_update()
         };
         assert!(validate_config_update(&cleared).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_update_validates_scripting_expression() {
+        let good = ClientConfigUpdate {
+            scripting: Some(ScriptingUpdate {
+                enabled: None,
+                code: None,
+                code_hash: None,
+                expression: Some(
+                    "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")"
+                        .to_string(),
+                ),
+            }),
+            ..base_update()
+        };
+        assert!(validate_config_update(&good).is_ok());
+
+        for expression in ["http.response.bogus eq 1", "len(200) eq 3"] {
+            let bad = ClientConfigUpdate {
+                scripting: Some(ScriptingUpdate {
+                    enabled: None,
+                    code: None,
+                    code_hash: None,
+                    expression: Some(expression.to_string()),
+                }),
+                ..base_update()
+            };
+            assert_eq!(
+                invalid_field(validate_config_update(&bad)),
+                "scripting.expression",
+                "{expression:?} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -846,6 +898,7 @@ mod tests {
                     enabled: None,
                     code: None,
                     code_hash: Some(hash.to_string()),
+                    expression: None,
                 }),
                 ..base_update()
             };
