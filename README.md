@@ -243,8 +243,27 @@ Headers relevantes de la respuesta:
 Las respuestas de error son JSON con códigos del diccionario (`docs/ERROR_DICTIONARY.md`):
 
 ```json
-{"error_code":"domain_not_whitelisted","message":"Domain not allowed for this client","status":403}
+{"error":"domain_not_whitelisted","message":"Domain not whitelisted: evil.com","url":"https://evil.com/x"}
 ```
+
+Con `MODO=desarrollo` los cuerpos de error son diagnósticos: los 5xx exponen el motivo interno
+completo y todos los errores incluyen un objeto `details` con los campos estructurados
+(`reason`, `domain`, `retry_after_secs`, …):
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Rate limit exceeded",
+  "details": {
+    "current_count": "51",
+    "max_requests": "50",
+    "retry_after_secs": "60"
+  }
+}
+```
+
+En cualquier otro modo los 5xx devuelven el mensaje escueto `Internal server error` y sin
+`details`:
 
 | Código | HTTP | Causa típica |
 |---|---|---|
@@ -533,6 +552,7 @@ Lista canónica en `docs/ENVIRONMENT.md`. Resumen:
 |---|---|---|
 | `RUST_LOG` | Filtro de logs (`EnvFilter`) | `warn,tele_proxy=info` |
 | `RUST_BACKTRACE` | Backtrace en pánico | `1` |
+| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`); cualquier otro valor o ausente → errores escuetos | escueto |
 
 ### Escucha HTTP
 
