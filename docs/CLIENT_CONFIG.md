@@ -89,6 +89,11 @@ TLD alfabético) o una IP pública. Se rechazan: `localhost`, `shutterstock.com:
 | `LUA_MEMORY_LIMIT_MB` | 50 | — | Límite de memoria del sandbox en MB |
 | `WEBHOOK_TIMEOUT_MS` | 5,000 | 1..=60,000 | Timeout para `proxy.http_request` desde Lua |
 
+**API del sandbox**: `proxy.log`, `proxy.regex_replace` (regex estilo Rust: grupos `$1`,
+flags `(?i)`/`(?s)`), `proxy.json_parse`/`proxy.json_stringify` (JSON ⇄ tabla Lua) y
+`proxy.http_request(url, method, body, timeout_ms)`. Recetas por tipo de contenido (JSON,
+HTML, CSS, Markdown, imágenes) en `docs/LUA_SCRIPTING.md`.
+
 **Webhooks desde Lua**: el script puede hacer peticiones HTTP externas vía `proxy.http_request(url, method, body, timeout_ms)`.
 Estas peticiones pasan por el mismo pipeline anti-SSRF que el proxy principal (whitelist del cliente,
 resolución DNS segura, rechazo de IPs privadas). Si el webhook excede el timeout, el script recibe

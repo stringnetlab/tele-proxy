@@ -917,6 +917,107 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&result), "esto no es json");
     }
 
+    /// Regresión de docs/LUA_SCRIPTING.md: las recetas del documento deben ejecutarse tal
+    /// cual en el sandbox (regex `$1`, flags `(?si)`, find literal, front-matter multilínea).
+    /// Si el motor cambia y el doc se queda viejo, este test lo detecta.
+    #[test]
+    fn test_recetas_del_documento_lua_scripting() {
+        let ctx = test_context();
+
+        // § 4.5: censar correos.
+        let censor = r#"
+            function(body)
+                body = proxy.regex_replace(body, "(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}", "[correo oculto]", 0)
+                return body
+            end
+        "#;
+        let result = engine()
+            .execute_sync(censor, b"contacto: ana.lucia@banco-pe.com fin", &ctx)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&result),
+            "contacto: [correo oculto] fin"
+        );
+
+        // § 4.7: eliminar scripts (el inline es multilínea: exige (?s)).
+        let strip = r#"
+            function(body)
+                body = proxy.regex_replace(body, "(?si)<script[^>]*>.*?</script>", "", 0)
+                body = proxy.regex_replace(body, "(?i)<script[^>]*/>", "", 0)
+                return body
+            end
+        "#;
+        let html = b"<html><head><script src=\"//tracker.com/x.js\"></script></head><body>ok<script>var a=1;\nvar b=2;</script></body></html>";
+        let result = engine().execute_sync(strip, html, &ctx).unwrap();
+        let out = String::from_utf8_lossy(&result);
+        assert!(!out.contains("tracker.com"), "{out}");
+        assert!(!out.contains("var a=1"), "{out}");
+        assert!(out.contains("<body>ok</body>"), "{out}");
+
+        // § 4.6: inyectar un script antes de </body>.
+        let inject = r#"
+            function(body)
+                local snippet = "<script src=\"https://mi-app.example.com/widget.js\" defer></script>"
+                if body:find("</body>", 1, true) then
+                    body = proxy.regex_replace(body, "</body>", snippet .. "</body>", 1)
+                else
+                    body = body .. snippet
+                end
+                return body
+            end
+        "#;
+        let result = engine()
+            .execute_sync(inject, b"<html><body>hi</body></html>", &ctx)
+            .unwrap();
+        let out = String::from_utf8_lossy(&result);
+        assert!(
+            out.contains(
+                "<script src=\"https://mi-app.example.com/widget.js\" defer></script></body>"
+            ),
+            "{out}"
+        );
+
+        // § 4.10: reescribir la URL de una imagen hacia el resizer (grupo $1).
+        let resize = r#"
+            function(body)
+                body = proxy.regex_replace(
+                    body,
+                    "https://cdn\\.ejemplo\\.com/([^\"')\\s]+\\.(?:jpg|jpeg|png|webp))",
+                    "https://images-weserv.ejemplo.com/?url=https://cdn.ejemplo.com/$1&w=400",
+                    0
+                )
+                return body
+            end
+        "#;
+        let result = engine()
+            .execute_sync(
+                resize,
+                b"<img src=\"https://cdn.ejemplo.com/fotos/a.jpg\">",
+                &ctx,
+            )
+            .unwrap();
+        let out = String::from_utf8_lossy(&result);
+        assert!(
+            out.contains(
+                "https://images-weserv.ejemplo.com/?url=https://cdn.ejemplo.com/fotos/a.jpg&w=400"
+            ),
+            "{out}"
+        );
+
+        // § 4.12: quitar front-matter multilínea.
+        let md = "---\ntitulo: doc\nversion: 3\n---\n# Hola\ncontenido\n";
+        let front_matter = r#"
+            function(body)
+                body = proxy.regex_replace(body, "(?s)\\A---\\n.*?\\n---\\n", "", 1)
+                return body
+            end
+        "#;
+        let result = engine()
+            .execute_sync(front_matter, md.as_bytes(), &ctx)
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&result), "# Hola\ncontenido\n");
+    }
+
     /// Regresión del P1: `proxy.http_request` era una `create_async_function` y mlua la rechazaba
     /// con `attempt to yield from outside a coroutine`, así que ningún script pudo llamarla nunca.
     #[tokio::test]
