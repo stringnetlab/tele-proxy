@@ -76,7 +76,8 @@ TLD alfabético) o una IP pública. Se rechazan: `localhost`, `shutterstock.com:
 | Campo | Rango / Tipo | Descripción |
 |---|---|---|
 | `enabled` | `bool` | Activa/desactiva la ejecución del script Lua para este cliente |
-| `code` | `string` | Código fuente Lua. Se ejecuta en un sandbox mlua (Lua 5.4) con deadline estricto |
+| `code` | `string` | Código fuente Lua. Se ejecuta en un sandbox mlua (Lua 5.4) con deadline estricto. Contrato: `function(body) ... return body_transformado end` — recibe el cuerpo como string y devuelve el transformado. Referencia y recetas: `docs/LUA_SCRIPTING.md` |
+| `expression` | `string` | Opcional, máx. 4.096 caracteres. Expresión del motor de reglas (la misma que `header_rules`): el script solo se ejecuta si la respuesta la cumple (p. ej. `http.response.status eq 200 and starts_with(http.response.content_type, "application/json")`). Vacía = siempre |
 | `code_hash` | `sha256:<64 hex>` | Hash SHA-256 del código. Obligatorio cuando `code` no está vacío |
 | `max_scripting_body_bytes` | 1,048,576..=52,428,800 | Límite de bytes del body que el script puede leer/escribir (1 MB – 50 MB) |
 
