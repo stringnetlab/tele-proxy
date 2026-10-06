@@ -33,6 +33,9 @@ struct AppConfig {
     /// `MODO=desarrollo`: errores HTTP verbosos con motivo interno y `details`. Cualquier otro
     /// valor (o ausente) mantiene los errores escuetos de producción.
     modo_desarrollo: bool,
+    /// User-Agent por defecto para las peticiones al origen cuando el cliente no envía el
+    /// suyo. Vacío = el User-Agent por defecto de reqwest.
+    upstream_user_agent: String,
 }
 
 impl AppConfig {
@@ -66,6 +69,7 @@ impl AppConfig {
             modo_desarrollo: std::env::var("MODO")
                 .map(|value| value.eq_ignore_ascii_case("desarrollo"))
                 .unwrap_or(false),
+            upstream_user_agent: env_var_or("UPSTREAM_USER_AGENT", "")?,
         })
     }
 }
@@ -222,7 +226,8 @@ async fn main() {
             lua_executor,
         )
         .with_degraded_mode(valkey_degraded)
-        .with_verbose_errors(config.modo_desarrollo),
+        .with_verbose_errors(config.modo_desarrollo)
+        .with_upstream_user_agent(config.upstream_user_agent),
     );
 
     let changes_listener = ChangesFeedListener::new(
