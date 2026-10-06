@@ -34,13 +34,21 @@ pub async fn proxy_handler(
     Query(query): Query<ProxyQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    // `MODO=desarrollo`: los errores de este handler llevan motivo interno y `details`.
+    let verbose = service.verbose_errors();
+    let api_err = |e: ProxyError| ApiError::detailed(e, verbose);
+
     if !validate_crypt_id(&crypt_id) {
-        return Err(ApiError::from(ProxyError::InvalidCryptId {
+        return Err(api_err(ProxyError::InvalidCryptId {
             reason: "Invalid format: must be 12 alphanumeric characters".to_string(),
         }));
     }
 
-    let config = service.config_fetcher().get_by_crypt_id(&crypt_id).await?;
+    let config = service
+        .config_fetcher()
+        .get_by_crypt_id(&crypt_id)
+        .await
+        .map_err(&api_err)?;
 
     let limit = service
         .cache_store()
@@ -52,18 +60,18 @@ pub async fn proxy_handler(
         .await;
 
     if !limit.allowed {
-        return Err(ApiError::from(ProxyError::RateLimitExceeded {
+        return Err(api_err(ProxyError::RateLimitExceeded {
             current_count: limit.current_count,
             max_requests: config.rate_limit.max_requests,
             retry_after_secs: limit.retry_after_secs,
         }));
     }
 
-    let url = validate_url_strict(&query.url)?;
-    let domain = extract_domain(&url)?;
+    let url = validate_url_strict(&query.url).map_err(&api_err)?;
+    let domain = extract_domain(&url).map_err(&api_err)?;
 
     if !domain_matches_whitelist(&domain, &config.whitelist) {
-        return Err(ApiError::from(ProxyError::DomainNotWhitelisted { domain }));
+        return Err(api_err(ProxyError::DomainNotWhitelisted { domain }));
     }
 
     // El limiter local (limit.degraded) también es degradación: la cuota aplicada es por
@@ -72,8 +80,14 @@ pub async fn proxy_handler(
 
     let cache_key = response_cache_key(&config.internal_id, config.config_version, &query.url);
 
-    if let Some(cached) = service.cache_store().get_response(&cache_key).await? {
-        let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)?;
+    if let Some(cached) = service
+        .cache_store()
+        .get_response(&cache_key)
+        .await
+        .map_err(&api_err)?
+    {
+        let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)
+            .map_err(&api_err)?;
         if degraded {
             resp.headers_mut()
                 .insert("X-Degraded-Mode", HeaderValue::from_static("true"));
@@ -89,7 +103,8 @@ pub async fn proxy_handler(
     let resolved_ip = service
         .dns_resolver()
         .resolve_and_validate(hostname)
-        .await?;
+        .await
+        .map_err(&api_err)?;
 
     // BDD Feature 5: the fallback MIME is taken from the explicit "?mime=" param when
     // present, otherwise inferred from the requested URL's file extension. Without the
@@ -115,7 +130,7 @@ pub async fn proxy_handler(
                 e,
             )
             .await
-            .map_err(ApiError::from);
+            .map_err(&api_err);
         }
     };
 
@@ -135,13 +150,15 @@ pub async fn proxy_handler(
             },
         )
         .await
-        .map_err(ApiError::from);
+        .map_err(&api_err);
     }
 
     let headers = upstream_response.headers().clone();
     // El tope se aplica durante el stream, no sobre el cuerpo ya bufferizado: un origen puede
     // anunciar un Content-Length pequeño y enviar mucho más.
-    let body_bytes = http_client::read_body_capped(upstream_response, MAX_RESPONSE_SIZE).await?;
+    let body_bytes = http_client::read_body_capped(upstream_response, MAX_RESPONSE_SIZE)
+        .await
+        .map_err(&api_err)?;
 
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -149,7 +166,9 @@ pub async fn proxy_handler(
         .unwrap_or("application/octet-stream");
 
     let body_bytes =
-        apply_lua_scripting(&service, &config, &url, query.mime.as_deref(), body_bytes).await?;
+        apply_lua_scripting(&service, &config, &url, query.mime.as_deref(), body_bytes)
+            .await
+            .map_err(&api_err)?;
 
     let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT;
     if cacheable {
@@ -225,7 +244,7 @@ pub async fn proxy_handler(
         response_headers,
         body_bytes,
     )
-    .map_err(ApiError::from)
+    .map_err(&api_err)
 }
 
 async fn apply_lua_scripting(

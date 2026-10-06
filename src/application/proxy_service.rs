@@ -9,6 +9,7 @@ pub struct ProxyService {
     dns_resolver: Arc<dyn DnsResolver>,
     lua_executor: Arc<dyn LuaExecutor>,
     degraded_mode: Arc<AtomicBool>,
+    verbose_errors: bool,
 }
 
 impl ProxyService {
@@ -24,12 +25,24 @@ impl ProxyService {
             dns_resolver,
             lua_executor,
             degraded_mode: Arc::new(AtomicBool::new(false)),
+            verbose_errors: false,
         }
     }
 
     pub fn with_degraded_mode(self, degraded: bool) -> Self {
         self.degraded_mode.store(degraded, Ordering::Relaxed);
         self
+    }
+
+    /// `MODO=desarrollo`: los errores HTTP (`ApiError`) exponen el motivo interno completo y
+    /// los campos estructurados en `details`. Cualquier otro modo mantiene los errores escuetos.
+    pub fn with_verbose_errors(mut self, verbose: bool) -> Self {
+        self.verbose_errors = verbose;
+        self
+    }
+
+    pub fn verbose_errors(&self) -> bool {
+        self.verbose_errors
     }
 
     pub fn config_fetcher(&self) -> &Arc<dyn ConfigFetcher> {
