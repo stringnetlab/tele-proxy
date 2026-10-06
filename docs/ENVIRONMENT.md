@@ -17,16 +17,18 @@ Estado de cada variable:
 | --- | --- | --- | --- | --- |
 | `RUST_LOG` | Filtro de `tracing-subscriber` (`EnvFilter`) | `warn,tele_proxy=info` | No | **activa** — `init_tracing()` (`main.rs:88`); el default se usa solo si la variable no está |
 | `RUST_BACKTRACE` | Backtrace en pánico | `1` | No | la consume el runtime de Rust, no el código |
-| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`); cualquier otro valor o ausente → errores escuetos | escueto | No | **activa** — `AppConfig::from_env()` (main.rs); viaja a `ProxyService::with_verbose_errors` |
+| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`) y `GET /` lista los endpoints; cualquier otro valor o ausente → respuestas escuetas | escueto | No | **activa** — `AppConfig::from_env()` (main.rs); viaja a `ProxyService::with_verbose_errors` |
 
-El efecto de `MODO` es exactamente uno: la verbosidad de los cuerpos de error que devuelven
-`/aq/` y `/api/v1/`. En `desarrollo` un 5xx expone el motivo interno completo y un objeto
-`details` con los campos estructurados del error (`reason`, `domain`, `retry_after_secs`, ...);
-en cualquier otro modo los 5xx siguen siendo `{"error":"internal_error","message":"Internal
-server error"}` y los 4xx mantienen su mensaje actual sin `details`. La comparación es
-case-insensitive (`DESARROLLO` también activa). No existe `RUST_ENV`: el entorno se distingue
-por `RUST_LOG` (logs) y `MODO` (cuerpos de error), y el binario corre en primer plano dentro
-del contenedor (ver *Runtime de Pingora*).
+El efecto de `MODO` son dos, ambos sobre las **respuestas HTTP**: (1) la verbosidad de los
+cuerpos de error que devuelven `/aq/` y `/api/v1/` — en `desarrollo` un 5xx expone el motivo
+interno completo y un objeto `details` con los campos estructurados del error (`reason`,
+`domain`, `retry_after_secs`, ...), y en cualquier otro modo los 5xx siguen siendo
+`{"error":"internal_error","message":"Internal server error"}` y los 4xx mantienen su mensaje
+actual sin `details`; y (2) el cuerpo de `GET /` en el puerto del proxy — en `desarrollo`
+incluye la lista de endpoints definidos, en producción solo el nombre del proyecto (`TELE -
+PROXY`). La comparación es case-insensitive (`DESARROLLO` también activa). No existe
+`RUST_ENV`: el entorno se distingue por `RUST_LOG` (logs) y `MODO` (cuerpos de respuesta), y el
+binario corre en primer plano dentro del contenedor (ver *Runtime de Pingora*).
 
 ## Runtime de Pingora (`ServerConf`)
 
