@@ -48,7 +48,8 @@ vive en el log; **5xx** = el callback devuelve `Err(BError)` y `fail_to_proxy` r
 | `redos_blocked`          | `ReDosBlocked`         | Compilación o ejecución de regex excede el presupuesto     | 500         | ERROR        | `crypt_id`†, `pattern`, `elapsed_ms`                        | degradación   |
 | `integrity_check_failed` | `IntegrityCheckFailed` | El hash del script o del fallback no coincide              | 500         | ERROR        | `crypt_id`†, `resource_type`, `expected_hash`, `actual_hash`| 5xx           |
 | `payload_too_large`      | `PayloadTooLarge`      | El cuerpo excede `max_response_size_bytes` (100 MB)        | 413         | WARN         | `crypt_id`†, `content_length`, `max_allowed`                | 5xx‡          |
-| `upstream_error`         | `UpstreamError`        | El origen devolvió 4xx/5xx sin fallback aplicable          | 502         | ERROR        | `crypt_id`†, `url`, `upstream_status`                       | 5xx           |
+| `upstream_error`         | `UpstreamError`        | Fallo de transporte hacia el origen (conexión/TLS rechazados, no timeout) | 502 | ERROR | `crypt_id`†, `url`, `upstream_status`, `reason`  | 5xx           |
+| `upstream_timeout`       | `UpstreamTimeout`      | El origen no respondió antes de `UPSTREAM_TIMEOUT_SECS` (30 s) | 504  | WARN         | `crypt_id`†, `url`, `timeout_ms`                            | 5xx           |
 | `script_timeout`         | `ScriptTimeout`        | La ejecución de Lua excede `timeout_ms`                    | 500         | WARN         | `crypt_id`†, `timeout_ms`, `elapsed_ms`                     | degradación   |
 | `script_memory_limit`    | `ScriptMemoryLimit`    | El script excede `memory_limit_mb`                         | 500         | WARN         | `crypt_id`†, `memory_limit_mb`, `used_mb`                   | degradación   |
 | `webhook_timeout`        | `WebhookTimeout`       | Llamada HTTP desde Lua excede su timeout                   | 500         | WARN         | `crypt_id`†, `webhook_url`, `timeout_ms`                    | degradación   |
@@ -176,8 +177,11 @@ pub enum ProxyError {
     #[error("Payload too large: {content_length} bytes (max: {max_allowed})")]
     PayloadTooLarge { content_length: u64, max_allowed: u64 },
 
-    #[error("Upstream error: status={upstream_status}")]
-    UpstreamError { url: String, upstream_status: u16 },
+    #[error("Upstream error: status={upstream_status}, reason={reason}")]
+    UpstreamError { url: String, upstream_status: u16, reason: String },
+
+    #[error("Upstream timeout: {timeout_ms}ms (url={url})")]
+    UpstreamTimeout { url: String, timeout_ms: u64 },
 
     #[error("Script timeout: {elapsed_ms}ms (max: {timeout_ms}ms)")]
     ScriptTimeout { timeout_ms: u64, elapsed_ms: u64 },
@@ -226,6 +230,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => 500,
             Self::PayloadTooLarge { .. } => 413,
             Self::UpstreamError { .. } => 502,
+            Self::UpstreamTimeout { .. } => 504,
             Self::ScriptTimeout { .. } => 500,
             Self::ScriptMemoryLimit { .. } => 500,
             Self::WebhookTimeout { .. } => 500,
@@ -249,6 +254,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => "integrity_check_failed",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::ScriptTimeout { .. } => "script_timeout",
             Self::ScriptMemoryLimit { .. } => "script_memory_limit",
             Self::WebhookTimeout { .. } => "webhook_timeout",
@@ -271,6 +277,7 @@ impl ProxyError {
             | Self::ScriptMemoryLimit { .. }
             | Self::WebhookTimeout { .. }
             | Self::WebhookFailed { .. }
+            | Self::UpstreamTimeout { .. }
             | Self::Unauthorized { .. } => Level::WARN,
 
             Self::InvalidCryptId { .. }
@@ -319,7 +326,8 @@ impl ProxyError {
             Self::PayloadTooLarge { content_length, max_allowed } => vec![
                 ("content_length", content_length.to_string()), ("max_allowed", max_allowed.to_string()),
             ],
-            Self::UpstreamError { url, upstream_status } => vec![("url", url.clone()), ("upstream_status", upstream_status.to_string())],
+            Self::UpstreamError { url, upstream_status, reason } => vec![("url", url.clone()), ("upstream_status", upstream_status.to_string()), ("reason", reason.clone())],
+            Self::UpstreamTimeout { url, timeout_ms } => vec![("url", url.clone()), ("timeout_ms", timeout_ms.to_string())],
             Self::ScriptTimeout { timeout_ms, elapsed_ms } => vec![("timeout_ms", timeout_ms.to_string()), ("elapsed_ms", elapsed_ms.to_string())],
             Self::ScriptMemoryLimit { memory_limit_mb, used_mb } => vec![("memory_limit_mb", memory_limit_mb.to_string()), ("used_mb", used_mb.to_string())],
             Self::WebhookTimeout { webhook_url, timeout_ms } => vec![("webhook_url", webhook_url.clone()), ("timeout_ms", timeout_ms.to_string())],

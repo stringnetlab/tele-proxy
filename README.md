@@ -230,7 +230,8 @@ Headers relevantes de la respuesta:
 | `Retry-After` | segundos | Con `429 Too Many Requests`: espera antes de reintentar |
 
 **Reglas del endpoint:**
-- Solo `GET`. Cualquier otra ruta que no sea `/aq/{crypt_id}/` responde `404` sin tocar el origen.
+- Solo `GET`. Las únicas rutas del puerto del proxy son `/aq/{crypt_id}/`, `/health` y `/`; cualquier otra responde `404` sin tocar el origen.
+- `GET /` responde el nombre del proyecto (`TELE - PROXY`); con `MODO=desarrollo` añade la lista de endpoints definidos.
 - `GET /health` en el puerto del proxy responde `200 OK` antes de cualquier validación
   (es el endpoint del `HEALTHCHECK` del Dockerfile).
 - El proxy **no sigue redirects**: reenvía el 3xx al cliente, pero valida `Location` primero;
@@ -263,7 +264,8 @@ completo y todos los errores incluyen un objeto `details` con los campos estruct
 ```
 
 En cualquier otro modo los 5xx devuelven el mensaje escueto `Internal server error` y sin
-`details`:
+`details`. Los fallos del **origen** se distinguen de los del propio proxy sin filtrar detalles
+internos: `upstream_error` → `Bad gateway`, `upstream_timeout` → `Gateway timeout`:
 
 | Código | HTTP | Causa típica |
 |---|---|---|
@@ -274,6 +276,8 @@ En cualquier otro modo los 5xx devuelven el mensaje escueto `Internal server err
 | `ssrf_blocked` | 403 | IP privada resuelta, redirect a IP privada, DNS rebinding |
 | `rate_limit_exceeded` | 429 | Límite del cliente superado; incluye `Retry-After` |
 | `payload_too_large` | 413 | Respuesta del origen > 100 MB |
+| `upstream_error` | 502 | Fallo de transporte hacia el origen (conexión/TLS rechazados) |
+| `upstream_timeout` | 504 | El origen no respondió antes de 30 s |
 | `script_timeout` | — | Script Lua abortado por deadline (se degrada al body original) |
 | `integrity_check_failed` | — | `code_hash` del script no coincide (se degrada al body original) |
 
@@ -552,7 +556,7 @@ Lista canónica en `docs/ENVIRONMENT.md`. Resumen:
 |---|---|---|
 | `RUST_LOG` | Filtro de logs (`EnvFilter`) | `warn,tele_proxy=info` |
 | `RUST_BACKTRACE` | Backtrace en pánico | `1` |
-| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`); cualquier otro valor o ausente → errores escuetos | escueto |
+| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`) y `GET /` lista los endpoints; cualquier otro valor o ausente → respuestas escuetas | escueto |
 
 ### Escucha HTTP
 
