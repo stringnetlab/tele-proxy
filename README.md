@@ -702,6 +702,7 @@ degradan al body original en lugar de romper la respuesta.
 | `docs/spec.md` | Especificación técnica completa (arquitectura, fases, estado de la migración a Pingora) |
 | `docs/CLIENT_CONFIG.md` | Referencia de cada campo del documento de cliente |
 | `docs/HEADER_RULES.md` | Lenguaje de expresiones de `header_rules` (sintaxis Cloudflare, funciones, ejemplos) |
+| `docs/INTEGRATION_PROMPT.md` | Prompt listo para agentes de codificación que integren TeleProxy en un proyecto existente |
 | `docs/ENVIRONMENT.md` | Lista canónica de variables de entorno y validaciones |
 | `docs/ERROR_DICTIONARY.md` | Diccionario completo de códigos de error |
 | `docs/DEPLOYMENT.md` | Procedimiento de despliegue con Dokploy, incluido "Subir el Rev de Pingora" |
