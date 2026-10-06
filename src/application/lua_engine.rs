@@ -173,6 +173,40 @@ impl SandboxedLuaEngine {
                 reason: format!("Failed to set regex_replace: {}", e),
             })?;
 
+        // `proxy.json_parse` / `proxy.json_stringify`: el sandbox no tiene `require`, así que
+        // procesar JSON (quitar claves, renombrar, filtrar arrays) necesita un parser nativo.
+        // La conversión es total: object ⇄ tabla con claves string, array ⇄ tabla secuencial,
+        // null ⇄ nil (un `null` JSON **no sobrevive** al round-trip, docs/LUA_SCRIPTING.md).
+        let json_parse = lua
+            .create_function(|lua, body: String| {
+                let value: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|e| LuaError::external(format!("invalid JSON: {e}")))?;
+                json_to_lua_value(lua, value)
+            })
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Failed to create json_parse function: {}", e),
+            })?;
+        proxy_table
+            .set("json_parse", json_parse)
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Failed to set json_parse: {}", e),
+            })?;
+
+        let json_stringify = lua
+            .create_function(|_, value: mlua::Value| {
+                let value = lua_value_to_json(value)?;
+                serde_json::to_string(&value)
+                    .map_err(|e| LuaError::external(format!("cannot serialize to JSON: {e}")))
+            })
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Failed to create json_stringify function: {}", e),
+            })?;
+        proxy_table
+            .set("json_stringify", json_stringify)
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Failed to set json_stringify: {}", e),
+            })?;
+
         // `proxy.http_request` es **síncrona** a propósito. Una `create_async_function` de mlua
         // solo puede reanudar desde una coroutine, y el cuerpo del script no es una coroutine:
         // llamarla devolvía siempre `attempt to yield from outside a coroutine`, así que el
@@ -400,6 +434,98 @@ fn store_webhook_error(state: &Arc<RunState>, error: ProxyError) -> LuaError {
     LuaError::external(format!("webhook failed: {code}"))
 }
 
+/// `serde_json::Value` → `mlua::Value`: object ⇄ tabla con claves string, array ⇄ tabla
+/// secuencial, números enteros ⇄ `Integer`. `null` se convierte en `nil`: un campo `null` del
+/// JSON **no sobrevive** a un round-trip (pasa a ausente), decisión documentada en
+/// `docs/LUA_SCRIPTING.md`.
+fn json_to_lua_value(lua: &Lua, value: serde_json::Value) -> mlua::Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Nil),
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Integer(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(Value::Integer(u as i64))
+            } else {
+                Ok(Value::Number(n.as_f64().unwrap_or(f64::NAN)))
+            }
+        }
+        serde_json::Value::String(s) => Ok(Value::String(lua.create_string(&s)?)),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table()?;
+            for item in items {
+                table.push(json_to_lua_value(lua, item)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table()?;
+            for (key, value) in map {
+                table.set(key.as_str(), json_to_lua_value(lua, value)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+    }
+}
+
+/// `mlua::Value` → `serde_json::Value`. Una tabla se serializa como array solo si todas sus
+/// claves son enteros ≥ 1; si no, como object (las claves numéricas se convierten a string).
+/// Funciones, userdata, threads y lightuserdata no son serializables: error al script.
+fn lua_value_to_json(value: Value) -> mlua::Result<serde_json::Value> {
+    match value {
+        Value::Nil => Ok(serde_json::Value::Null),
+        Value::Boolean(b) => Ok(serde_json::Value::Bool(b)),
+        Value::Integer(i) => Ok(serde_json::Value::Number(i.into())),
+        Value::Number(n) => Ok(serde_json::Number::from_f64(n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)),
+        Value::String(s) => Ok(serde_json::Value::String(s.to_str()?.to_string())),
+        Value::Table(table) => {
+            let mut is_sequence = true;
+            for pair in table.clone().pairs::<Value, Value>() {
+                match pair {
+                    Ok((Value::Integer(i), _)) if i >= 1 => {}
+                    _ => {
+                        is_sequence = false;
+                        break;
+                    }
+                }
+            }
+            if is_sequence && table.len()? > 0 {
+                let len = table.len()? as usize;
+                let mut items = Vec::with_capacity(len);
+                for i in 1..=len {
+                    items.push(lua_value_to_json(table.get(i)?)?);
+                }
+                Ok(serde_json::Value::Array(items))
+            } else {
+                let mut map = serde_json::Map::new();
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair?;
+                    let key = match key {
+                        Value::String(s) => s.to_str()?.to_string(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Number(n) => n.to_string(),
+                        other => {
+                            return Err(LuaError::external(format!(
+                                "object key of type {} cannot be serialized to JSON",
+                                other.type_name()
+                            )))
+                        }
+                    };
+                    map.insert(key, lua_value_to_json(value)?);
+                }
+                Ok(serde_json::Value::Object(map))
+            }
+        }
+        other => Err(LuaError::external(format!(
+            "value of type {} cannot be serialized to JSON",
+            other.type_name()
+        ))),
+    }
+}
+
 /// `docs/spec.md` Fase 4: el código solo se ejecuta si su digest coincide con el `code_hash`
 /// declarado. Sin `code_hash` no hay nada con qué comparar (configs anteriores al contrato), así
 /// que se ejecuta y la verificación queda documentada como deuda en `docs/DIAGRAMS.md`.
@@ -580,6 +706,7 @@ mod tests {
                     enabled: true,
                     code: String::new(),
                     code_hash: String::new(),
+                    expression: String::new(),
                 },
                 error_handling: ErrorHandlingConfig {
                     mode: ErrorMode::Wrapped,
@@ -695,6 +822,99 @@ mod tests {
         let script = r#"function(body) return body end"#;
         let result = engine().execute_sync(script, b"unchanged", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "unchanged");
+    }
+
+    #[test]
+    fn test_json_quitar_y_renombrar_claves() {
+        let ctx = test_context();
+        // Caso de mundo real: el origen devuelve campos internos y un nombre de clave que el
+        // frontend ya no usa; el script los limpia antes de que la respuesta se cachee y sirva.
+        let script = r#"
+            function(body)
+                local data = proxy.json_parse(body)
+                data.internal_id = nil
+                data.costo_interno = nil
+                data.user_name = data.userName
+                data.userName = nil
+                return proxy.json_stringify(data)
+            end
+        "#;
+        let body = br#"{"userName":"ana","internal_id":"x9","costo_interno":0.25,"edad":30}"#;
+
+        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&result).expect("la salida debe ser JSON valido");
+
+        assert_eq!(parsed["user_name"], "ana");
+        assert_eq!(parsed["edad"], 30);
+        assert!(parsed.get("userName").is_none(), "{parsed}");
+        assert!(parsed.get("internal_id").is_none(), "{parsed}");
+        assert!(parsed.get("costo_interno").is_none(), "{parsed}");
+    }
+
+    #[test]
+    fn test_json_filtrar_array() {
+        let ctx = test_context();
+        // Quitar los elementos inactivos de una lista sin romper la secuencia (table.remove,
+        // no `t[i] = nil`, que deja huecos y se serializa como object).
+        let script = r#"
+            function(body)
+                local data = proxy.json_parse(body)
+                for i = #data.items, 1, -1 do
+                    if not data.items[i].activo then
+                        table.remove(data.items, i)
+                    end
+                end
+                return proxy.json_stringify(data)
+            end
+        "#;
+        let body =
+            br#"{"items":[{"id":1,"activo":true},{"id":2,"activo":false},{"id":3,"activo":true}]}"#;
+
+        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["items"][0]["id"], 1);
+        assert_eq!(parsed["items"][1]["id"], 3);
+    }
+
+    #[test]
+    fn test_json_null_no_sobrevive_al_roundtrip() {
+        let ctx = test_context();
+        let script = r#"
+            function(body)
+                local data = proxy.json_parse(body)
+                data.extra = "añadido"
+                return proxy.json_stringify(data)
+            end
+        "#;
+        let body = br#"{"a":1,"b":1.5,"c":true,"d":null}"#;
+
+        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 1.5);
+        assert_eq!(parsed["c"], true);
+        assert!(
+            parsed.get("d").is_none(),
+            "null -> nil -> ausente: {parsed}"
+        );
+        assert_eq!(parsed["extra"], "añadido");
+    }
+
+    #[test]
+    fn test_json_invalido_degrada_al_cuerpo_original() {
+        let ctx = test_context();
+        let script = r#"
+            function(body)
+                local data = proxy.json_parse(body)
+                return proxy.json_stringify(data)
+            end
+        "#;
+        let result = engine()
+            .execute_sync(script, b"esto no es json", &ctx)
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&result), "esto no es json");
     }
 
     /// Regresión del P1: `proxy.http_request` era una `create_async_function` y mlua la rechazaba
@@ -848,6 +1068,7 @@ mod tests {
             enabled: true,
             code_hash: format!("sha256:{}", sha256_hex(&code)),
             code,
+            expression: String::new(),
         };
         assert!(verify_script_integrity(&scripting).is_ok());
     }
@@ -858,6 +1079,7 @@ mod tests {
             enabled: true,
             code: "function(body) return body end".to_string(),
             code_hash: "sha256:deadbeef".to_string(),
+            expression: String::new(),
         };
         let error = verify_script_integrity(&scripting)
             .expect_err("a mismatched digest must block execution");
@@ -870,6 +1092,7 @@ mod tests {
             enabled: true,
             code: "function(body) return body end".to_string(),
             code_hash: String::new(),
+            expression: String::new(),
         };
         assert!(verify_script_integrity(&scripting).is_ok());
     }
@@ -880,6 +1103,7 @@ mod tests {
             enabled: true,
             code: "function(body) return body end".to_string(),
             code_hash: "no-es-un-hash".to_string(),
+            expression: String::new(),
         };
         assert!(matches!(
             verify_script_integrity(&scripting),
@@ -895,12 +1119,14 @@ mod tests {
             enabled: Some(true),
             code: Some("function(body) return string.upper(body) end".to_string()),
             code_hash: None,
+            expression: None,
         };
         let code = update.code.clone().unwrap();
         let scripting = ScriptingConfig {
             enabled: true,
             code_hash: format!("sha256:{}", sha256_hex(&code)),
             code,
+            expression: String::new(),
         };
         assert!(verify_script_integrity(&scripting).is_ok());
     }

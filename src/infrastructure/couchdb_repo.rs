@@ -186,6 +186,7 @@ impl CouchDbRepository {
                 enabled: false,
                 code: String::new(),
                 code_hash: String::new(),
+                expression: String::new(),
             },
             error_handling: ErrorHandlingConfig {
                 mode: ErrorMode::Transparent,
@@ -397,6 +398,9 @@ impl ConfigFetcher for CouchDbRepository {
             }
             if let Some(ref code_hash) = scripting.code_hash {
                 config.scripting.code_hash = code_hash.clone();
+            }
+            if let Some(ref expression) = scripting.expression {
+                config.scripting.expression = expression.clone();
             }
         }
         if let Some(ref error_handling) = update.error_handling {

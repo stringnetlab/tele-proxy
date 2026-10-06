@@ -640,6 +640,14 @@ pub fn validate_expression(src: &str) -> Result<(), String> {
     check_regex_literals(&expr)
 }
 
+/// Parsea y evalúa una expresión contra un contexto. Punto de entrada para los demás módulos
+/// del dominio (p. ej. el gate condicional de `scripting`): un error de parseo aquí significa
+/// un documento escrito a mano fuera de contrato (el `PUT` ya validó), así que el llamador
+/// decide si degrada o no.
+pub fn evaluate_expression(src: &str, ctx: &RuleContext) -> Result<bool, String> {
+    Ok(parse_expression(src)?.eval(ctx))
+}
+
 fn check_regex_literals(expr: &Expr) -> Result<(), String> {
     match expr {
         Expr::Or(parts) | Expr::And(parts) => {

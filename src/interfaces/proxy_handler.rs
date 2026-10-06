@@ -174,10 +174,34 @@ pub async fn proxy_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let body_bytes =
-        apply_lua_scripting(&service, &config, &url, query.mime.as_deref(), body_bytes)
-            .await
-            .map_err(&api_err)?;
+    let mut response_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| !must_not_forward_header(k.as_str()))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_string(), val.to_string()))
+        })
+        .collect();
+
+    let rule_ctx = RuleContext {
+        method: "GET".to_string(),
+        url: url.clone(),
+        request_headers: header_pairs(&request_headers),
+        response_status: status,
+        response_headers: response_pairs.clone(),
+    };
+
+    let body_bytes = apply_lua_scripting(
+        &service,
+        &config,
+        &url,
+        &rule_ctx,
+        query.mime.as_deref(),
+        body_bytes,
+    )
+    .await
+    .map_err(&api_err)?;
 
     // Los 3xx quedan fuera de la caché: su Location reescrito depende del Host de cada
     // petición y no se puede servir tal cual en un HIT.
@@ -216,16 +240,6 @@ pub async fn proxy_handler(
         }
     }
 
-    let mut response_pairs: Vec<(String, String)> = headers
-        .iter()
-        .filter(|(k, _)| !must_not_forward_header(k.as_str()))
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|val| (k.as_str().to_string(), val.to_string()))
-        })
-        .collect();
-
     // Redirects 3xx: validar el destino anti-SSRF y reescribir Location como URL del proxy,
     // para que el cliente pueda seguirlo (un Location relativo del upstream resuelto contra
     // /aq/ rompe la navegación). Los 3xx no se cachean: el Location reescrito depende del Host
@@ -242,7 +256,7 @@ pub async fn proxy_handler(
     // Las reglas de headers del cliente se aplican sobre los headers crudos del upstream, antes
     // de fijar los headers de seguridad del proxy (que siempre ganan, aunque una regla los
     // nombrara — `PUT /config` ya prohíbe esos nombres).
-    apply_client_header_rules(&config, &request_headers, &url, status, &mut response_pairs);
+    apply_client_header_rules(&config, &rule_ctx, &mut response_pairs);
 
     let mut response_headers = pairs_to_header_map(response_pairs);
 
@@ -271,14 +285,43 @@ pub async fn proxy_handler(
     .map_err(&api_err)
 }
 
+/// Decide si el script Lua del cliente corre para esta respuesta: `scripting.expression`
+/// (mismo motor de expresiones que `header_rules`, docs/HEADER_RULES.md) evaluada contra el
+/// contexto de la petición/respuesta. Expresión vacía = siempre, para compatibilidad con
+/// configs anteriores a este campo. Una expresión que falla en runtime (documento escrito a
+/// mano fuera de contrato; el `PUT` ya validó) degrada a "no ejecutar" con WARN, igual que una
+/// regla de headers.
+fn should_apply_scripting(
+    scripting: &crate::domain::models::ScriptingConfig,
+    ctx: &RuleContext,
+) -> bool {
+    if !scripting.enabled || scripting.code.is_empty() {
+        return false;
+    }
+    if scripting.expression.trim().is_empty() {
+        return true;
+    }
+    match header_rules::evaluate_expression(&scripting.expression, ctx) {
+        Ok(matches) => matches,
+        Err(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                "scripting expression failed at runtime; script skipped"
+            );
+            false
+        }
+    }
+}
+
 async fn apply_lua_scripting(
     service: &ProxyService,
     config: &crate::domain::models::ClientConfig,
     url: &url::Url,
+    rule_ctx: &RuleContext,
     mime_hint: Option<&str>,
     body_bytes: Vec<u8>,
 ) -> Result<Vec<u8>, ProxyError> {
-    if !config.scripting.enabled || config.scripting.code.is_empty() {
+    if !should_apply_scripting(&config.scripting, rule_ctx) {
         return Ok(body_bytes);
     }
 
@@ -347,13 +390,14 @@ async fn try_fallback_or_error(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             if let Ok(parsed_url) = url::Url::parse(url) {
-                apply_client_header_rules(
-                    config,
-                    request_headers,
-                    &parsed_url,
-                    fallback.cached.status,
-                    &mut pairs,
-                );
+                let rule_ctx = RuleContext {
+                    method: "GET".to_string(),
+                    url: parsed_url,
+                    request_headers: header_pairs(request_headers),
+                    response_status: fallback.cached.status,
+                    response_headers: pairs.clone(),
+                };
+                apply_client_header_rules(config, &rule_ctx, &mut pairs);
             }
             let mut headers = pairs_to_header_map(pairs);
             headers.insert(
@@ -389,7 +433,17 @@ fn build_response_from_cached(
         .filter(|(key, _)| !must_not_forward_header(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    apply_client_header_rules(config, request_headers, url, cached.status, &mut pairs);
+    apply_client_header_rules(
+        config,
+        &RuleContext {
+            method: "GET".to_string(),
+            url: url.clone(),
+            request_headers: header_pairs(request_headers),
+            response_status: cached.status,
+            response_headers: pairs.clone(),
+        },
+        &mut pairs,
+    );
     let mut headers = pairs_to_header_map(pairs);
 
     headers.insert(
@@ -410,29 +464,19 @@ fn build_response_from_cached(
 }
 
 /// Aplica las `header_rules` del cliente sobre los pares `(header, valor)` de la respuesta que
-/// se está sirviendo. Construye el contexto de evaluación a partir de la request del cliente
-/// (los headers que este envió al proxy), la URL destino y los headers de respuesta **antes** de
-/// aplicar ninguna regla: cada regla ve las mutaciones de las anteriores, pero ninguna condiciona
-/// a su propio resultado.
+/// se está sirviendo. El contexto de evaluación (`rule_ctx`) se construye una sola vez por
+/// petición en el handler y se comparte con el gate de scripting: ambos evalúan contra los
+/// headers de respuesta **antes** de aplicar ninguna regla.
 fn apply_client_header_rules(
     config: &ClientConfig,
-    request_headers: &HeaderMap,
-    url: &url::Url,
-    status: u16,
+    rule_ctx: &RuleContext,
     response_pairs: &mut Vec<(String, String)>,
 ) {
     if config.header_rules.is_empty() {
         return;
     }
 
-    let ctx = RuleContext {
-        method: "GET".to_string(),
-        url: url.clone(),
-        request_headers: header_pairs(request_headers),
-        response_status: status,
-        response_headers: response_pairs.clone(),
-    };
-    header_rules::apply_header_rules(&config.header_rules, &ctx, response_pairs);
+    header_rules::apply_header_rules(&config.header_rules, rule_ctx, response_pairs);
 }
 
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -873,6 +917,50 @@ mod tests {
     }
 
     #[test]
+    fn should_apply_scripting_evalua_la_expresion_contra_el_contexto() {
+        use crate::domain::models::ScriptingConfig;
+
+        let scripting = |expression: &str| ScriptingConfig {
+            enabled: true,
+            code: "function(body) return body end".to_string(),
+            code_hash: "sha256:x".to_string(),
+            expression: expression.to_string(),
+        };
+        let ctx = |content_type: &str| super::RuleContext {
+            method: "GET".to_string(),
+            url: url::Url::parse("https://api.example.com/data").unwrap(),
+            request_headers: vec![],
+            response_status: 200,
+            response_headers: vec![("content-type".to_string(), content_type.to_string())],
+        };
+
+        // La expresión de la doc: JSON + 200 cumple, HTML no.
+        let expr = "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")";
+        assert!(super::should_apply_scripting(
+            &scripting(expr),
+            &ctx("application/json; charset=utf-8")
+        ));
+        assert!(!super::should_apply_scripting(
+            &scripting(expr),
+            &ctx("text/html")
+        ));
+
+        // Expresión vacía = siempre (configs anteriores al campo).
+        assert!(super::should_apply_scripting(
+            &scripting("  "),
+            &ctx("text/html")
+        ));
+
+        // Deshabilitado o sin código = nunca, haya expresión o no.
+        let mut disabled = scripting("");
+        disabled.enabled = false;
+        assert!(!super::should_apply_scripting(&disabled, &ctx("text/html")));
+        let mut no_code = scripting("");
+        no_code.code = String::new();
+        assert!(!super::should_apply_scripting(&no_code, &ctx("text/html")));
+    }
+
+    #[test]
     fn client_header_rules_apply_over_upstream_pairs() {
         use crate::domain::header_rules::{
             HeaderActionParameters, HeaderOperation, HeaderOperationKind, HeaderRule,
@@ -898,6 +986,7 @@ mod tests {
                 enabled: false,
                 code: String::new(),
                 code_hash: String::new(),
+                expression: String::new(),
             },
             error_handling: crate::domain::models::ErrorHandlingConfig {
                 mode: crate::domain::models::ErrorMode::Wrapped,
@@ -919,39 +1008,32 @@ mod tests {
         let mut request = HeaderMap::new();
         request.insert("x-client", HeaderValue::from_static("ios"));
 
+        let rule_ctx = |pairs: &[(String, String)], path: &str| super::RuleContext {
+            method: "GET".to_string(),
+            url: url::Url::parse(&format!("https://example.com{path}")).unwrap(),
+            request_headers: super::header_pairs(&request),
+            response_status: 200,
+            response_headers: pairs.to_vec(),
+        };
+
         // Coincide la expresión: el header se inyecta.
         let mut pairs = vec![("content-type".to_string(), "application/json".to_string())];
-        super::apply_client_header_rules(
-            &config,
-            &request,
-            &url::Url::parse("https://example.com/api").unwrap(),
-            200,
-            &mut pairs,
-        );
+        let ctx = rule_ctx(&pairs, "/api");
+        super::apply_client_header_rules(&config, &ctx, &mut pairs);
         assert!(pairs.contains(&("x-algo".to_string(), "asi".to_string())));
 
         // No coincide: el upstream mandó HTML y la regla no aplica.
         let mut html_pairs = vec![("content-type".to_string(), "text/html".to_string())];
-        super::apply_client_header_rules(
-            &config,
-            &request,
-            &url::Url::parse("https://example.com/page").unwrap(),
-            200,
-            &mut html_pairs,
-        );
+        let ctx = rule_ctx(&html_pairs, "/page");
+        super::apply_client_header_rules(&config, &ctx, &mut html_pairs);
         assert!(!html_pairs.iter().any(|(k, _)| k == "x-algo"));
 
         // Sin reglas configuradas es un no-op (el fast-path no construye contexto).
         let mut no_rules = config.clone();
         no_rules.header_rules = Vec::new();
         let mut untouched = vec![("content-type".to_string(), "application/json".to_string())];
-        super::apply_client_header_rules(
-            &no_rules,
-            &request,
-            &url::Url::parse("https://example.com/api").unwrap(),
-            200,
-            &mut untouched,
-        );
+        let ctx = rule_ctx(&untouched, "/api");
+        super::apply_client_header_rules(&no_rules, &ctx, &mut untouched);
         assert_eq!(untouched.len(), 1);
     }
 }
