@@ -86,6 +86,10 @@ pub struct ErrorResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Solo en `MODO=desarrollo`: campos estructurados del error (field/reason del dominio,
+    /// resolved_ip, retry_after_secs, ...). En producción nunca se serializa.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<std::collections::HashMap<&'static str, String>>,
 }
 
 impl ProxyError {

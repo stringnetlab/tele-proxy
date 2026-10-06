@@ -29,6 +29,9 @@ struct AppConfig {
     lua_timeout_ms: u64,
     lua_memory_limit_mb: u32,
     webhook_timeout_ms: u64,
+    /// `MODO=desarrollo`: errores HTTP verbosos con motivo interno y `details`. Cualquier otro
+    /// valor (o ausente) mantiene los errores escuetos de producción.
+    modo_desarrollo: bool,
 }
 
 impl AppConfig {
@@ -59,6 +62,9 @@ impl AppConfig {
                 .parse()
                 .map_err(|e| format!("Invalid LUA_MEMORY_LIMIT_MB: {}", e))?,
             webhook_timeout_ms: parse_in_range("WEBHOOK_TIMEOUT_MS", "5000", 1u64, 60_000u64)?,
+            modo_desarrollo: std::env::var("MODO")
+                .map(|value| value.eq_ignore_ascii_case("desarrollo"))
+                .unwrap_or(false),
         })
     }
 }
@@ -125,6 +131,11 @@ async fn main() {
     tracing::info!(
         proxy_port = config.http_proxy_port,
         control_port = config.http_control_port,
+        modo = if config.modo_desarrollo {
+            "desarrollo"
+        } else {
+            "produccion"
+        },
         "Starting tele-proxy"
     );
 
@@ -185,7 +196,8 @@ async fn main() {
             Arc::clone(&dns_resolver) as Arc<_>,
             lua_executor,
         )
-        .with_degraded_mode(valkey_degraded),
+        .with_degraded_mode(valkey_degraded)
+        .with_verbose_errors(config.modo_desarrollo),
     );
 
     let changes_listener = ChangesFeedListener::new(
