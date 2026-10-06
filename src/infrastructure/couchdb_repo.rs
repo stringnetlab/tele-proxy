@@ -162,7 +162,10 @@ impl CouchDbRepository {
         let mut hasher = Sha256::new();
         hasher.update(demo_token.as_bytes());
         let result = hasher.finalize();
-        let hex_str = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex_str = result
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         let token_hash = format!("sha256:{}", hex_str);
 
         let demo_config = ClientConfig {
@@ -188,6 +191,7 @@ impl CouchDbRepository {
                 mode: ErrorMode::Transparent,
                 fallback_urls: HashMap::new(),
             },
+            header_rules: Vec::new(),
         };
 
         let url = self.doc_url(&demo_config.id);
@@ -397,6 +401,9 @@ impl ConfigFetcher for CouchDbRepository {
         }
         if let Some(ref error_handling) = update.error_handling {
             config.error_handling = error_handling.clone();
+        }
+        if let Some(ref header_rules) = update.header_rules {
+            config.header_rules = header_rules.clone();
         }
 
         config.config_version += 1;
