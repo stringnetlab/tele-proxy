@@ -610,6 +610,7 @@ Lista canónica en `docs/ENVIRONMENT.md`. Resumen:
 | `MAX_RESPONSE_SIZE_BYTES` | `104857600` (100 MB) | — |
 | `CONFIG_CACHE_TTL_SECONDS` | `300` | — |
 | `CONFIG_CACHE_MAX_CAPACITY` | `10000` | — |
+| `UPSTREAM_USER_AGENT` | `""` (reqwest) | El `User-Agent` del cliente, si llega, siempre se reenvía al origen; este default solo aplica cuando el cliente no envía uno |
 
 ### DNS (DoT + DNSSEC)
 

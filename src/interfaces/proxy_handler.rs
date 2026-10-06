@@ -115,7 +115,13 @@ pub async fn proxy_handler(
         .as_deref()
         .or_else(|| infer_mime_from_url(&query.url));
 
-    let upstream_result = make_upstream_request(&url, resolved_ip).await;
+    let upstream_result = make_upstream_request(
+        &url,
+        resolved_ip,
+        &request_headers,
+        service.upstream_user_agent(),
+    )
+    .await;
 
     let upstream_response = match upstream_result {
         Ok(resp) => resp,
@@ -504,9 +510,49 @@ fn pairs_to_header_map(pairs: Vec<(String, String)>) -> HeaderMap {
     map
 }
 
+/// Headers del cliente que se reenvían al origen. El `User-Agent` del cliente manda; si no
+/// llega, el default configurable (`UPSTREAM_USER_AGENT`); si tampoco, el header no se toca y
+/// reqwest usa el suyo. Sitios con puerta por UA reciben así un UA de navegador en vez de la
+/// firma `reqwest/x.y`. (Ojo: no arregla bloqueos por huella TLS — ver docs/LUA_SCRIPTING.md
+/// y el análisis de Meta en el repo.)
+fn upstream_client_headers(
+    request_headers: &HeaderMap,
+    default_user_agent: &str,
+) -> Vec<(reqwest::header::HeaderName, String)> {
+    let mut headers = Vec::new();
+
+    let user_agent = request_headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if default_user_agent.is_empty() {
+                None
+            } else {
+                Some(default_user_agent.to_string())
+            }
+        });
+    if let Some(user_agent) = user_agent {
+        headers.push((reqwest::header::USER_AGENT, user_agent));
+    }
+
+    if let Some(language) = request_headers
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        headers.push((reqwest::header::ACCEPT_LANGUAGE, language.to_string()));
+    }
+
+    headers
+}
+
 async fn make_upstream_request(
     url: &url::Url,
     resolved_ip: std::net::IpAddr,
+    request_headers: &HeaderMap,
+    default_user_agent: &str,
 ) -> Result<reqwest::Response, ProxyError> {
     let hostname = url.host_str().ok_or_else(|| ProxyError::Internal {
         reason: "Upstream URL has no host".to_string(),
@@ -524,7 +570,12 @@ async fn make_upstream_request(
         std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
     )?;
 
-    client.get(url.as_str()).send().await.map_err(|e| {
+    let mut request = client.get(url.as_str());
+    for (name, value) in upstream_client_headers(request_headers, default_user_agent) {
+        request = request.header(name, value);
+    }
+
+    request.send().await.map_err(|e| {
         // `{e:?}` en lugar de `{e}`: el `Display` de reqwest solo dice "error sending request
         // for url" y esconde la causa (TLS alert, connect refused, timeout); la cadena completa
         // del error vive en el log y en el `reason` del error (visible en MODO=desarrollo).
@@ -914,6 +965,46 @@ mod tests {
             result,
             Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })
         ));
+    }
+
+    #[test]
+    fn upstream_client_headers_reenvia_ua_del_cliente_y_default() {
+        let mut client = HeaderMap::new();
+        client.insert(
+            axum::http::header::USER_AGENT,
+            HeaderValue::from_static("MiApp/2.1 (Android)"),
+        );
+        client.insert(
+            axum::http::header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("es-PE,es;q=0.9"),
+        );
+
+        // El UA del cliente manda sobre el default; Accept-Language se reenvía.
+        let headers = super::upstream_client_headers(&client, "DefaultUA/1.0");
+        assert!(headers.contains(&(
+            reqwest::header::USER_AGENT,
+            "MiApp/2.1 (Android)".to_string()
+        )));
+        assert!(headers.contains(&(
+            reqwest::header::ACCEPT_LANGUAGE,
+            "es-PE,es;q=0.9".to_string()
+        )));
+
+        // Sin UA del cliente: cae en el default configurado.
+        let client_no_ua = HeaderMap::new();
+        let headers = super::upstream_client_headers(&client_no_ua, "DefaultUA/1.0");
+        assert!(headers.contains(&(reqwest::header::USER_AGENT, "DefaultUA/1.0".to_string())));
+        assert_eq!(headers.len(), 1);
+
+        // Sin UA del cliente y sin default: ningún header (reqwest usa el suyo).
+        let headers = super::upstream_client_headers(&client_no_ua, "");
+        assert!(headers.is_empty());
+
+        // UA vacío del cliente no bloquea el default.
+        let mut client_empty_ua = HeaderMap::new();
+        client_empty_ua.insert(axum::http::header::USER_AGENT, HeaderValue::from_static(""));
+        let headers = super::upstream_client_headers(&client_empty_ua, "DefaultUA/1.0");
+        assert!(headers.contains(&(reqwest::header::USER_AGENT, "DefaultUA/1.0".to_string())));
     }
 
     #[test]

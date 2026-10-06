@@ -124,6 +124,7 @@ y en el secret store de Dokploy.
 | --- | --- | --- | --- | --- |
 | `MAX_RESPONSE_SIZE_BYTES` | Tamaño máximo de respuesta del origen (100 MB) | `104857600` | No | designada — `upstream_response_body_filter`, Fase 3 |
 | `MAX_SCRIPTING_BODY_BYTES` | Cuerpo máximo que entra a Lua (5 MB) | `5242880` | No | designada como default: el bypass decide por `ClientConfig.max_scripting_body_bytes` (documento CouchDB), no por esta variable |
+| `UPSTREAM_USER_AGENT` | User-Agent por defecto para las peticiones al origen cuando el **cliente no envía el suyo**. Vacío = el de reqwest. El `User-Agent` del cliente, si llega, siempre se reenvía tal cual (lo mismo `Accept-Language`) | `""` | No | **activa** — `AppConfig::from_env()` → `ProxyService::with_upstream_user_agent` |
 | `LUA_TIMEOUT_MS` | Deadline de ejecución Lua | `200` | No | **activa** — parseada y validada por `parse_in_range` (`main.rs:57`, la función en `main.rs:75`) |
 | `LUA_MEMORY_LIMIT_MB` | Límite de memoria del sandbox | `50` | No | **activa** |
 | `WEBHOOK_TIMEOUT_MS` | Timeout de `proxy.http_request` | `5000` | No | **activa** — parseada por `parse_in_range` (`main.rs:61`); es el techo de `WebhookRequest.timeout_ms` (`application/webhook_service.rs:88`) y el deadline del puente Lua->tokio (`application/lua_engine.rs:228`) |

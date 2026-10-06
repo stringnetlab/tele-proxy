@@ -10,6 +10,9 @@ pub struct ProxyService {
     lua_executor: Arc<dyn LuaExecutor>,
     degraded_mode: Arc<AtomicBool>,
     verbose_errors: bool,
+    /// User-Agent por defecto para las peticiones al origen (env `UPSTREAM_USER_AGENT`).
+    /// Se usa solo cuando el cliente de la petición no envía su propio `User-Agent`.
+    upstream_user_agent: String,
 }
 
 impl ProxyService {
@@ -26,6 +29,7 @@ impl ProxyService {
             lua_executor,
             degraded_mode: Arc::new(AtomicBool::new(false)),
             verbose_errors: false,
+            upstream_user_agent: String::new(),
         }
     }
 
@@ -43,6 +47,17 @@ impl ProxyService {
 
     pub fn verbose_errors(&self) -> bool {
         self.verbose_errors
+    }
+
+    /// User-Agent por defecto para el origen (vacío = el de reqwest). Nunca pisa el
+    /// `User-Agent` que el cliente envíe: ese se reenvía tal cual.
+    pub fn with_upstream_user_agent(mut self, user_agent: String) -> Self {
+        self.upstream_user_agent = user_agent;
+        self
+    }
+
+    pub fn upstream_user_agent(&self) -> &str {
+        &self.upstream_user_agent
     }
 
     pub fn config_fetcher(&self) -> &Arc<dyn ConfigFetcher> {
