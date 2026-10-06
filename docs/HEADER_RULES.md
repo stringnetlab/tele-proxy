@@ -243,23 +243,40 @@ reglas (sustituye la lista completa, igual que `whitelist`).
 
 ---
 
-## 9. Ejemplos por caso de uso
+## 9. Ejemplos de mundo real
 
-### Inyectar un header en respuestas JSON
+Recetas listas para `PUT /api/v1/clients/config` con `header_rules`, agrupadas por el problema
+que resuelven. Todas usan únicamente la sintaxis documentada en las secciones anteriores.
+
+### 9.1 CORS: que los assets se puedan consumir desde el navegador
+
+**Escenario**: sirves imágenes/CSS/JS a una web que corre en otro dominio. El navegador bloquea
+la respuesta al hacer `fetch()` o al pintarla en un `<canvas>` (tainted canvas) si el origen no
+devuelve `Access-Control-Allow-Origin`. Es el caso de uso más frecuente con este proxy.
 
 ```json
 {
-  "expression": "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")",
+  "expression": "http.response.status eq 200 and (starts_with(http.response.content_type, \"image/\") or starts_with(http.response.content_type, \"font/\") or ends_with(url.path, \".css\") or ends_with(url.path, \".js\"))",
   "action": "set",
   "action_parameters": {
     "headers": [
-      { "name": "x-algo", "value": "asi", "operation": "set" }
+      { "name": "access-control-allow-origin", "value": "https://mi-app.example.com", "operation": "set" },
+      { "name": "access-control-allow-methods", "value": "GET", "operation": "set" },
+      { "name": "timing-allow-origin", "value": "https://mi-app.example.com", "operation": "set" }
     ]
   }
 }
 ```
 
-### Cache-Control distinto por tipo de recurso
+Notas:
+- Fíjate en el `or` entre condiciones; si prefieres abrirlo a cualquier consumidor, usa `*` en
+  lugar del dominio (pierdes credenciales/cookies, que aquí no existen).
+- `timing-allow-origin` habilita métricas de Resource Timing en el navegador del consumidor.
+
+### 9.2 Cache-Control por tipo de recurso
+
+**Escenario**: el upstream no manda `Cache-Control` (o manda uno malo) y el navegador/CDN de tu
+app revalida todo. Imágenes versionadas por URL pueden cachearse días; HTML nunca.
 
 ```json
 {
@@ -267,27 +284,49 @@ reglas (sustituye la lista completa, igual que `whitelist`).
   "action": "set",
   "action_parameters": {
     "headers": [
-      { "name": "cache-control", "value": "public, max-age=86400", "operation": "set" }
+      { "name": "cache-control", "value": "public, max-age=86400, immutable", "operation": "set" }
     ]
   }
 }
 ```
-
-### Marcar la respuesta según el cliente que la pide
 
 ```json
 {
-  "expression": "http.request.headers[\"x-client\"] in {\"ios\" \"android\"}",
+  "expression": "starts_with(http.response.content_type, \"text/html\")",
   "action": "set",
   "action_parameters": {
     "headers": [
-      { "name": "x-platform", "value": "${http.request.headers[\"x-client\"]}", "operation": "set" }
+      { "name": "cache-control", "value": "no-store, must-revalidate", "operation": "set" }
     ]
   }
 }
 ```
 
-### Limpiar headers del upstream
+### 9.3 Cabeceras de seguridad en páginas HTML proxied
+
+**Escenario**: embebes páginas HTML del upstream en tu producto. Les añades la protección que el
+origen no tiene (clicjacking, MIME sniffing ya lo pone el proxy).
+
+```json
+{
+  "expression": "starts_with(http.response.content_type, \"text/html\")",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "x-frame-options", "value": "SAMEORIGIN", "operation": "set" },
+      { "name": "referrer-policy", "value": "strict-origin-when-cross-origin", "operation": "set" },
+      { "name": "permissions-policy", "value": "camera=(), microphone=(), geolocation=()", "operation": "set" }
+    ]
+  }
+}
+```
+
+### 9.4 Limpiar la huella del upstream y las cookies de los assets
+
+**Escenario**: el origen anuncia su stack (`server: nginx/1.18`, `x-powered-by: PHP/8.1`) y
+planta `Set-Cookie` hasta en las imágenes. Las cookies en recursos públicos rompen la caché
+compartida (cada usuario cachea su propia copia) y son un vector de tracking. Se quitan en todo
+lo que se sirve:
 
 ```json
 {
@@ -296,13 +335,49 @@ reglas (sustituye la lista completa, igual que `whitelist`).
   "action_parameters": {
     "headers": [
       { "name": "server", "operation": "remove" },
-      { "name": "x-powered-by", "operation": "remove" }
+      { "name": "x-powered-by", "operation": "remove" },
+      { "name": "x-aspnet-version", "operation": "remove" },
+      { "name": "x-generator", "operation": "remove" }
     ]
   }
 }
 ```
 
-### Añadir un header de trazabilidad con URL y status
+```json
+{
+  "expression": "starts_with(http.response.content_type, \"image/\") or ends_with(url.path, \".css\") or ends_with(url.path, \".js\")",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "set-cookie", "operation": "remove" }
+    ]
+  }
+}
+```
+
+### 9.5 Corregir el Content-Type de un origen mal configurado
+
+**Escenario**: un CDN sirve los SVG como `application/octet-stream` y el navegador los descarga
+en vez de pintarlos en `<img>`. Se corrige mirando la extensión del path (el upstream mintió,
+así que la respuesta no sirve):
+
+```json
+{
+  "expression": "ends_with(lower(url.path), \".svg\") and starts_with(http.response.content_type, \"application/octet-stream\")",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "content-type", "value": "image/svg+xml", "operation": "set" }
+    ]
+  }
+}
+```
+
+### 9.6 Trazabilidad: saber qué origen respondió y si hubo fallo
+
+**Escenario**: tu app consume varios orígenes a través del mismo `crypt_id` y en soporte no
+sabes a cuál peticionar. Dos reglas: traza siempre, y marca explícitamente los errores (en modo
+`transparent`, donde el status del origen viaja tal cual al cliente):
 
 ```json
 {
@@ -310,11 +385,124 @@ reglas (sustituye la lista completa, igual que `whitelist`).
   "action": "set",
   "action_parameters": {
     "headers": [
-      { "name": "x-trace", "value": "host=${url.host};status=${http.response.status}", "operation": "set" }
+      { "name": "x-served-from", "value": "${url.host}", "operation": "set" }
     ]
   }
 }
 ```
+
+```json
+{
+  "expression": "http.response.status in {500 502 503 504}",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "x-upstream-degraded", "value": "true;status=${http.response.status};url=${url.host}", "operation": "set" }
+    ]
+  }
+}
+```
+
+### 9.7 Segmentar la respuesta según el dispositivo del cliente
+
+**Escenario**: tu app móvil y tu web comparten el `crypt_id` y quieres métricas (o comportamiento
+de caché) por plataforma. El valor del header de salida se interpola del header de entrada:
+
+```json
+{
+  "expression": "http.request.headers[\"x-app\"] in {\"ios\" \"android\"}",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "x-platform", "value": "${http.request.headers[\"x-app\"]}", "operation": "set" },
+      { "name": "vary", "value": "x-app", "operation": "set" }
+    ]
+  }
+}
+```
+
+El `vary: x-app` evita que una caché intermedia sirva la respuesta de iOS a un cliente Android.
+
+### 9.8 Forzar descarga en rutas concretas
+
+**Escenario**: las facturas/PDF de `/documentos/` deben descargarse, no abrirse en pestaña:
+
+```json
+{
+  "expression": "starts_with(url.path, \"/documentos/\") and http.response.status eq 200",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "content-disposition", "value": "attachment", "operation": "set" }
+    ]
+  }
+}
+```
+
+### 9.9 Configuración completa de ejemplo
+
+Un cliente real combina varias de las recetas anteriores. `PUT /api/v1/clients/config` con todo
+el bloque (sustituye la lista completa de `header_rules`):
+
+```json
+{
+  "header_rules": [
+    {
+      "expression": "true eq true",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "server", "operation": "remove" },
+          { "name": "x-powered-by", "operation": "remove" },
+          { "name": "x-served-from", "value": "${url.host}", "operation": "set" }
+        ]
+      }
+    },
+    {
+      "expression": "http.response.status eq 200 and (starts_with(http.response.content_type, \"image/\") or starts_with(http.response.content_type, \"font/\"))",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "access-control-allow-origin", "value": "https://mi-app.example.com", "operation": "set" },
+          { "name": "cache-control", "value": "public, max-age=86400, immutable", "operation": "set" },
+          { "name": "set-cookie", "operation": "remove" }
+        ]
+      }
+    },
+    {
+      "expression": "starts_with(http.response.content_type, \"text/html\")",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "cache-control", "value": "no-store, must-revalidate", "operation": "set" },
+          { "name": "x-frame-options", "value": "SAMEORIGIN", "operation": "set" }
+        ]
+      }
+    },
+    {
+      "expression": "ends_with(lower(url.path), \".svg\") and starts_with(http.response.content_type, \"application/octet-stream\")",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "content-type", "value": "image/svg+xml", "operation": "set" }
+        ]
+      }
+    },
+    {
+      "expression": "http.response.status in {500 502 503 504}",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "x-upstream-degraded", "value": "true;status=${http.response.status}", "operation": "set" }
+        ]
+      }
+    }
+  ]
+}
+```
+
+El orden importa: las reglas se evalúan en secuencia y cada una ve las modificaciones de las
+anteriores — por eso la limpieza general va primero y las correcciones condicionales después.
 
 ---
 

@@ -234,9 +234,12 @@ Headers relevantes de la respuesta:
 - `GET /` responde el nombre del proyecto (`TELE - PROXY`); con `MODO=desarrollo` añade la lista de endpoints definidos.
 - `GET /health` en el puerto del proxy responde `200 OK` antes de cualquier validación
   (es el endpoint del `HEALTHCHECK` del Dockerfile).
-- El proxy **no sigue redirects**: reenvía el 3xx al cliente, pero valida `Location` primero;
-  si apunta a una IP privada o dominio fuera de whitelist, la cabecera se elimina y la petición
-  se bloquea.
+- El proxy **no sigue redirects**: reenvía el 3xx al cliente, pero valida `Location` con el
+  anti-SSRF y lo **reescribe como URL del proxy** (`/aq/{crypt_id}/?url=<destino>`), para que el
+  cliente pueda seguirlo (un `Location` relativo del origen resuelto contra `/aq/` rompería).
+  El destino de un redirect inválido (esquema no HTTP, IP privada, …) nunca se reenvía: la
+  petición se bloquea con `ssrf_blocked`. La petición de seguimiento reaplica whitelist, rate
+  limit y pinning DNS; los 3xx no se cachean.
 - Tope de respuesta del origen: 100 MB (aborta el stream con `payload_too_large`, sin bufferizar).
 
 ### Errores

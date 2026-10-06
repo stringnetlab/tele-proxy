@@ -1053,4 +1053,72 @@ mod tests {
             "header_rules"
         );
     }
+
+    /// Regresión de docs/HEADER_RULES.md § 9.9: la configuración completa de ejemplo del
+    /// documento tiene que validar tal cual — si el lenguaje evoluciona, el doc no puede
+    /// quedarse con ejemplos que el `PUT` rechazaría.
+    #[test]
+    fn test_validate_config_update_accepts_la_receta_completa_del_documento() {
+        let json = r#"{
+            "header_rules": [
+                {
+                    "expression": "true eq true",
+                    "action": "set",
+                    "action_parameters": {
+                        "headers": [
+                            { "name": "server", "operation": "remove" },
+                            { "name": "x-powered-by", "operation": "remove" },
+                            { "name": "x-served-from", "value": "${url.host}", "operation": "set" }
+                        ]
+                    }
+                },
+                {
+                    "expression": "http.response.status eq 200 and (starts_with(http.response.content_type, \"image/\") or starts_with(http.response.content_type, \"font/\"))",
+                    "action": "set",
+                    "action_parameters": {
+                        "headers": [
+                            { "name": "access-control-allow-origin", "value": "https://mi-app.example.com", "operation": "set" },
+                            { "name": "cache-control", "value": "public, max-age=86400, immutable", "operation": "set" },
+                            { "name": "set-cookie", "operation": "remove" }
+                        ]
+                    }
+                },
+                {
+                    "expression": "starts_with(http.response.content_type, \"text/html\")",
+                    "action": "set",
+                    "action_parameters": {
+                        "headers": [
+                            { "name": "cache-control", "value": "no-store, must-revalidate", "operation": "set" },
+                            { "name": "x-frame-options", "value": "SAMEORIGIN", "operation": "set" }
+                        ]
+                    }
+                },
+                {
+                    "expression": "ends_with(lower(url.path), \".svg\") and starts_with(http.response.content_type, \"application/octet-stream\")",
+                    "action": "set",
+                    "action_parameters": {
+                        "headers": [
+                            { "name": "content-type", "value": "image/svg+xml", "operation": "set" }
+                        ]
+                    }
+                },
+                {
+                    "expression": "http.response.status in {500 502 503 504}",
+                    "action": "set",
+                    "action_parameters": {
+                        "headers": [
+                            { "name": "x-upstream-degraded", "value": "true;status=${http.response.status}", "operation": "set" }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let update: ClientConfigUpdate =
+            serde_json::from_str(json).expect("el JSON del doc debe deserializar");
+        assert!(
+            validate_config_update(&update).is_ok(),
+            "la receta completa de docs/HEADER_RULES.md § 9.9 debe validar"
+        );
+    }
 }

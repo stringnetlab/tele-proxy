@@ -179,7 +179,9 @@ pub async fn proxy_handler(
             .await
             .map_err(&api_err)?;
 
-    let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT;
+    // Los 3xx quedan fuera de la caché: su Location reescrito depende del Host de cada
+    // petición y no se puede servir tal cual en un HIT.
+    let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT && status < 300;
     if cacheable {
         let cached = CachedResponse {
             status,
@@ -223,6 +225,19 @@ pub async fn proxy_handler(
                 .map(|val| (k.as_str().to_string(), val.to_string()))
         })
         .collect();
+
+    // Redirects 3xx: validar el destino anti-SSRF y reescribir Location como URL del proxy,
+    // para que el cliente pueda seguirlo (un Location relativo del upstream resuelto contra
+    // /aq/ rompe la navegación). Los 3xx no se cachean: el Location reescrito depende del Host
+    // de cada petición.
+    rewrite_redirect_location(
+        &mut response_pairs,
+        &request_headers,
+        &crypt_id,
+        &url,
+        status,
+    )
+    .map_err(&api_err)?;
 
     // Las reglas de headers del cliente se aplican sobre los headers crudos del upstream, antes
     // de fijar los headers de seguridad del proxy (que siempre ganan, aunque una regla los
@@ -538,6 +553,79 @@ async fn passthrough_upstream_error(
     )
 }
 
+/// Reescritura de redirects (3xx) para que el cliente pueda seguirlos a través del proxy. El
+/// `Location` del upstream suele ser **relativo a su propio host** (`/ruta`), y tras el proxy
+/// eso resuelve contra `/aq/` y rompe la navegación. Cada destino se valida con el pipeline
+/// anti-SSRF de URLs (`validate_url_strict`: esquema http/https, sin credenciales, sin
+/// fragmentos, sin IPs privadas literales); un destino inválido **nunca** se reenvía: la spec
+/// (paso 5) manda responder `ssrf_blocked`. Los destinos válidos se reescriben como URL
+/// absoluta que vuelve a entrar por `/aq/{crypt_id}/` — la petición de seguimiento reaplica
+/// whitelist, rate limit y pinning DNS, así que un redirect a un dominio no permitido muere en
+/// el 403 de siempre. El host/proto se toman de la petición del cliente (Host +
+/// X-Forwarded-Proto), que es exactamente cómo se construyó la URL actual.
+fn rewrite_redirect_location(
+    response_pairs: &mut [(String, String)],
+    request_headers: &HeaderMap,
+    crypt_id: &str,
+    upstream_url: &url::Url,
+    status: u16,
+) -> Result<(), ProxyError> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(());
+    }
+
+    for pair in response_pairs
+        .iter_mut()
+        .filter(|(name, _)| name == "location")
+    {
+        let resolved = url::Url::options()
+            .base_url(Some(upstream_url))
+            .parse(&pair.1)
+            .map_err(|e| ProxyError::InvalidUrlFormat {
+                url: pair.1.clone(),
+                reason: format!("redirect Location does not parse: {e}"),
+            })?;
+
+        if let Err(reason) = validate_url_strict(resolved.as_str()) {
+            tracing::warn!(
+                location = %pair.1,
+                resolved = %resolved,
+                reason = %reason,
+                "Redirect Location failed validation; request blocked"
+            );
+            return Err(ProxyError::SsrfBlocked {
+                resolved_ip: resolved
+                    .host_str()
+                    .filter(|host| host.parse::<std::net::IpAddr>().is_ok())
+                    .unwrap_or("unresolved")
+                    .to_string(),
+                url: resolved.to_string(),
+                reason: "redirect_to_invalid_target".to_string(),
+            });
+        }
+
+        let proto = request_headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("http");
+        let host = request_headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        let proxied = url::Url::parse_with_params(
+            &format!("{proto}://{host}/aq/{crypt_id}/"),
+            [("url", resolved.as_str())],
+        )
+        .map_err(|e| ProxyError::Internal {
+            reason: format!("Failed to build proxied redirect URL: {e}"),
+        })?;
+        pair.1 = proxied.to_string();
+    }
+
+    Ok(())
+}
+
 // A reverse proxy must not forward transport-framing or content-encoding headers
 // from upstream: hyper computes Content-Length for our buffered body, and reqwest
 // has already transparently decoded any Content-Encoding. Blindly copying these
@@ -716,6 +804,72 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert_eq!(cookies, vec!["a=1".to_string(), "b=2".to_string()]);
+    }
+
+    #[test]
+    fn rewrite_redirect_reescribe_destinos_validos() {
+        let mut request = HeaderMap::new();
+        request.insert("host", HeaderValue::from_static("teleproxy.velone.ai"));
+        request.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let upstream = url::Url::parse("https://origen.example/a").unwrap();
+
+        // Location relativo del upstream → URL absoluta del proxy con ?url= codificado.
+        let mut pairs = vec![("location".to_string(), "/video.abc/titulo".to_string())];
+        super::rewrite_redirect_location(&mut pairs, &request, "crypt_id_123", &upstream, 301)
+            .unwrap();
+        assert_eq!(
+            pairs[0].1,
+            "https://teleproxy.velone.ai/aq/crypt_id_123/?url=https%3A%2F%2Forigen.example%2Fvideo.abc%2Ftitulo"
+        );
+
+        // Location absoluto cross-host también se reescribe (la petición de seguimiento
+        // reaplica whitelist/DNS/pinning).
+        let mut cross = vec![(
+            "location".to_string(),
+            "https://cdn.otro.com/x.jpg".to_string(),
+        )];
+        super::rewrite_redirect_location(&mut cross, &request, "crypt_id_123", &upstream, 302)
+            .unwrap();
+        assert!(cross[0].1.starts_with(
+            "https://teleproxy.velone.ai/aq/crypt_id_123/?url=https%3A%2F%2Fcdn.otro.com%2Fx.jpg"
+        ));
+
+        // Sin Location o status no-redirect: no-op.
+        let mut other = vec![("content-type".to_string(), "text/html".to_string())];
+        super::rewrite_redirect_location(&mut other, &request, "crypt_id_123", &upstream, 301)
+            .unwrap();
+        assert_eq!(other[0].1, "text/html");
+        let mut pairs_200 = vec![("location".to_string(), "/x".to_string())];
+        super::rewrite_redirect_location(&mut pairs_200, &request, "crypt_id_123", &upstream, 200)
+            .unwrap();
+        assert_eq!(pairs_200[0].1, "/x");
+    }
+
+    #[test]
+    fn rewrite_redirect_bloquea_destinos_invalidos() {
+        let mut request = HeaderMap::new();
+        request.insert("host", HeaderValue::from_static("teleproxy.velone.ai"));
+        let upstream = url::Url::parse("https://origen.example/a").unwrap();
+
+        // Esquema no HTTP.
+        let mut js = vec![("location".to_string(), "javascript:alert(1)".to_string())];
+        let result = super::rewrite_redirect_location(&mut js, &request, "c1", &upstream, 302);
+        assert!(matches!(
+            result,
+            Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })
+        ));
+
+        // IP privada literal: nunca se reenvía al cliente (spec anti-SSRF paso 5).
+        let mut metadata = vec![(
+            "location".to_string(),
+            "http://169.254.169.254/latest".to_string(),
+        )];
+        let result =
+            super::rewrite_redirect_location(&mut metadata, &request, "c1", &upstream, 302);
+        assert!(matches!(
+            result,
+            Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })
+        ));
     }
 
     #[test]
