@@ -1,0 +1,53 @@
+services:
+  tele-proxy:
+    build:
+      context: .
+    ports:
+      # 8080 = /aq/ + /health. Objetivo Pingora (`add_tcp`); hoy lo sirve Axum, porque la portación
+      # de la Fase 3 no está terminada (docs/spec.md, "Estado de la migración"). Es el único puerto
+      # expuesto al público detrás del TLS de Dokploy.
+      - "${HTTP_PROXY_PORT:-8080}:8080"
+      # API de control (axum; pasará a BackgroundService): solo loopback. No publicar 8081 en 0.0.0.0.
+      - "127.0.0.1:${HTTP_CONTROL_PORT:-8081}:8081"
+    environment:
+      - RUST_LOG=${RUST_LOG:-warn,tele_proxy=info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PROXY_PORT=8080
+      - HTTP_CONTROL_PORT=8081
+      # ServerConf de Pingora (docs/ENVIRONMENT.md). threads vale 1 por defecto en Pingora: sin
+      # PROXY_WORKER_THREADS el proxy es mono-thread aunque el host tenga 8 núcleos.
+      - PROXY_WORKER_THREADS=${PROXY_WORKER_THREADS:-4}
+      - PROXY_WORK_STEALING=${PROXY_WORK_STEALING:-true}
+      - PROXY_GRACE_PERIOD_SECONDS=${PROXY_GRACE_PERIOD_SECONDS:-10}
+      - UPSTREAM_KEEPALIVE_POOL_SIZE=${UPSTREAM_KEEPALIVE_POOL_SIZE:-128}
+      - COUCHDB_URL=http://velone-servicios:5984
+      - COUCHDB_USER=${COUCHDB_USER}
+      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD}
+      - COUCHDB_DB_NAME=${COUCHDB_DB_NAME:-tele_proxy_configs}
+      - VALKEY_URL=redis://:${VALKEY_PASSWORD}@velone-servicios:6379
+      # Deadline y límite del sandbox Lua (`docs/ENVIRONMENT.md` § Límites del sistema): son las
+      # variables que hoy lee `AppConfig::from_env`, así que se pasan por compose para poder
+      # ajustarlas sin rebuild. Los dos timeouts fuera de 1..=60000 hacen que el proceso no arranque.
+      - LUA_TIMEOUT_MS=${LUA_TIMEOUT_MS:-200}
+      - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
+      - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
+    restart: unless-stopped
+    # Debe superar a PROXY_GRACE_PERIOD_SECONDS o Docker manda SIGKILL antes de que Pingora
+    # drene las conexiones en curso (el proceso no se daemoniza nunca: sin -d/--daemon).
+    stop_grace_period: 15s
+    # velone-servicios es un hostname de Tailscale MagicDNS (100.70.199.122). Docker no hereda
+    # el DNS de Tailscale del host, así que hay que mapearlo explícitamente para que el contenedor
+    # alcance CouchDB y Valkey en la red de Tailscale.
+    extra_hosts:
+      - "velone-servicios:100.70.199.122"
+    networks:
+      - default
+      - dokploy-network
+      - red-velone
+
+networks:
+  dokploy-network:
+    driver: bridge
+  red-velone:
+    driver: bridge
