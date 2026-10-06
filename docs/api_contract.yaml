@@ -531,6 +531,13 @@ components:
                     type: string
                   hash:
                     type: string
+        header_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/HeaderRule"
+          description: |
+            Reglas de modificación de headers de respuesta. El lenguaje de expresiones y los
+            límites completos viven en `docs/HEADER_RULES.md` (sintaxis Cloudflare Rules Engine).
 
     ClientConfigUpdate:
       type: object
@@ -586,3 +593,71 @@ components:
                   hash:
                     type: string
                     description: Hash SHA-256 del recurso fallback (obligatorio)
+        header_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/HeaderRule"
+          description: |
+            Sustituye la lista completa de reglas (como `whitelist`); `[]` las desactiva.
+            Máximo 50 reglas. Cada expresión se valida (sintaxis, tipos, regex de `matches`)
+            antes de escribir: un error devuelve 400 `invalid_config` con el campo concreto,
+            p. ej. `header_rules[0].expression`.
+
+    HeaderRule:
+      type: object
+      required:
+        - expression
+        - action
+        - action_parameters
+      properties:
+        expression:
+          type: string
+          maxLength: 4096
+          example: |
+            http.response.status eq 200 and starts_with(http.response.content_type, "application/json")
+          description: |
+            Expresión estilo Cloudflare Rules Engine. Campos: `http.response.status`,
+            `http.response.content_type`, `http.response.headers["nombre"]`,
+            `http.request.method`, `http.request.headers["nombre"]`, `url.scheme`,
+            `url.host`, `url.path`, `url.query`. Operadores: `eq`/`ne` (o `==`/`!=`),
+            `in { ... }`, `and`/`or`/`not`, paréntesis. Funciones: `starts_with`,
+            `ends_with`, `contains`, `matches`, `lower`, `upper`, `len`, `concat`.
+            Ver `docs/HEADER_RULES.md`.
+        action:
+          type: string
+          enum: [set]
+          description: Acción de la regla (Cloudflare fija `set` en las reglas de headers).
+        action_parameters:
+          type: object
+          required:
+            - headers
+          properties:
+            headers:
+              type: array
+              maxItems: 10
+              items:
+                type: object
+                required:
+                  - name
+                properties:
+                  name:
+                    type: string
+                    maxLength: 128
+                    example: "x-algo"
+                    description: |
+                      Nombre del header. Se rechazan los que gestiona el proxy
+                      (`x-cache`, `x-proxy-by`, `content-length`, `host`, ...).
+                  operation:
+                    type: string
+                    enum: [set, add, remove]
+                    default: set
+                    description: |
+                      `set` reemplaza el valor; `add` acumula valores múltiples;
+                      `remove` elimina el header.
+                  value:
+                    type: string
+                    maxLength: 4096
+                    example: "host=${url.host};status=${http.response.status}"
+                    description: |
+                      Obligatorio para `set`/`add`; ignorado en `remove`. Admite placeholders
+                      `${campo}` que se expanden contra el contexto de la petición.

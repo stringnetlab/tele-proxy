@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::domain::header_rules::HeaderRule;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(rename = "_id")]
@@ -17,6 +19,10 @@ pub struct ClientConfig {
     pub max_scripting_body_bytes: u64,
     pub scripting: ScriptingConfig,
     pub error_handling: ErrorHandlingConfig,
+    /// Reglas de modificación de headers de respuesta (Cloudflare Ruleset Engine-like).
+    /// `serde(default)` mantiene compatibles los documentos de CouchDB anteriores al campo.
+    #[serde(default)]
+    pub header_rules: Vec<HeaderRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +116,8 @@ pub struct ClientConfigResponse {
     pub max_scripting_body_bytes: u64,
     pub scripting: ScriptingConfigResponse,
     pub error_handling: ErrorHandlingConfig,
+    #[serde(default)]
+    pub header_rules: Vec<HeaderRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +151,7 @@ impl ClientConfig {
                 mode: ErrorMode::Transparent,
                 fallback_urls: HashMap::new(),
             },
+            header_rules: Vec::new(),
         }
     }
 
@@ -164,6 +173,7 @@ impl From<ClientConfig> for ClientConfigResponse {
                 code_hash: config.scripting.code_hash,
             },
             error_handling: config.error_handling,
+            header_rules: config.header_rules,
         }
     }
 }
@@ -175,6 +185,8 @@ pub struct ClientConfigUpdate {
     pub max_scripting_body_bytes: Option<u64>,
     pub scripting: Option<ScriptingUpdate>,
     pub error_handling: Option<ErrorHandlingConfig>,
+    /// Sustituye la lista completa de reglas (como `whitelist`): enviar `[]` las desactiva.
+    pub header_rules: Option<Vec<HeaderRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +249,7 @@ mod tests {
                 mode: ErrorMode::Wrapped,
                 fallback_urls: HashMap::new(),
             },
+            header_rules: Vec::new(),
         };
         assert!(!config.is_degraded());
     }

@@ -585,6 +585,7 @@ mod tests {
                     mode: ErrorMode::Wrapped,
                     fallback_urls: HashMap::new(),
                 },
+                header_rules: Vec::new(),
             },
         }
     }

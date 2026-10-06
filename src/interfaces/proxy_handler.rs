@@ -11,7 +11,8 @@ use crate::application::cache_key::response_cache_key;
 use crate::application::fallback::{FallbackService, FallbackSource};
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ProxyError};
-use crate::domain::models::{CachedResponse, ProxyContext};
+use crate::domain::header_rules::{self, RuleContext};
+use crate::domain::models::{CachedResponse, ClientConfig, ProxyContext};
 use crate::domain::validators::{domain_matches_whitelist, extract_domain, validate_url_strict};
 use crate::infrastructure::http_client;
 use crate::interfaces::control_api::ApiError;
@@ -31,6 +32,7 @@ pub async fn proxy_handler(
     State(service): State<Arc<ProxyService>>,
     Path(crypt_id): Path<String>,
     Query(query): Query<ProxyQuery>,
+    request_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if !validate_crypt_id(&crypt_id) {
         return Err(ApiError::from(ProxyError::InvalidCryptId {
@@ -71,7 +73,7 @@ pub async fn proxy_handler(
     let cache_key = response_cache_key(&config.internal_id, config.config_version, &query.url);
 
     if let Some(cached) = service.cache_store().get_response(&cache_key).await? {
-        let mut resp = build_response_from_cached(&cached)?;
+        let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)?;
         if degraded {
             resp.headers_mut()
                 .insert("X-Degraded-Mode", HeaderValue::from_static("true"));
@@ -104,9 +106,16 @@ pub async fn proxy_handler(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(error = %e, url = %query.url, "Upstream request failed, trying fallbacks");
-            return try_fallback_or_error(&service, &config, &query.url, fallback_mime, e)
-                .await
-                .map_err(ApiError::from);
+            return try_fallback_or_error(
+                &service,
+                &config,
+                &query.url,
+                fallback_mime,
+                &request_headers,
+                e,
+            )
+            .await
+            .map_err(ApiError::from);
         }
     };
 
@@ -119,6 +128,7 @@ pub async fn proxy_handler(
             &config,
             &query.url,
             fallback_mime,
+            &request_headers,
             ProxyError::UpstreamError {
                 url: query.url.clone(),
                 upstream_status: status,
@@ -176,25 +186,31 @@ pub async fn proxy_handler(
         }
     }
 
-    let mut response_headers = HeaderMap::new();
+    let mut response_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| !must_not_forward_header(k.as_str()))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_string(), val.to_string()))
+        })
+        .collect();
 
-    for (key, value) in headers.iter() {
-        if must_not_forward_header(key.as_str()) {
-            continue;
-        }
-        if let Ok(val) = value.to_str() {
-            response_headers.insert(
-                key,
-                HeaderValue::from_str(val).unwrap_or_else(|_| HeaderValue::from_static("")),
-            );
-        }
-    }
+    // Las reglas de headers del cliente se aplican sobre los headers crudos del upstream, antes
+    // de fijar los headers de seguridad del proxy (que siempre ganan, aunque una regla los
+    // nombrara — `PUT /config` ya prohíbe esos nombres).
+    apply_client_header_rules(&config, &request_headers, &url, status, &mut response_pairs);
+
+    let mut response_headers = pairs_to_header_map(response_pairs);
 
     response_headers.insert(
         "X-Content-Type-Options",
         HeaderValue::from_static("nosniff"),
     );
-    response_headers.insert("X-Proxy-By", HeaderValue::from_static("teleproxy.velone.ai"));
+    response_headers.insert(
+        "X-Proxy-By",
+        HeaderValue::from_static("teleproxy.velone.ai"),
+    );
     response_headers.insert(
         "X-Cache",
         HeaderValue::from_static(if cacheable { "MISS" } else { "BYPASS" }),
@@ -257,6 +273,7 @@ async fn try_fallback_or_error(
     config: &crate::domain::models::ClientConfig,
     url: &str,
     mime_hint: Option<&str>,
+    request_headers: &HeaderMap,
     original_error: ProxyError,
 ) -> Result<Response, ProxyError> {
     if config.error_handling.mode == crate::domain::models::ErrorMode::Transparent {
@@ -279,18 +296,23 @@ async fn try_fallback_or_error(
                 FallbackSource::Embedded => "embedded",
             };
 
-            let mut headers = HeaderMap::new();
-            for (key, value) in &fallback.cached.headers {
-                if must_not_forward_header(key) {
-                    continue;
-                }
-                if let (Ok(name), Ok(val)) = (
-                    key.parse::<axum::http::header::HeaderName>(),
-                    HeaderValue::from_str(value),
-                ) {
-                    headers.insert(name, val);
-                }
+            let mut pairs: Vec<(String, String)> = fallback
+                .cached
+                .headers
+                .iter()
+                .filter(|(key, _)| !must_not_forward_header(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if let Ok(parsed_url) = url::Url::parse(url) {
+                apply_client_header_rules(
+                    config,
+                    request_headers,
+                    &parsed_url,
+                    fallback.cached.status,
+                    &mut pairs,
+                );
             }
+            let mut headers = pairs_to_header_map(pairs);
             headers.insert(
                 "X-Content-Type-Options",
                 HeaderValue::from_static("nosniff"),
@@ -307,20 +329,22 @@ async fn try_fallback_or_error(
     }
 }
 
-fn build_response_from_cached(cached: &CachedResponse) -> Result<Response, ProxyError> {
-    let mut headers = HeaderMap::new();
-
-    for (key, value) in &cached.headers {
-        if must_not_forward_header(key) {
-            continue;
-        }
-        if let (Ok(name), Ok(val)) = (
-            key.parse::<axum::http::header::HeaderName>(),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, val);
-        }
-    }
+fn build_response_from_cached(
+    cached: &CachedResponse,
+    config: &ClientConfig,
+    request_headers: &HeaderMap,
+    url: &url::Url,
+) -> Result<Response, ProxyError> {
+    // Los headers cacheados son los crudos del upstream (las reglas se aplican al servir, no al
+    // guardar): una regla nueva cobra incluso sobre contenido ya cacheado de la misma versión.
+    let mut pairs: Vec<(String, String)> = cached
+        .headers
+        .iter()
+        .filter(|(key, _)| !must_not_forward_header(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    apply_client_header_rules(config, request_headers, url, cached.status, &mut pairs);
+    let mut headers = pairs_to_header_map(pairs);
 
     headers.insert(
         "X-Content-Type-Options",
@@ -334,6 +358,57 @@ fn build_response_from_cached(cached: &CachedResponse) -> Result<Response, Proxy
         headers,
         cached.body.clone(),
     )
+}
+
+/// Aplica las `header_rules` del cliente sobre los pares `(header, valor)` de la respuesta que
+/// se está sirviendo. Construye el contexto de evaluación a partir de la request del cliente
+/// (los headers que este envió al proxy), la URL destino y los headers de respuesta **antes** de
+/// aplicar ninguna regla: cada regla ve las mutaciones de las anteriores, pero ninguna condiciona
+/// a su propio resultado.
+fn apply_client_header_rules(
+    config: &ClientConfig,
+    request_headers: &HeaderMap,
+    url: &url::Url,
+    status: u16,
+    response_pairs: &mut Vec<(String, String)>,
+) {
+    if config.header_rules.is_empty() {
+        return;
+    }
+
+    let ctx = RuleContext {
+        method: "GET".to_string(),
+        url: url.clone(),
+        request_headers: header_pairs(request_headers),
+        response_status: status,
+        response_headers: response_pairs.clone(),
+    };
+    header_rules::apply_header_rules(&config.header_rules, &ctx, response_pairs);
+}
+
+fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+fn pairs_to_header_map(pairs: Vec<(String, String)>) -> HeaderMap {
+    let mut map = HeaderMap::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        if let (Ok(header_name), Ok(header_value)) = (
+            name.parse::<axum::http::header::HeaderName>(),
+            HeaderValue::from_str(&value),
+        ) {
+            map.append(header_name, header_value);
+        }
+    }
+    map
 }
 
 async fn make_upstream_request(
@@ -462,6 +537,8 @@ fn validate_crypt_id(crypt_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
     use super::{infer_mime_from_url, must_not_forward_header};
 
     #[test]
@@ -521,5 +598,114 @@ mod tests {
         assert_eq!(infer_mime_from_url("https://example.com/"), None);
         assert_eq!(infer_mime_from_url("not a url"), None);
         assert_eq!(infer_mime_from_url("https://example.com/.hidden"), None);
+    }
+
+    #[test]
+    fn pairs_roundtrip_preserves_duplicates() {
+        let mut map = HeaderMap::new();
+        map.append("x-a", HeaderValue::from_static("1"));
+        map.append("set-cookie", HeaderValue::from_static("a=1"));
+        map.append("set-cookie", HeaderValue::from_static("b=2"));
+
+        let pairs = super::header_pairs(&map);
+        assert_eq!(
+            pairs,
+            vec![
+                ("x-a".to_string(), "1".to_string()),
+                ("set-cookie".to_string(), "a=1".to_string()),
+                ("set-cookie".to_string(), "b=2".to_string()),
+            ]
+        );
+
+        let rebuilt = super::pairs_to_header_map(pairs);
+        let cookies: Vec<_> = rebuilt
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cookies, vec!["a=1".to_string(), "b=2".to_string()]);
+    }
+
+    #[test]
+    fn client_header_rules_apply_over_upstream_pairs() {
+        use crate::domain::header_rules::{
+            HeaderActionParameters, HeaderOperation, HeaderOperationKind, HeaderRule,
+            HeaderRuleAction,
+        };
+        use std::collections::HashMap;
+
+        let config = crate::domain::models::ClientConfig {
+            id: "c1".to_string(),
+            rev: None,
+            r#type: "client_config".to_string(),
+            internal_id: "c1".to_string(),
+            crypt_id: "crypt_id_123".to_string(),
+            bearer_token_hash: "sha256:x".to_string(),
+            config_version: 1,
+            whitelist: vec![],
+            rate_limit: crate::domain::models::RateLimitConfig {
+                max_requests: 50,
+                window_seconds: 60,
+            },
+            max_scripting_body_bytes: 0,
+            scripting: crate::domain::models::ScriptingConfig {
+                enabled: false,
+                code: String::new(),
+                code_hash: String::new(),
+            },
+            error_handling: crate::domain::models::ErrorHandlingConfig {
+                mode: crate::domain::models::ErrorMode::Wrapped,
+                fallback_urls: HashMap::new(),
+            },
+            header_rules: vec![HeaderRule {
+                expression: "http.response.status == 200 and starts_with(http.response.content_type, \"application/json\")".to_string(),
+                action: HeaderRuleAction::Set,
+                action_parameters: HeaderActionParameters {
+                    headers: vec![HeaderOperation {
+                        name: "x-algo".to_string(),
+                        operation: HeaderOperationKind::Set,
+                        value: Some("asi".to_string()),
+                    }],
+                },
+            }],
+        };
+
+        let mut request = HeaderMap::new();
+        request.insert("x-client", HeaderValue::from_static("ios"));
+
+        // Coincide la expresión: el header se inyecta.
+        let mut pairs = vec![("content-type".to_string(), "application/json".to_string())];
+        super::apply_client_header_rules(
+            &config,
+            &request,
+            &url::Url::parse("https://example.com/api").unwrap(),
+            200,
+            &mut pairs,
+        );
+        assert!(pairs.contains(&("x-algo".to_string(), "asi".to_string())));
+
+        // No coincide: el upstream mandó HTML y la regla no aplica.
+        let mut html_pairs = vec![("content-type".to_string(), "text/html".to_string())];
+        super::apply_client_header_rules(
+            &config,
+            &request,
+            &url::Url::parse("https://example.com/page").unwrap(),
+            200,
+            &mut html_pairs,
+        );
+        assert!(!html_pairs.iter().any(|(k, _)| k == "x-algo"));
+
+        // Sin reglas configuradas es un no-op (el fast-path no construye contexto).
+        let mut no_rules = config.clone();
+        no_rules.header_rules = Vec::new();
+        let mut untouched = vec![("content-type".to_string(), "application/json".to_string())];
+        super::apply_client_header_rules(
+            &no_rules,
+            &request,
+            &url::Url::parse("https://example.com/api").unwrap(),
+            200,
+            &mut untouched,
+        );
+        assert_eq!(untouched.len(), 1);
     }
 }

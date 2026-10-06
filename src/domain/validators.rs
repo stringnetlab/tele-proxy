@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 use crate::domain::errors::ProxyError;
+use crate::domain::header_rules::{self, HeaderOperationKind, HeaderRule};
 use crate::domain::models::ClientConfigUpdate;
 
 pub fn is_private_ip(ip: &IpAddr) -> bool {
@@ -176,9 +177,36 @@ pub const MAX_REQUESTS_CEILING: u32 = 10_000;
 pub const WINDOW_SECONDS_CEILING: u64 = 3_600;
 pub const MIN_SCRIPTING_BODY_BYTES: u64 = 1_048_576;
 pub const MAX_SCRIPTING_BODY_BYTES: u64 = 52_428_800;
+pub const MAX_HEADER_RULES: usize = 50;
+pub const MAX_HEADERS_PER_RULE: usize = 10;
+pub const MAX_HEADER_RULE_EXPRESSION_BYTES: usize = 4_096;
+const MAX_HEADER_NAME_BYTES: usize = 128;
+const MAX_HEADER_VALUE_BYTES: usize = 4_096;
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LABEL_BYTES: usize = 63;
 const SHA256_HEX_BYTES: usize = 64;
+
+/// Headers que el proxy gestiona por su cuenta. Permitir que una regla de cliente los toque
+/// rompería el contrato de la respuesta (framing calculado por hyper, `X-Cache` que miente,
+/// spoofing de `X-Proxy-By`, ...), así que `PUT /config` los rechaza con `400 invalid_config`.
+const PROXY_MANAGED_HEADERS: &[&str] = &[
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "host",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "x-cache",
+    "x-proxy-by",
+    "x-degraded-mode",
+    "x-content-type-options",
+    "x-fallback-source",
+];
 
 /// Validación de `PUT /api/v1/clients/config` (`docs/spec.md`, Fase 5). Solo mira el payload
 /// recibido: los campos `None` no se tocan, porque el repo los fusiona sobre el documento
@@ -261,7 +289,136 @@ pub fn validate_config_update(update: &ClientConfigUpdate) -> Result<(), ProxyEr
         }
     }
 
+    if let Some(header_rules) = &update.header_rules {
+        validate_header_rules(header_rules)?;
+    }
+
     Ok(())
+}
+
+/// Cotas y coherencia de `header_rules`. La acción (`set`/`add`/`remove`) y los nombres de los
+/// headers se validan aquí; la sintaxis de cada expresión la valida el propio parser del
+/// dominio (`header_rules::validate_expression`).
+fn validate_header_rules(rules: &[HeaderRule]) -> Result<(), ProxyError> {
+    if rules.len() > MAX_HEADER_RULES {
+        return Err(invalid_config(
+            "header_rules",
+            format!(
+                "{} rules exceed the {} allowed",
+                rules.len(),
+                MAX_HEADER_RULES
+            ),
+        ));
+    }
+
+    for (i, rule) in rules.iter().enumerate() {
+        let base = format!("header_rules[{i}]");
+
+        if rule.expression.len() > MAX_HEADER_RULE_EXPRESSION_BYTES {
+            return Err(invalid_config(
+                &format!("{base}.expression"),
+                format!(
+                    "expression has {} bytes, max {} allowed",
+                    rule.expression.len(),
+                    MAX_HEADER_RULE_EXPRESSION_BYTES
+                ),
+            ));
+        }
+        if let Err(reason) = header_rules::validate_expression(&rule.expression) {
+            return Err(invalid_config(&format!("{base}.expression"), reason));
+        }
+
+        if rule.action_parameters.headers.len() > MAX_HEADERS_PER_RULE {
+            return Err(invalid_config(
+                &format!("{base}.action_parameters.headers"),
+                format!(
+                    "{} operations exceed the {} allowed",
+                    rule.action_parameters.headers.len(),
+                    MAX_HEADERS_PER_RULE
+                ),
+            ));
+        }
+
+        for (j, op) in rule.action_parameters.headers.iter().enumerate() {
+            let field = format!("{base}.action_parameters.headers[{j}]");
+            validate_rule_header_name(&format!("{field}.name"), &op.name)?;
+
+            match op.operation {
+                HeaderOperationKind::Remove => {}
+                HeaderOperationKind::Set | HeaderOperationKind::Add => {
+                    let value = op.value.as_deref().ok_or_else(|| {
+                        invalid_config(
+                            &format!("{field}.value"),
+                            "required for set/add operations".to_string(),
+                        )
+                    })?;
+                    if value.len() > MAX_HEADER_VALUE_BYTES {
+                        return Err(invalid_config(
+                            &format!("{field}.value"),
+                            format!(
+                                "value has {} bytes, max {} allowed",
+                                value.len(),
+                                MAX_HEADER_VALUE_BYTES
+                            ),
+                        ));
+                    }
+                    if let Err(reason) = header_rules::validate_value_template(value) {
+                        return Err(invalid_config(&format!("{field}.value"), reason));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_rule_header_name(field: &str, name: &str) -> Result<(), ProxyError> {
+    if name.is_empty() || name.len() > MAX_HEADER_NAME_BYTES {
+        return Err(invalid_config(
+            field,
+            format!(
+                "header name must be 1..={} bytes, got {}",
+                MAX_HEADER_NAME_BYTES,
+                name.len()
+            ),
+        ));
+    }
+    if !name.bytes().all(is_header_name_char) {
+        return Err(invalid_config(
+            field,
+            format!("'{name}' is not a valid HTTP header name"),
+        ));
+    }
+    if PROXY_MANAGED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(invalid_config(
+            field,
+            format!("'{name}' is managed by the proxy and cannot be modified"),
+        ));
+    }
+    Ok(())
+}
+
+/// `tchar` de RFC 9110: el charset que un nombre de header puede usar.
+fn is_header_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn invalid_config(field: &str, reason: String) -> ProxyError {
@@ -376,6 +533,7 @@ mod tests {
             max_scripting_body_bytes: None,
             scripting: None,
             error_handling: None,
+            header_rules: None,
         }
     }
 
@@ -536,6 +694,7 @@ mod tests {
                 code_hash: Some(format!("sha256:{}", "ab".repeat(SHA256_HEX_BYTES / 2))),
             }),
             error_handling: None,
+            header_rules: None,
         };
         assert!(validate_config_update(&update).is_ok());
     }
@@ -757,6 +916,141 @@ mod tests {
         assert_eq!(
             invalid_field(validate_config_update(&missing_hash)),
             "error_handling.fallback_urls[image/*].hash"
+        );
+    }
+
+    fn header_rule(
+        expression: &str,
+        operations: Vec<(&str, HeaderOperationKind, Option<&str>)>,
+    ) -> HeaderRule {
+        HeaderRule {
+            expression: expression.to_string(),
+            action: crate::domain::header_rules::HeaderRuleAction::Set,
+            action_parameters: crate::domain::header_rules::HeaderActionParameters {
+                headers: operations
+                    .into_iter()
+                    .map(
+                        |(name, operation, value)| crate::domain::header_rules::HeaderOperation {
+                            name: name.to_string(),
+                            operation,
+                            value: value.map(str::to_string),
+                        },
+                    )
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_config_update_accepts_valid_header_rules() {
+        let update = ClientConfigUpdate {
+            header_rules: Some(vec![
+                header_rule(
+                    "http.response.status == 200 and starts_with(http.response.content_type, \"application/json\")",
+                    vec![("x-algo", HeaderOperationKind::Set, Some("asi"))],
+                ),
+                header_rule(
+                    "http.request.headers[\"x-debug\"] == \"1\"",
+                    vec![
+                        ("x-debug-trace", HeaderOperationKind::Add, Some("${url.host}")),
+                        ("server", HeaderOperationKind::Remove, None),
+                    ],
+                ),
+            ]),
+            ..base_update()
+        };
+        assert!(validate_config_update(&update).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_update_rejects_bad_header_rule_expressions() {
+        for expression in [
+            "http.response.status == \"200\"",
+            "unknown.field == 1",
+            "len(200) == 3",
+            "matches(url.path, \"[unclosed\")",
+        ] {
+            let update = ClientConfigUpdate {
+                header_rules: Some(vec![header_rule(expression, vec![])]),
+                ..base_update()
+            };
+            assert_eq!(
+                invalid_field(validate_config_update(&update)),
+                "header_rules[0].expression",
+                "{expression:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_config_update_rejects_proxy_managed_headers() {
+        for name in ["x-cache", "X-Proxy-By", "content-length", "host"] {
+            let update = ClientConfigUpdate {
+                header_rules: Some(vec![header_rule(
+                    "true == true",
+                    vec![(name, HeaderOperationKind::Set, Some("v"))],
+                )]),
+                ..base_update()
+            };
+            assert_eq!(
+                invalid_field(validate_config_update(&update)),
+                "header_rules[0].action_parameters.headers[0].name",
+                "{name:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_config_update_rejects_bad_header_rule_operations() {
+        let value_required = ClientConfigUpdate {
+            header_rules: Some(vec![header_rule(
+                "true == true",
+                vec![("x-a", HeaderOperationKind::Set, None)],
+            )]),
+            ..base_update()
+        };
+        assert_eq!(
+            invalid_field(validate_config_update(&value_required)),
+            "header_rules[0].action_parameters.headers[0].value"
+        );
+
+        let bad_name = ClientConfigUpdate {
+            header_rules: Some(vec![header_rule(
+                "true == true",
+                vec![("bad name", HeaderOperationKind::Set, Some("v"))],
+            )]),
+            ..base_update()
+        };
+        assert_eq!(
+            invalid_field(validate_config_update(&bad_name)),
+            "header_rules[0].action_parameters.headers[0].name"
+        );
+
+        let bad_placeholder = ClientConfigUpdate {
+            header_rules: Some(vec![header_rule(
+                "true == true",
+                vec![("x-a", HeaderOperationKind::Set, Some("${url.bogus}"))],
+            )]),
+            ..base_update()
+        };
+        assert_eq!(
+            invalid_field(validate_config_update(&bad_placeholder)),
+            "header_rules[0].action_parameters.headers[0].value"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_update_rejects_too_many_header_rules() {
+        let rules: Vec<HeaderRule> = (0..=MAX_HEADER_RULES)
+            .map(|_| header_rule("true == true", vec![]))
+            .collect();
+        let update = ClientConfigUpdate {
+            header_rules: Some(rules),
+            ..base_update()
+        };
+        assert_eq!(
+            invalid_field(validate_config_update(&update)),
+            "header_rules"
         );
     }
 }
