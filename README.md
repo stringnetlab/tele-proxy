@@ -283,7 +283,18 @@ Cada cliente es un documento JSON en la base `tele_proxy_configs` de CouchDB, ge
     "fallback_urls": {
       "image/*": { "url": "https://cdn.example.com/error.png", "hash": "sha256:..." }
     }
-  }
+  },
+  "header_rules": [
+    {
+      "expression": "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")",
+      "action": "set",
+      "action_parameters": {
+        "headers": [
+          { "name": "x-algo", "value": "asi", "operation": "set" }
+        ]
+      }
+    }
+  ]
 }
 ```
 
@@ -363,6 +374,52 @@ Límites del sandbox (variables de entorno): `LUA_TIMEOUT_MS` (default 200), `LU
 `fallback_urls` usa como clave un patrón de MIME (`type/subtype` o `type/*`). La `url` se valida
 con el mismo pipeline anti-SSRF (http/https, sin credenciales, sin IPs privadas). El `hash`
 garantiza la integridad del contenido servido.
+
+#### `header_rules` — modificación de headers de respuesta
+
+Reglas estilo [Cloudflare Ruleset Engine](https://developers.cloudflare.com/ruleset-engine/about/rules/)
+para inyectar, modificar o eliminar headers de la respuesta según condiciones sobre la petición
+y el upstream:
+
+```json
+"header_rules": [
+  {
+    "expression": "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")",
+    "action": "set",
+    "action_parameters": {
+      "headers": [
+        { "name": "x-algo", "value": "asi", "operation": "set" }
+      ]
+    }
+  },
+  {
+    "expression": "http.request.headers[\"x-client\"] in {\"ios\" \"android\"}",
+    "action": "set",
+    "action_parameters": {
+      "headers": [
+        { "name": "x-platform", "value": "${http.request.headers[\"x-client\"]}", "operation": "set" }
+      ]
+    }
+  }
+]
+```
+
+| Campo | Descripción |
+|---|---|
+| `expression` | Condición evaluada por petición. Máx. 4.096 caracteres. |
+| `action` | `"set"` (única por ahora; como las reglas de headers de Cloudflare). |
+| `action_parameters.headers` | Operaciones `set` (reemplaza), `add` (acumula valores) o `remove`. Máx. 10 por regla. El `value` admite placeholders `${campo}`. |
+
+- Sintaxis de expresiones: `eq`/`ne` (o `==`/`!=`), conjuntos `in { ... }`, `and`/`or`/`not`,
+  paréntesis; funciones `starts_with`, `ends_with`, `contains`, `matches` (regex),
+  `lower`, `upper`, `len`, `concat`.
+- Campos: `http.response.status`, `http.response.content_type`,
+  `http.response.headers["nombre"]`, `http.request.method`,
+  `http.request.headers["nombre"]`, `url.scheme`, `url.host`, `url.path`, `url.query`.
+- Se aplican en orden sobre cualquier respuesta servida (upstream, caché HIT o fallback); los
+  headers que fija el proxy siempre ganan y no pueden tocarse desde una regla.
+- Cotas: 50 reglas por cliente; `[]` las desactiva. Referencia completa del lenguaje con
+  ejemplos por caso de uso: **`docs/HEADER_RULES.md`**.
 
 ### Cliente demo (seed)
 
@@ -617,6 +674,7 @@ degradan al body original en lugar de romper la respuesta.
 |---|---|
 | `docs/spec.md` | Especificación técnica completa (arquitectura, fases, estado de la migración a Pingora) |
 | `docs/CLIENT_CONFIG.md` | Referencia de cada campo del documento de cliente |
+| `docs/HEADER_RULES.md` | Lenguaje de expresiones de `header_rules` (sintaxis Cloudflare, funciones, ejemplos) |
 | `docs/ENVIRONMENT.md` | Lista canónica de variables de entorno y validaciones |
 | `docs/ERROR_DICTIONARY.md` | Diccionario completo de códigos de error |
 | `docs/DEPLOYMENT.md` | Procedimiento de despliegue con Dokploy, incluido "Subir el Rev de Pingora" |

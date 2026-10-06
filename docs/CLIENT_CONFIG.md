@@ -133,6 +133,63 @@ sin credenciales, sin fragmentos, sin IPs privadas en el host.
 
 ---
 
+## Reglas de Modificación de Headers (`header_rules`)
+
+Cada cliente puede definir reglas que inyectan, modifican o eliminan headers de la respuesta,
+con expresiones estilo [Cloudflare Ruleset Engine](https://developers.cloudflare.com/ruleset-engine/about/rules/).
+Referencia completa del lenguaje (campos, operadores, funciones, límites y ejemplos) en
+**`docs/HEADER_RULES.md`**.
+
+```json
+"header_rules": [
+  {
+    "expression": "http.response.status eq 200 and starts_with(http.response.content_type, \"application/json\")",
+    "action": "set",
+    "action_parameters": {
+      "headers": [
+        { "name": "x-algo", "value": "asi", "operation": "set" }
+      ]
+    }
+  },
+  {
+    "expression": "http.request.headers[\"x-client\"] in {\"ios\" \"android\"}",
+    "action": "set",
+    "action_parameters": {
+      "headers": [
+        { "name": "x-platform", "value": "${http.request.headers[\"x-client\"]}", "operation": "set" }
+      ]
+    }
+  }
+]
+```
+
+| Campo | Descripción |
+|---|---|
+| `expression` | Se evalúa por petición contra la request del cliente y la respuesta del upstream. Si es `true`, se aplican las operaciones. Máx. 4.096 caracteres. |
+| `action` | `"set"` (única acción por ahora, igual que las reglas de headers de Cloudflare). |
+| `action_parameters.headers` | Lista de operaciones (máx. 10 por regla): `name` + `operation` (`set`/`add`/`remove`) + `value` (obligatorio para `set`/`add`, admite placeholders `${campo}`). |
+
+**Comportamiento**:
+
+- Las reglas se aplican en orden sobre la respuesta servida (upstream en vivo, caché HIT y
+  fallback). Cada regla ve las modificaciones de las anteriores.
+- Los headers del proxy (`X-Cache`, `X-Proxy-By`, `X-Content-Type-Options`,
+  `X-Degraded-Mode`) se fijan después y siempre ganan; `PUT /config` rechaza operaciones sobre
+  ellos y sobre los headers de framing (`content-length`, `transfer-encoding`, `connection`,
+  `host`, ...).
+- `PUT` con `header_rules` sustituye la lista completa (como `whitelist`); `[]` las desactiva.
+- El campo es opcional: los documentos de CouchDB anteriores a él se cargan con la lista vacía.
+- Cotas: 50 reglas por cliente, 10 operaciones por regla, 4.096 caracteres por expresión,
+  128 bytes por nombre de header, 4.096 bytes por valor. Fuera de cota → `400 invalid_config`.
+
+**Campos disponibles en las expresiones**: `http.response.status`,
+`http.response.content_type`, `http.response.headers["nombre"]`, `http.request.method`,
+`http.request.headers["nombre"]`, `url.scheme`, `url.host`, `url.path`, `url.query`.
+Operadores: `eq`/`ne` (o `==`/`!=`), `in { ... }`, `and`/`or`/`not`, paréntesis. Funciones:
+`starts_with`, `ends_with`, `contains`, `matches` (regex), `lower`, `upper`, `len`, `concat`.
+
+---
+
 ## Configuración del Cliente Demo (Seed)
 
 Cuando la base de datos CouchDB está vacía (primer despliegue), el proxy crea automáticamente un
