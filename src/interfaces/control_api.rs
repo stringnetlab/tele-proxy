@@ -58,11 +58,13 @@ impl IntoResponse for ApiError {
         let status = StatusCode::from_u16(self.error.to_http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         // Un 5xx no filtra el motivo interno al cliente: eso vive solo en el log. En
-        // `MODO=desarrollo` el cuerpo es diagnóstico completo a propósito.
+        // `MODO=desarrollo` el cuerpo es diagnóstico completo a propósito. En producción los
+        // fallos del origen se distinguen de los del propio proxy (Bad gateway / Gateway
+        // timeout) sin filtrar detalles internos.
         let message = if self.verbose || !status.is_server_error() {
             self.error.to_string()
         } else {
-            String::from("Internal server error")
+            self.error.escueto_message().to_string()
         };
         let details = self.verbose.then(|| {
             self.error
@@ -270,6 +272,42 @@ mod tests {
             body["details"]["reason"],
             "CouchDB connection refused at 192.168.0.10:5984"
         );
+    }
+
+    #[tokio::test]
+    async fn error_5xx_mantiene_el_mensaje_escueto_de_produccion() {
+        // Los fallos del origen se distinguen del propio proxy sin filtrar detalles internos.
+        let timeout = body_json(
+            ApiError::detailed(
+                ProxyError::UpstreamTimeout {
+                    url: "https://lento.example/x.jpg".to_string(),
+                    timeout_ms: 30_000,
+                },
+                false,
+            )
+            .into_response(),
+        )
+        .await;
+        assert_eq!(timeout["error"], "upstream_timeout");
+        assert_eq!(timeout["message"], "Gateway timeout");
+        assert!(timeout.get("details").is_none(), "{timeout}");
+
+        let desarrollo = body_json(
+            ApiError::detailed(
+                ProxyError::UpstreamTimeout {
+                    url: "https://lento.example/x.jpg".to_string(),
+                    timeout_ms: 30_000,
+                },
+                true,
+            )
+            .into_response(),
+        )
+        .await;
+        assert!(desarrollo["message"]
+            .as_str()
+            .expect("message must be a string")
+            .contains("lento.example"));
+        assert_eq!(desarrollo["details"]["timeout_ms"], "30000");
     }
 
     #[tokio::test]

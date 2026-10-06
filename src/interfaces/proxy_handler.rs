@@ -137,6 +137,14 @@ pub async fn proxy_handler(
     let status = upstream_response.status().as_u16();
 
     if status >= 400 {
+        // Modo transparent (docs/CLIENT_CONFIG.md): el error del upstream viaja al cliente tal
+        // cual — status, headers y cuerpo — no un 502 genérico que esconde qué pasó.
+        if config.error_handling.mode == crate::domain::models::ErrorMode::Transparent {
+            tracing::warn!(status = status, url = %query.url, "Upstream returned error, passing through (transparent mode)");
+            return passthrough_upstream_error(upstream_response, degraded)
+                .await
+                .map_err(&api_err);
+        }
         tracing::warn!(status = status, url = %query.url, "Upstream returned error, trying fallbacks");
         return try_fallback_or_error(
             &service,
@@ -147,6 +155,7 @@ pub async fn proxy_handler(
             ProxyError::UpstreamError {
                 url: query.url.clone(),
                 upstream_status: status,
+                reason: "upstream returned an error status".to_string(),
             },
         )
         .await
@@ -336,7 +345,10 @@ async fn try_fallback_or_error(
                 "X-Content-Type-Options",
                 HeaderValue::from_static("nosniff"),
             );
-            headers.insert("X-Proxy-By", HeaderValue::from_static("tele.velone.ai"));
+            headers.insert(
+                "X-Proxy-By",
+                HeaderValue::from_static("teleproxy.velone.ai"),
+            );
             headers.insert("X-Cache", HeaderValue::from_static("FALLBACK"));
             headers.insert("X-Fallback-Source", HeaderValue::from_static(x_fallback));
 
@@ -369,7 +381,10 @@ fn build_response_from_cached(
         "X-Content-Type-Options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("X-Proxy-By", HeaderValue::from_static("tele.velone.ai"));
+    headers.insert(
+        "X-Proxy-By",
+        HeaderValue::from_static("teleproxy.velone.ai"),
+    );
     headers.insert("X-Cache", HeaderValue::from_static("HIT"));
 
     build_response(
@@ -451,18 +466,76 @@ async fn make_upstream_request(
     )?;
 
     client.get(url.as_str()).send().await.map_err(|e| {
+        // `{e:?}` en lugar de `{e}`: el `Display` de reqwest solo dice "error sending request
+        // for url" y esconde la causa (TLS alert, connect refused, timeout); la cadena completa
+        // del error vive en el log y en el `reason` del error (visible en MODO=desarrollo).
+        let reason = format!("{e:?}");
         tracing::warn!(
             url = %url,
             pinned_ip = %resolved_ip,
             port = port,
-            error = %e,
+            error = %reason,
             "Upstream connection failed"
         );
-        ProxyError::UpstreamError {
-            url: url.to_string(),
-            upstream_status: 502,
+        // El timeout del origen es un 504, no un 502: el cliente puede distinguir "el origen
+        // no respondió a tiempo" de "el origen rechazó la conexión".
+        if e.is_timeout() {
+            ProxyError::UpstreamTimeout {
+                url: url.to_string(),
+                timeout_ms: UPSTREAM_TIMEOUT_SECS * 1000,
+            }
+        } else {
+            ProxyError::UpstreamError {
+                url: url.to_string(),
+                upstream_status: 502,
+                reason,
+            }
         }
     })
+}
+
+/// Reenvía el error del upstream al cliente tal cual (modo `transparent`): el status original
+/// (404 del origen → 404, no 502), los headers de respuesta filtrados de hop-by-hop y el cuerpo
+/// del error, más los headers de identificación y seguridad del proxy. El cuerpo se lee con el
+/// mismo tope que una respuesta normal: un origen que cuelga con un error enorme no puede
+/// agotar la memoria del proxy.
+async fn passthrough_upstream_error(
+    upstream_response: reqwest::Response,
+    degraded: bool,
+) -> Result<Response, ProxyError> {
+    let status = upstream_response.status();
+    let headers = upstream_response.headers().clone();
+    let body = http_client::read_body_capped(upstream_response, MAX_RESPONSE_SIZE).await?;
+
+    let mut response_headers = pairs_to_header_map(
+        headers
+            .iter()
+            .filter(|(k, _)| !must_not_forward_header(k.as_str()))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.as_str().to_string(), val.to_string()))
+            })
+            .collect(),
+    );
+    response_headers.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(
+        "X-Proxy-By",
+        HeaderValue::from_static("teleproxy.velone.ai"),
+    );
+    response_headers.insert("X-Cache", HeaderValue::from_static("BYPASS"));
+    if degraded {
+        response_headers.insert("X-Degraded-Mode", HeaderValue::from_static("true"));
+    }
+
+    build_response(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        response_headers,
+        body,
+    )
 }
 
 // A reverse proxy must not forward transport-framing or content-encoding headers

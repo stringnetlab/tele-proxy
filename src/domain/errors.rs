@@ -52,8 +52,15 @@ pub enum ProxyError {
         max_allowed: u64,
     },
 
-    #[error("Upstream error: status={upstream_status}")]
-    UpstreamError { url: String, upstream_status: u16 },
+    #[error("Upstream error: status={upstream_status}, reason={reason}")]
+    UpstreamError {
+        url: String,
+        upstream_status: u16,
+        reason: String,
+    },
+
+    #[error("Upstream timeout: {timeout_ms}ms (url={url})")]
+    UpstreamTimeout { url: String, timeout_ms: u64 },
 
     #[error("Script timeout: {elapsed_ms}ms (max: {timeout_ms}ms)")]
     ScriptTimeout { timeout_ms: u64, elapsed_ms: u64 },
@@ -107,6 +114,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => 500,
             Self::PayloadTooLarge { .. } => 413,
             Self::UpstreamError { .. } => 502,
+            Self::UpstreamTimeout { .. } => 504,
             Self::ScriptTimeout { .. } => 500,
             Self::ScriptMemoryLimit { .. } => 500,
             Self::WebhookTimeout { .. } => 500,
@@ -131,6 +139,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => "integrity_check_failed",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::ScriptTimeout { .. } => "script_timeout",
             Self::ScriptMemoryLimit { .. } => "script_memory_limit",
             Self::WebhookTimeout { .. } => "webhook_timeout",
@@ -154,6 +163,7 @@ impl ProxyError {
             | Self::ScriptMemoryLimit { .. }
             | Self::WebhookTimeout { .. }
             | Self::WebhookFailed { .. }
+            | Self::UpstreamTimeout { .. }
             | Self::Unauthorized { .. } => Level::WARN,
 
             Self::InvalidCryptId { .. }
@@ -165,6 +175,19 @@ impl ProxyError {
             | Self::UpstreamError { .. }
             | Self::ConfigNotFound { .. }
             | Self::Internal { .. } => Level::ERROR,
+        }
+    }
+
+    /// Mensaje escueto para el cuerpo de error en producción (los 5xx no filtran el motivo
+    /// interno, docs/ERROR_DICTIONARY.md § Camino Axum). Los fallos del **origen** se
+    /// distinguen de los fallos del propio proxy: `upstream_error`/`dns_resolution_failed`
+    /// → "Bad gateway", `upstream_timeout` → "Gateway timeout". En `MODO=desarrollo` el
+    /// cuerpo lleva el mensaje completo (`ApiError` con `verbose`).
+    pub fn escueto_message(&self) -> &'static str {
+        match self {
+            Self::UpstreamError { .. } | Self::DnsResolutionFailed { .. } => "Bad gateway",
+            Self::UpstreamTimeout { .. } => "Gateway timeout",
+            _ => "Internal server error",
         }
     }
 
@@ -240,10 +263,15 @@ impl ProxyError {
             Self::UpstreamError {
                 url,
                 upstream_status,
+                reason,
             } => vec![
                 ("url", url.clone()),
                 ("upstream_status", upstream_status.to_string()),
+                ("reason", reason.clone()),
             ],
+            Self::UpstreamTimeout { url, timeout_ms } => {
+                vec![("url", url.clone()), ("timeout_ms", timeout_ms.to_string())]
+            }
             Self::ScriptTimeout {
                 timeout_ms,
                 elapsed_ms,
@@ -287,6 +315,7 @@ impl ProxyError {
             Self::SsrfBlocked { url, .. }
             | Self::InvalidUrlFormat { url, .. }
             | Self::UpstreamError { url, .. }
+            | Self::UpstreamTimeout { url, .. }
             | Self::WebhookFailed { url, .. } => Some(url.as_str()),
             Self::WebhookTimeout { webhook_url, .. } => Some(webhook_url.as_str()),
             _ => None,
@@ -398,6 +427,7 @@ mod tests {
         assert!(!ProxyError::UpstreamError {
             url: "https://example.com".to_string(),
             upstream_status: 503,
+            reason: "service unavailable".to_string(),
         }
         .is_client_error());
     }
@@ -410,6 +440,47 @@ mod tests {
             }
             .to_error_code(),
             "domain_not_whitelisted"
+        );
+    }
+
+    #[test]
+    fn upstream_timeout_es_504_warn_y_escueto() {
+        let e = ProxyError::UpstreamTimeout {
+            url: "https://lento.example/x.jpg".to_string(),
+            timeout_ms: 30_000,
+        };
+        assert_eq!(e.to_http_status(), 504);
+        assert_eq!(e.to_error_code(), "upstream_timeout");
+        assert_eq!(e.log_level(), Level::WARN);
+        assert_eq!(e.escueto_message(), "Gateway timeout");
+        assert_eq!(e.url(), Some("https://lento.example/x.jpg"));
+    }
+
+    #[test]
+    fn escueto_message_distingue_fallo_de_origen_del_propio_proxy() {
+        assert_eq!(
+            ProxyError::UpstreamError {
+                url: "https://a.example".to_string(),
+                upstream_status: 503,
+                reason: "connect refused".to_string(),
+            }
+            .escueto_message(),
+            "Bad gateway"
+        );
+        assert_eq!(
+            ProxyError::DnsResolutionFailed {
+                hostname: "a.example".to_string(),
+                reason: "nxdomain".to_string(),
+            }
+            .escueto_message(),
+            "Bad gateway"
+        );
+        assert_eq!(
+            ProxyError::Internal {
+                reason: "algo interno".to_string(),
+            }
+            .escueto_message(),
+            "Internal server error"
         );
     }
 }
