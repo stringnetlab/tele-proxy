@@ -1,0 +1,588 @@
+openapi: 3.0.3
+info:
+  title: Tele-Proxy API
+  version: 1.0.0
+  description: |
+    API de proxy de acceso remoto con dos niveles de seguridad:
+    - Endpoint público sin autenticación (solo whitelist + rate limit)
+    - Endpoints de control con Bearer token
+
+paths:
+  # ========================================
+  # ENDPOINT PÚBLICO (Sin Autenticación)
+  # ========================================
+  /aq/{crypt_id}/:
+    get:
+      summary: Proxy público de recursos externos
+      description: |
+        Endpoint público sin autenticación. La seguridad se gestiona mediante:
+        - Validación del crypt_id (nanoid de 12 caracteres)
+        - Whitelist de dominios permitidos
+        - Rate limit por crypt_id
+        - Validación estricta anti-SSRF
+
+        Solo registra errores (4xx, 5xx, bloqueos). No registra solicitudes exitosas.
+      parameters:
+        - name: crypt_id
+          in: path
+          required: true
+          description: |
+            Identificador criptográfico público del cliente (nanoid de 12 caracteres URL-safe).
+            Este ID puede ser rotado por el cliente vía la API de control si se detecta abuso.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]{12}$"
+            example: "V1StGXR8_Z5j"
+
+        - name: url
+          in: query
+          required: true
+          description: |
+            URL del recurso externo a proxificar. Debe estar URL-encoded.
+            Solo se permiten esquemas http:// y https://.
+            No se permiten credenciales embebidas (user:pass@) ni fragmentos (#).
+          schema:
+            type: string
+            format: uri
+            example: "https%3A%2F%2Fshutterstock.com%2Fimagen.jpg"
+
+        - name: mime
+          in: query
+          required: false
+          description: |
+            MIME type esperado del recurso (opcional).
+            Se usa para seleccionar el fallback de error adecuado si el origen falla.
+            Prioridad de inferencia: 1) Este parámetro, 2) Extensión de la URL,
+            3) `Content-Type` del origen, 4) `application/octet-stream`.
+            El header `Accept` del cliente NO interviene: selecciona lo que el cliente acepta,
+            no lo que el recurso es, y usarlo para elegir un fallback confundiría un 404
+            de imagen con uno de PDF.
+          schema:
+            type: string
+            example: "image/png"
+
+      responses:
+        "200":
+          description: Recurso obtenido exitosamente
+          content:
+            "*/*":
+              schema:
+                type: string
+                format: binary
+                description: El cuerpo del recurso (imagen, PDF, HTML, etc.)
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+            X-Proxy-By:
+              $ref: "#/components/headers/X-Proxy-By"
+            X-Content-Type-Options:
+              $ref: "#/components/headers/X-Content-Type-Options"
+
+        "400":
+          description: URL malformada o con esquema inválido
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "invalid_url_format"
+                message: "Invalid URL format: URL contains credentials"
+
+        "403":
+          description: Dominio no autorizado o SSRF bloqueado
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                domain_not_whitelisted:
+                  summary: Dominio fuera de whitelist
+                  value:
+                    error: "domain_not_whitelisted"
+                    message: "Domain not whitelisted: malicious.com"
+                ssrf_blocked:
+                  summary: Intento de SSRF
+                  value:
+                    error: "ssrf_blocked"
+                    message: "SSRF blocked: resolves to private IP"
+
+        "404":
+          description: crypt_id inválido o inexistente
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_crypt_id:
+                  summary: crypt_id con formato inválido o sin cliente en CouchDB
+                  value:
+                    error: "invalid_crypt_id"
+                    message: "Invalid crypt_id: not found"
+                config_not_found:
+                  summary: La configuración del cliente no existe
+                  value:
+                    error: "config_not_found"
+                    message: "Configuration not found for client: client_123"
+
+        "413":
+          description: El cuerpo superado `max_response_size_bytes`
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "payload_too_large"
+                message: "Payload too large: 15728640 bytes (max: 10485760)"
+
+        "429":
+          description: Rate limit excedido
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                example: 60
+              description: Segundos hasta que se puede reintentar
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "rate_limit_exceeded"
+                message: "Rate limit exceeded"
+
+        "500":
+          description: Fallo del proxy o del script Lua (ver ERROR_DICTIONARY.md)
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                internal_error:
+                  summary: Fallo no clasificado
+                  value:
+                    error: "internal_error"
+                    message: "Internal error: cache write failed"
+                integrity_check_failed:
+                  summary: El hash del script o del fallback no coincide
+                  value:
+                    error: "integrity_check_failed"
+                    message: "Integrity check failed for lua_script"
+
+        "502":
+          description: Error al obtener el recurso del origen o fallo DNS
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                upstream_error:
+                  summary: El origen devolvió 4xx/5xx sin fallback aplicable
+                  value:
+                    error: "upstream_error"
+                    message: "Upstream error: status=503"
+                dns_resolution_failed:
+                  summary: Todos los resolvers DoT fallaron
+                  value:
+                    error: "dns_resolution_failed"
+                    message: "DNS resolution failed for unknown.example: nxdomain"
+
+  # ========================================
+  # ENDPOINTS DE CONTROL (Bearer Token)
+  # ========================================
+  /api/v1/clients/config:
+    get:
+      summary: Obtiene la configuración del cliente autenticado
+      description: |
+        Devuelve la configuración completa del cliente, incluyendo:
+        - crypt_id actual (público, rotable)
+        - whitelist de dominios
+        - rate limit
+        - configuración de scripting
+        - manejo de errores
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Configuración actual
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientConfigResponse"
+        "401":
+          description: Token Bearer inválido o ausente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "unauthorized"
+                message: "Unauthorized: Missing Authorization header"
+        "404":
+          description: Ningún cliente con ese token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "config_not_found"
+                message: "Configuration not found for client: client_123"
+        "500":
+          description: Fallo de CouchDB u otro error no clasificado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "internal_error"
+                message: "Internal error: couchdb view query failed"
+
+    put:
+      summary: Actualiza la configuración del cliente
+      description: |
+        Actualiza la configuración del cliente autenticado.
+        Requiere el hash de integridad (`sha256:<64 hex>`) para scripts Lua y fallbacks;
+        el `PUT` comprueba el formato, la comparación `sha256(code) == code_hash` ocurre
+        en tiempo de ejecución antes de correr el script (ver `spec.md`, Fase 4).
+        Incrementa automáticamente el config_version (invalida caché sin purga masiva).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientConfigUpdate"
+      responses:
+        "200":
+          description: Configuración actualizada exitosamente
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config_version:
+                    type: integer
+                    description: Nueva versión de configuración
+                  updated_at:
+                    type: string
+                    format: date-time
+        "400":
+          description: >
+            Error de validación. `PUT` valida todos los límites del contrato
+            (`max_requests 1..=10000`, `window_seconds 1..=3600`,
+            `max_scripting_body_bytes 1048576..=52428800`, `whitelist` de hasta 100
+            hosts desnudos sin IP privadas, `code_hash` y el `hash` de cada fallback
+            en formato `sha256:<64 hex>`) antes de escribir en CouchDB, y también
+            devuelve 400 cuando el cuerpo no deserializa (p. ej. un
+            `error_handling.mode` fuera de `transparent`/`wrapped`): Axum respondería
+            422 en texto plano, y se normaliza a este contrato. Códigos:
+            `invalid_config` para las cotas y los hashes, `invalid_url_format` para
+            una URL de fallback no http/https.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                out_of_range:
+                  summary: Un límite fuera del rango permitido
+                  value:
+                    error: "invalid_config"
+                    message: "Invalid config: rate_limit.max_requests 20000 is outside 1..=10000"
+                whitelist_entry_not_a_host:
+                  summary: Entrada de whitelist que lleva una cabecera o una IP privada
+                  value:
+                    error: "invalid_config"
+                    message: "Invalid config: whitelist 'shutterstock.com:8080' is not a bare domain name"
+                bad_fallback_url:
+                  summary: URL de fallback malformada
+                  value:
+                    error: "invalid_url_format"
+                    message: "Invalid URL format: Invalid scheme 'ftp': only http and https are allowed"
+        "401":
+          description: Token Bearer inválido o ausente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "unauthorized"
+                message: "Unauthorized: Invalid Authorization format, expected Bearer"
+        "404":
+          description: Ningún cliente con ese token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "config_not_found"
+                message: "Configuration not found for client: client_123"
+        "500":
+          description: Fallo de CouchDB u otro error no clasificado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "internal_error"
+                message: "Internal error: couchdb write failed"
+
+  /api/v1/clients/rotate-id:
+    post:
+      summary: Rota el crypt_id público del cliente
+      description: |
+        Genera un nuevo nanoid de 12 caracteres para el cliente.
+        El crypt_id anterior se invalida inmediatamente.
+        Útil si se detecta abuso o exposición no deseada del ID público.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Nuevo crypt_id generado exitosamente
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  new_crypt_id:
+                    type: string
+                    pattern: "^[A-Za-z0-9_-]{12}$"
+                    example: "9Kp2mX7qR4wL"
+                    description: "Nuevo nanoid de 12 caracteres URL-safe"
+                  rotated_at:
+                    type: string
+                    format: date-time
+        "401":
+          description: Token Bearer inválido o ausente
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "unauthorized"
+                message: "Unauthorized: Empty bearer token"
+        "404":
+          description: Ningún cliente con ese token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "config_not_found"
+                message: "Configuration not found for client: client_123"
+        "500":
+          description: Fallo de CouchDB u otro error no clasificado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "internal_error"
+                message: "Internal error: couchdb write failed"
+
+  # ========================================
+  # SALUD (sin autenticación, en ambos puertos)
+  # ========================================
+  /health:
+    get:
+      summary: Livecheck del proceso
+      description: |
+        Vive en el puerto del proxy (`HTTP_PROXY_PORT`) y en el de control
+        (`HTTP_CONTROL_PORT`); no requiere Bearer token. Es el endpoint que usan el
+        `HEALTHCHECK` del Dockerfile y el `healthcheck` del compose.
+        Solo informa que el proceso atiende peticiones: no comprueba CouchDB ni Valkey,
+        porque un 503 aquí derribaría el listener de un proxy que degradó a la config
+        default y sigue sirviendo MISS.
+      responses:
+        "200":
+          description: Proceso atendiendo
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "OK"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: Token único por cliente para endpoints de control
+
+  # Nombres de cabecera en el alambre: Pingora escribe en minúsculas los nombres `&'static str`
+  # que se le pasan a `ResponseHeader::insert_header` (pingora-http 0.9.0 conserva la casing
+  # recibida), así que las respuestas del proxy llevan `x-cache`, `x-proxy-by`,
+  # `x-content-type-options` y `retry-after` en minúsculas. El nombre capitalizado que se usa
+  # aquí es el canónico de HTTP/2+OpenAPI: la comparación de cabeceras es case-insensitive.
+  headers:
+    X-Cache:
+      description: |
+        Decisión de caché de la respuesta. Hoy la emite el handler con literales
+        (`interfaces/proxy_handler.rs`: `HIT`, `MISS`, `FALLBACK`, `BYPASS`). En el motor Pingora
+        sale de `CacheDirective::as_str()` (`RUST_STYLE_GUIDE.md`), la misma función que usa
+        `logging()` para el campo `x_cache`: un único punto para que el header y el log no diverjan.
+      schema:
+        type: string
+        enum: [HIT, MISS, FALLBACK, BYPASS]
+        example: "MISS"
+    X-Proxy-By:
+      description: Identificador del servicio que sirvió la respuesta.
+      schema:
+        type: string
+        example: "tele.velone.ai"
+    X-Content-Type-Options:
+      description: Evita que el navegador sniff-e el Content-Type del recurso proxificado.
+      schema:
+        type: string
+        example: "nosniff"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: Código de error del diccionario
+          example: "domain_not_whitelisted"
+        message:
+          type: string
+          description: Display del `ProxyError` (dominio/errors.rs); no un texto libre
+          example: "Domain not whitelisted: malicious.com"
+
+    ClientConfigResponse:
+      type: object
+      properties:
+        crypt_id:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{12}$"
+          example: "V1StGXR8_Z5j"
+          description: ID público rotable
+        config_version:
+          type: integer
+          description: Versión actual de la configuración
+        whitelist:
+          type: array
+          items:
+            type: string
+          example: ["shutterstock.com", "gettyimages.com"]
+        rate_limit:
+          type: object
+          properties:
+            max_requests:
+              type: integer
+              minimum: 1
+              maximum: 10000
+              example: 50
+            window_seconds:
+              type: integer
+              minimum: 1
+              maximum: 3600
+              example: 60
+          description: |
+            Mismos límites que `ClientConfigUpdate.rate_limit`: `PUT /api/v1/clients/config`
+            los valida y devuelve 400 fuera de rango, así que lo que se lee aquí siempre
+            está dentro de ellos.
+        max_scripting_body_bytes:
+          type: integer
+          example: 5242880
+          description: Límite de bytes para scripting Lua
+        scripting:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            code_hash:
+              type: string
+              description: Hash SHA-256 del script Lua (no se expone el código)
+        error_handling:
+          type: object
+          properties:
+            mode:
+              type: string
+              enum: [transparent, wrapped]
+            fallback_urls:
+              type: object
+              additionalProperties:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  hash:
+                    type: string
+
+    ClientConfigUpdate:
+      type: object
+      properties:
+        whitelist:
+          type: array
+          items:
+            type: string
+          example: ["shutterstock.com", "gettyimages.com"]
+        rate_limit:
+          type: object
+          properties:
+            max_requests:
+              type: integer
+              minimum: 1
+              maximum: 10000
+            window_seconds:
+              type: integer
+              minimum: 1
+              maximum: 3600
+        max_scripting_body_bytes:
+          type: integer
+          minimum: 1048576
+          maximum: 52428800
+        scripting:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+            code:
+              type: string
+              description: Código Lua completo
+            code_hash:
+              type: string
+              description: Hash SHA-256 del código (obligatorio si se proporciona code)
+        error_handling:
+          type: object
+          properties:
+            mode:
+              type: string
+              enum: [transparent, wrapped]
+            fallback_urls:
+              type: object
+              additionalProperties:
+                type: object
+                required:
+                  - url
+                  - hash
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                  hash:
+                    type: string
+                    description: Hash SHA-256 del recurso fallback (obligatorio)
