@@ -1,6 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::Router;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -105,8 +106,32 @@ fn init_tracing() {
         .init();
 }
 
-async fn index() -> &'static str {
-    "TELE - PROXY"
+/// `GET /` en el puerto del proxy. En producción solo el nombre del proyecto; en
+/// `MODO=desarrollo` también la lista de endpoints definidos, para descubrir la API a mano.
+async fn index(State(service): State<Arc<ProxyService>>) -> String {
+    index_body(service.verbose_errors())
+}
+
+fn index_body(verbose: bool) -> String {
+    const NAME: &str = "TELE - PROXY";
+    if !verbose {
+        return NAME.to_string();
+    }
+    let endpoints = [
+        "",
+        "Endpoints del proxy (puerto HTTP_PROXY_PORT):",
+        "  GET  /aq/{crypt_id}/?url=<url>[&mime=<mime>]   Proxy publico multi-cliente",
+        "  GET  /health                                   Healthcheck del contenedor",
+        "  GET  /                                         Este indice",
+        "",
+        "API de control (puerto HTTP_CONTROL_PORT, loopback, auth Bearer):",
+        "  GET  /api/v1/clients/config                    Configuracion actual (sin secretos)",
+        "  PUT  /api/v1/clients/config                    Actualizacion parcial validada",
+        "  POST /api/v1/clients/rotate-id                 Rota el crypt_id",
+        "  GET  /health                                   Healthcheck",
+    ]
+    .join("\n");
+    format!("{NAME}\n{endpoints}\n")
 }
 
 async fn healthcheck() -> &'static str {
@@ -262,6 +287,32 @@ async fn main() {
         _ = changes_task => tracing::error!("Changes feed listener exited unexpectedly"),
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Shutdown signal received");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_body;
+
+    #[test]
+    fn index_en_produccion_es_solo_el_nombre() {
+        let body = index_body(false);
+        assert_eq!(body, "TELE - PROXY");
+        assert!(!body.contains("/aq/"), "{body}");
+    }
+
+    #[test]
+    fn index_en_desarrollo_lista_los_endpoints() {
+        let body = index_body(true);
+        assert!(body.starts_with("TELE - PROXY\n"), "{body}");
+        for endpoint in [
+            "/aq/{crypt_id}/",
+            "/api/v1/clients/config",
+            "/api/v1/clients/rotate-id",
+            "/health",
+        ] {
+            assert!(body.contains(endpoint), "falta {endpoint} en:\n{body}");
         }
     }
 }
