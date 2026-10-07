@@ -59,8 +59,10 @@ EXPOSE 8080 8081
 
 # El proceso va en PRIMER PLANO: nunca -d/--daemon ni ServerConf.daemon = true, porque un
 # proceso daemonizado deja este HEALTHCHECK en falso y rompe el stop_grace_period del compose.
-# /health en 8080 lo resuelve request_filter antes de validar crypt_id (docs/spec.md Fase 3).
+# /health en el puerto del proxy lo resuelve request_filter antes de validar crypt_id
+# (docs/spec.md Fase 3). El puerto se lee de la variable: en Dokploy el contenedor escucha en
+# HTTP_PROXY_PORT (8784), no en el 8080 por defecto.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:8080/health || exit 1
+    CMD curl -fsS "http://localhost:${HTTP_PROXY_PORT:-8080}/health" || exit 1
 
 ENTRYPOINT ["/app/tele-proxy"]

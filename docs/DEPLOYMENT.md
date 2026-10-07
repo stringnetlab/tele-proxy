@@ -208,11 +208,17 @@ secrets del servicio, no en el repositorio.
 
 ### 4. Configurar Dominio
 
-- Dominio: `tele.velone.ai`
-- Puerto: `8080` (proxy público, el listener de Pingora)
-- `8081` (API de control) **no** se expone al público: queda en la red del compose y solo se alcanza
-  desde el propio host o desde una red interna restringida
-- HTTPS: habilitado (Cloudflare o Let's Encrypt)
+- Dominio del proxy: `tele.velone.ai` → Puerto: `HTTP_PROXY_PORT` (proxy público, el listener de Pingora).
+- Dominio del panel: `admin.teleproxy.velone.ai` → Puerto: `HTTP_CONTROL_PORT`. **Subdominio, no path**:
+  la app usa rutas absolutas (`/admin/`, `/api/v1/admin/...`) y Dokploy no strippea prefijos, así que
+  un path tipo `/adm` rompe la UI aunque el puerto responda.
+- Los dos puertos se publican en `0.0.0.0` (no loopback): el Traefik de Dokploy vive en otro
+  contenedor y `127.0.0.1` del host no le sirve. El acceso directo `http://<ip-del-servidor>:8785`
+  queda expuesto: protégelo en firewall (solo loopback + redes Docker) o acepta que la API admin
+  (OAuth + rate limit) es el único filtro. El panel nunca se sirve por el puerto del proxy.
+- HTTPS: habilitado (Cloudflare o Let's Encrypt). Fijar `GOOGLE_REDIRECT_URI` al callback con el
+  esquema https del subdominio del panel: la cookie de sesión solo es `Secure` si el esquema es https.
+- DNS: `A` de `admin.` apuntando al servidor (puede ir proxied por Cloudflare).
 
 ### 5. Desplegar
 
@@ -533,7 +539,10 @@ Esperado: Pingora no compila en Windows. Trabajar en Windows con `default = []` 
 
 - [ ] `COUCHDB_USER`, `COUCHDB_PASSWORD` y `VALKEY_PASSWORD` generados (no los del `.env.example`)
 - [ ] `5984` (CouchDB) y `6379` (Valkey) **sin** mapeo de puertos público
-- [ ] `8081` (API de control) accesible solo desde red interna; `8080` detrás del TLS de Dokploy
+- [ ] `HTTP_CONTROL_PORT` del panel alcanzable por el subdominio de Dokploy y, si el host tiene IP
+  pública, restringido en firewall al loopback + redes Docker (el puerto queda publicado en
+  `0.0.0.0` porque Traefik no puede usar el `127.0.0.1` del host); `HTTP_PROXY_PORT` detrás del
+  TLS de Dokploy
 - [ ] Base `tele_proxy_configs` creada y `_design/proxy_lookup` presente
 - [ ] `PROXY_WORKER_THREADS` fijado explícitamente
 - [ ] Proceso **no** daemonizado; `stop_grace_period` >= `PROXY_GRACE_PERIOD_SECONDS`

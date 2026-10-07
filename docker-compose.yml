@@ -6,17 +6,24 @@ services:
       # 8080 = /aq/ + /health. Objetivo Pingora (`add_tcp`); hoy lo sirve Axum, porque la portación
       # de la Fase 3 no está terminada (docs/spec.md, "Estado de la migración"). Es el único puerto
       # expuesto al público detrás del TLS de Dokploy.
-      - "${HTTP_PROXY_PORT:-8080}:8080"
-      # API de control (axum; pasará a BackgroundService): solo loopback. No publicar 8081 en 0.0.0.0.
-      - "127.0.0.1:${HTTP_CONTROL_PORT:-8081}:8081"
+      #
+      # TRAEFIK/DOKPLOY: el puerto de control se publica en TODAS las interfaces (igual que este),
+      # no en loopback: el Traefik de Dokploy vive en otro contenedor y 127.0.0.1 del host no le
+      # sirve (evidencia: la ruta `/` funciona con Port 8784 = puerto publicado; la ruta al panel
+      # moría con el binding loopback). El panel sigue sin exponerse por el puerto del proxy: se
+      # sirve en el de control, alcanzable vía subdominio en Dokploy (p.ej. admin.teleproxy.velone.ai).
+      # El puerto interno del contenedor iguala al publicado porque Dokploy enruta al puerto que
+      # configura en el dominio según la versión (contenedor o host).
+      - "${HTTP_PROXY_PORT:-8080}:${HTTP_PROXY_PORT:-8080}"
+      - "${HTTP_CONTROL_PORT:-8081}:${HTTP_CONTROL_PORT:-8081}"
     environment:
       - RUST_LOG=${RUST_LOG:-warn,tele_proxy=info}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       # desarrollo → errores HTTP verbosos; cualquier otro valor mantiene los errores escuetos.
       - MODO=${MODO:-produccion}
       - HTTP_HOST=0.0.0.0
-      - HTTP_PROXY_PORT=8080
-      - HTTP_CONTROL_PORT=8081
+      - HTTP_PROXY_PORT=${HTTP_PROXY_PORT:-8080}
+      - HTTP_CONTROL_PORT=${HTTP_CONTROL_PORT:-8081}
       # ServerConf de Pingora (docs/ENVIRONMENT.md). threads vale 1 por defecto en Pingora: sin
       # PROXY_WORKER_THREADS el proxy es mono-thread aunque el host tenga 8 núcleos.
       - PROXY_WORKER_THREADS=${PROXY_WORKER_THREADS:-4}
