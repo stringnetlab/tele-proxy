@@ -10,10 +10,43 @@ use tokio::sync::RwLock;
 
 use crate::domain::errors::ProxyError;
 use crate::domain::models::{
-    ClientConfig, ClientConfigUpdate, ErrorHandlingConfig, ErrorMode, RateLimitConfig,
+    AdminUser, ClientConfig, ClientConfigUpdate, ErrorHandlingConfig, ErrorMode, RateLimitConfig,
     ScriptingConfig,
 };
-use crate::domain::services::ConfigFetcher;
+use crate::domain::services::{AdminRepository, ConfigFetcher};
+
+/// Map functions de las vistas del design doc. Fuente única de verdad: `ensure_design_doc` crea
+/// el documento con estas vistas y **lo actualiza** cuando difieren (p. ej. tras añadir una
+/// vista nueva en una release). Las dos primeras existen desde la primera versión: no cambiar
+/// su clave ni su condición, son el lookup caliente del proxy.
+const DESIGN_VIEWS: &[(&str, &str)] = &[
+    (
+        "by_crypt_id",
+        r#"function(doc) { if (doc.type === 'client_config' && doc.crypt_id) { emit(doc.crypt_id, null); } }"#,
+    ),
+    (
+        "by_token_hash",
+        r#"function(doc) { if (doc.type === 'client_config' && doc.bearer_token_hash) { emit(doc.bearer_token_hash, null); } }"#,
+    ),
+    (
+        "list_admins",
+        r#"function(doc) { if (doc.type === 'admin_user' && doc.email) { emit(doc.email, null); } }"#,
+    ),
+    (
+        "list_clients",
+        r#"function(doc) { if (doc.type === 'client_config') { emit(null, null); } }"#,
+    ),
+];
+
+fn view_def(name: &str) -> ViewDef {
+    ViewDef {
+        map: DESIGN_VIEWS
+            .iter()
+            .find(|(view_name, _)| *view_name == name)
+            .map(|(_, map)| (*map).to_string())
+            .unwrap_or_default(),
+    }
+}
 
 pub struct CouchDbRepository {
     base_url: String,
@@ -27,18 +60,54 @@ pub struct CouchDbRepository {
 
 #[derive(Serialize)]
 struct DesignDoc {
+    #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
+    rev: Option<String>,
     views: Views,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Views {
     by_crypt_id: ViewDef,
     by_token_hash: ViewDef,
+    list_admins: ViewDef,
+    list_clients: ViewDef,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ViewDef {
     map: String,
+}
+
+/// Documento existente tal como está en CouchDB: solo interesan el `_rev` (para el update) y
+/// los `map` actuales (para decidir si hace falta reescribir).
+#[derive(Deserialize)]
+struct ExistingDesignDoc {
+    #[serde(rename = "_rev")]
+    rev: Option<String>,
+    views: HashMap<String, ViewDef>,
+}
+
+impl DesignDoc {
+    fn with_rev(rev: Option<String>) -> Self {
+        Self {
+            rev,
+            views: Views {
+                by_crypt_id: view_def("by_crypt_id"),
+                by_token_hash: view_def("by_token_hash"),
+                list_admins: view_def("list_admins"),
+                list_clients: view_def("list_clients"),
+            },
+        }
+    }
+
+    fn is_satisfied_by(existing: &ExistingDesignDoc) -> bool {
+        DESIGN_VIEWS.iter().all(|(name, map)| {
+            existing
+                .views
+                .get(*name)
+                .is_some_and(|view_def| view_def.map == *map)
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -48,6 +117,8 @@ struct ViewRow {
 
 #[derive(Deserialize)]
 struct ViewResponse {
+    #[serde(default)]
+    total_rows: Option<u64>,
     rows: Vec<ViewRow>,
 }
 
@@ -78,62 +149,119 @@ impl CouchDbRepository {
         }
     }
 
+    /// Crea el design doc si falta y **lo actualiza** cuando los `map` difieren de
+    /// `DESIGN_VIEWS` (p. ej. esta release añadió `list_admins`/`list_clients`). El update
+    /// preserva el `_rev` del documento existente; un 409 (rev obsoleta) se resuelve
+    /// releyendo el `_rev` una vez, no con un bucle.
     pub async fn ensure_design_doc(&self) -> Result<(), ProxyError> {
         let design_doc_id = "_design/proxy_lookup";
         let url = format!("{}/{}/{}", self.base_url, self.db_name, design_doc_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await
-            .map_err(|e| ProxyError::Internal {
-                reason: format!("Falló la conexión a CouchDB: {}", e),
-            })?;
-
-        if resp.status().is_success() {
-            return Ok(());
-        }
-
-        let design_doc = DesignDoc {
-            views: Views {
-                by_crypt_id: ViewDef {
-                    map: r#"function(doc) { if (doc.type === 'client_config' && doc.crypt_id) { emit(doc.crypt_id, null); } }"#.to_string(),
-                },
-                by_token_hash: ViewDef {
-                    map: r#"function(doc) { if (doc.type === 'client_config' && doc.bearer_token_hash) { emit(doc.bearer_token_hash, null); } }"#.to_string(),
-                },
-            },
+        let fetch_existing = |client: &Client| {
+            client
+                .get(&url)
+                .basic_auth(&self.username, Some(&self.password))
+                .send()
         };
 
-        let resp = self
-            .client
-            .put(&url)
-            .basic_auth(&self.username, Some(&self.password))
-            .json(&design_doc)
-            .send()
-            .await
-            .map_err(|e| ProxyError::Internal {
-                reason: format!("No se pudo crear el design doc: {}", e),
+        let existing: Option<ExistingDesignDoc> = {
+            let resp = fetch_existing(&self.client).await.map_err(|e| {
+                ProxyError::Internal {
+                    reason: format!("Falló la conexión a CouchDB: {}", e),
+                }
             })?;
+            if resp.status().is_success() {
+                let body = resp.bytes().await.map_err(|e| ProxyError::Internal {
+                    reason: format!("No se pudo leer el design doc existente: {}", e),
+                })?;
+                Some(serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
+                    reason: format!("El design doc existente no tiene la forma esperada: {}", e),
+                })?)
+            } else {
+                None
+            }
+        };
 
-        if !resp.status().is_success() {
+        if let Some(ref doc) = existing {
+            if DesignDoc::is_satisfied_by(doc) {
+                return Ok(());
+            }
+            tracing::info!("Design doc de CouchDB desactualizado, actualizando vistas");
+        }
+
+        // Intento inicial con el `_rev` conocido; si el documento no existía, sin `_rev`.
+        let mut rev = existing.and_then(|doc| doc.rev);
+        for attempt in 0..2 {
+            let payload = DesignDoc::with_rev(rev.clone());
+            let resp = self
+                .client
+                .put(&url)
+                .basic_auth(&self.username, Some(&self.password))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| ProxyError::Internal {
+                    reason: format!("No se pudo escribir el design doc: {}", e),
+                })?;
+
+            if resp.status().is_success() {
+                tracing::info!("Design doc de CouchDB creado/actualizado");
+                return Ok(());
+            }
+
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
+
+            // 409 = el `_rev` usado es obsoleto (otro proceso lo actualizó antes): se relee el
+            // documento una única vez y se reintenta. Cualquier otro error es terminal.
+            if status == 409 && attempt == 0 {
+                tracing::warn!(error = %body, "Conflicto 409 escribiendo el design doc, releyendo _rev");
+                let retry = fetch_existing(&self.client).await.map_err(|e| {
+                    ProxyError::Internal {
+                        reason: format!("Falló la reconexión a CouchDB tras el 409: {}", e),
+                    }
+                })?;
+                if retry.status().is_success() {
+                    let body = retry.bytes().await.map_err(|e| ProxyError::Internal {
+                        reason: format!("No se pudo releer el design doc tras el 409: {}", e),
+                    })?;
+                    let doc: ExistingDesignDoc =
+                        serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
+                            reason: format!(
+                                "El design doc releído tras el 409 no parsea: {}",
+                                e
+                            ),
+                        })?;
+                    if DesignDoc::is_satisfied_by(&doc) {
+                        return Ok(());
+                    }
+                    rev = doc.rev;
+                    continue;
+                }
+            }
+
             return Err(ProxyError::Internal {
-                reason: format!("No se pudo crear el design doc: {}", body),
+                reason: format!("No se pudo escribir el design doc: {}", body),
             });
         }
 
-        tracing::info!("Design doc de CouchDB creado");
-        Ok(())
+        Err(ProxyError::Internal {
+            reason: "No se pudo escribir el design doc tras reintentar el _rev".to_string(),
+        })
     }
 
-    /// Si la DB no tiene documentos de configuración (type === "client_config"), crea un cliente
-    /// demo con permisos mínimos para pruebas y demos. El bearer token es `demo-token` (hash SHA-256
-    /// calculado en runtime). La whitelist solo permite `example.com`, rate limit de 5 req/60s, sin
-    /// scripting, error handling transparent.
-    pub async fn seed_demo_client_if_empty(&self) -> Result<(), ProxyError> {
+    /// Si la DB no tiene documentos de configuración (type === "client_config") y el proceso
+    /// arranca en `MODO=desarrollo`, crea un cliente demo con permisos mínimos para pruebas y
+    /// demos. El bearer token es `demo-token` (hash SHA-256 calculado en runtime). En cualquier
+    /// otro modo **no siembra nada**: un cliente con token conocido en producción sería una
+    /// puerta trasera. El log solo menciona el `crypt_id` (público por diseño): el token en
+    /// claro jamás se registra.
+    pub async fn seed_demo_client_if_empty(&self, modo_desarrollo: bool) -> Result<(), ProxyError> {
+        if !modo_desarrollo {
+            tracing::debug!("Modo producción: el cliente demo no se siembra");
+            return Ok(());
+        }
+
         let url = self.view_url("by_crypt_id");
         let resp = self
             .client
@@ -176,6 +304,8 @@ impl CouchDbRepository {
             crypt_id: nanoid::nanoid!(12),
             bearer_token_hash: token_hash,
             config_version: 1,
+            kind: crate::domain::models::ClientKind::Client,
+            wildcard: false,
             whitelist: vec!["example.com".to_string()],
             rate_limit: RateLimitConfig {
                 max_requests: 5,
@@ -216,7 +346,7 @@ impl CouchDbRepository {
 
         tracing::info!(
             crypt_id = %demo_config.crypt_id,
-            "Cliente demo sembrado (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)"
+            "Cliente demo sembrado (whitelist: example.com, 5 req/60s); el bearer token no se registra"
         );
         Ok(())
     }
@@ -233,6 +363,15 @@ impl CouchDbRepository {
     }
 
     async fn fetch_doc_by_id(&self, doc_id: &str) -> Result<ClientConfig, ProxyError> {
+        self.fetch_raw_doc(doc_id).await
+    }
+
+    /// GET de un documento CouchDB deserializado a `T`. El 404 se normaliza a
+    /// `ConfigNotFound` con el `doc_id` pedido (el `internal_id` de la pista de auditoría).
+    async fn fetch_raw_doc<T: serde::de::DeserializeOwned>(
+        &self,
+        doc_id: &str,
+    ) -> Result<T, ProxyError> {
         let url = self.doc_url(doc_id);
 
         let resp = self
@@ -260,11 +399,11 @@ impl CouchDbRepository {
             }
         }
 
-        let config: ClientConfig = resp.json().await.map_err(|e| ProxyError::Internal {
+        let doc: T = resp.json().await.map_err(|e| ProxyError::Internal {
             reason: format!("No se pudo parsear la respuesta de CouchDB: {}", e),
         })?;
 
-        Ok(config)
+        Ok(doc)
     }
 
     async fn fetch_doc_by_view(
@@ -319,6 +458,53 @@ impl CouchDbRepository {
             config.internal_id.clone(),
             (config.crypt_id.clone(), config.bearer_token_hash.clone()),
         );
+    }
+
+    /// PUT de un documento CouchDB y devolución del `_rev` asignado. Un 409 se reporta como
+    /// error de conflicto de revisión (el llamador tiene un documento obsoleto y debe releer).
+    async fn write_doc<T: Serialize>(&self, doc_id: &str, doc: &T) -> Result<String, ProxyError> {
+        let url = self.doc_url(doc_id);
+        let resp = self
+            .client
+            .put(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .json(doc)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló la escritura en CouchDB ({}): {}", doc_id, e),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            let reason = if status == 409 {
+                format!("Conflicto de _rev en '{}': el documento cambió en CouchDB", doc_id)
+            } else {
+                format!("Error de CouchDB {} escribiendo '{}': {}", status, doc_id, body)
+            };
+            return Err(ProxyError::Internal { reason });
+        }
+
+        #[derive(Deserialize)]
+        struct WriteResp {
+            rev: String,
+        }
+
+        let write_resp: WriteResp = resp.json().await.map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo parsear la respuesta de escritura: {}", e),
+        })?;
+        Ok(write_resp.rev)
+    }
+
+    /// Invalida la caché local bajo los identificadores anteriores de un cliente (p. ej. tras
+    /// rotar token o crypt_id, o al borrarlo): el id_index recuerda cuáles eran.
+    async fn invalidate_by_internal_id(&self, internal_id: &str) {
+        let mut index = self.id_index.write().await;
+        if let Some((crypt_id, token_hash)) = index.remove(internal_id) {
+            self.local_cache.invalidate(&crypt_id).await;
+            self.local_cache.invalidate(&token_hash).await;
+        }
     }
 }
 
@@ -508,6 +694,176 @@ impl ConfigFetcher for CouchDbRepository {
     }
 }
 
+#[async_trait]
+impl AdminRepository for CouchDbRepository {
+    async fn get_admin(&self, email: &str) -> Result<AdminUser, ProxyError> {
+        let admin: AdminUser = self.fetch_raw_doc(&AdminUser::doc_id(email)).await?;
+        Ok(admin)
+    }
+
+    async fn list_admins(&self) -> Result<Vec<AdminUser>, ProxyError> {
+        let url = self.view_url("list_admins");
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló la consulta de la vista list_admins: {}", e),
+            })?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal {
+                reason: format!("Error de la vista list_admins: {}", body),
+            });
+        }
+        let view_resp: ViewResponse = resp.json().await.map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo parsear la respuesta de list_admins: {}", e),
+        })?;
+
+        let mut admins = Vec::with_capacity(view_resp.rows.len());
+        for row in view_resp.rows {
+            admins.push(self.fetch_raw_doc(&row.id).await?);
+        }
+        Ok(admins)
+    }
+
+    async fn put_admin(&self, admin: &AdminUser) -> Result<AdminUser, ProxyError> {
+        let mut saved = admin.clone();
+        saved.email = saved.email.to_lowercase();
+        saved.id = AdminUser::doc_id(&saved.email);
+        saved.r#type = "admin_user".to_string();
+        let rev = self.write_doc(&saved.id, &saved).await?;
+        saved.rev = Some(rev);
+        Ok(saved)
+    }
+
+    async fn delete_admin(&self, email: &str) -> Result<(), ProxyError> {
+        let admin = self.get_admin(email).await?;
+        let url = self.doc_url(&admin.id);
+        let resp = self
+            .client
+            .delete(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .query(&[("rev", admin.rev.unwrap_or_default())])
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló el borrado del admin: {}", e),
+            })?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal {
+                reason: format!("Error de CouchDB borrando el admin: {}", body),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_clients(
+        &self,
+        limit: u64,
+        skip: u64,
+    ) -> Result<(Vec<ClientConfig>, u64), ProxyError> {
+        let url = self.view_url("list_clients");
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .query(&[
+                ("limit", limit.to_string()),
+                ("skip", skip.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló la consulta de la vista list_clients: {}", e),
+            })?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal {
+                reason: format!("Error de la vista list_clients: {}", body),
+            });
+        }
+        let view_resp: ViewResponse = resp.json().await.map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo parsear la respuesta de list_clients: {}", e),
+        })?;
+        let total = view_resp.total_rows.unwrap_or(view_resp.rows.len() as u64);
+
+        let mut clients = Vec::with_capacity(view_resp.rows.len());
+        for row in view_resp.rows {
+            clients.push(self.fetch_doc_by_id(&row.id).await?);
+        }
+        Ok((clients, total))
+    }
+
+    async fn get_client_by_internal_id(
+        &self,
+        internal_id: &str,
+    ) -> Result<ClientConfig, ProxyError> {
+        self.fetch_doc_by_id(internal_id).await
+    }
+
+    async fn put_client(&self, config: &ClientConfig) -> Result<ClientConfig, ProxyError> {
+        // Invalida primero bajo los identificadores anteriores: un token o crypt_id rotado debe
+        // dejar de resolver en caliente, no solo tras expirar el TTL de Moka.
+        self.invalidate_by_internal_id(&config.internal_id).await;
+        let mut saved = config.clone();
+        let rev = self.write_doc(&config.id, &saved).await?;
+        saved.rev = Some(rev);
+        self.cache_config(&saved).await;
+        Ok(saved)
+    }
+
+    async fn delete_client(&self, internal_id: &str) -> Result<(), ProxyError> {
+        let config = self.fetch_doc_by_id(internal_id).await?;
+        let url = self.doc_url(&config.id);
+        let resp = self
+            .client
+            .delete(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .query(&[("rev", config.rev.clone().unwrap_or_default())])
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló el borrado del cliente: {}", e),
+            })?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal {
+                reason: format!("Error de CouchDB borrando el cliente: {}", body),
+            });
+        }
+        self.invalidate_by_internal_id(internal_id).await;
+        Ok(())
+    }
+
+    async fn client_count(&self) -> Result<u64, ProxyError> {
+        let url = self.view_url("list_clients");
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .query(&[("limit", "0")])
+            .send()
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("Falló la consulta de client_count: {}", e),
+            })?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProxyError::Internal {
+                reason: format!("Error de la vista list_clients: {}", body),
+            });
+        }
+        let view_resp: ViewResponse = resp.json().await.map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo parsear la respuesta de client_count: {}", e),
+        })?;
+        Ok(view_resp.total_rows.unwrap_or(0))
+    }
+}
+
 pub async fn verify_couchdb_connection(
     base_url: &str,
     username: &str,
@@ -539,5 +895,25 @@ fn is_connection_error(error: &ProxyError) -> bool {
                 || reason.contains("unreachable")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn seed_demo_no_se_ejecuta_fuera_de_desarrollo() {
+        // URL de un CouchDB inexistente: si la función tocara la red, fallaría. En modo
+        // producción tiene que devolver Ok sin salir de casa (hallazgo C1).
+        let repo = CouchDbRepository::new(
+            "http://127.0.0.1:1".to_string(),
+            "test_db".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            60,
+            100,
+        );
+        assert!(repo.seed_demo_client_if_empty(false).await.is_ok());
     }
 }

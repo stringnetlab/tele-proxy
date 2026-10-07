@@ -102,6 +102,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # --- Regex ---
 regex = "1.13"
 
+# --- OAuth2 / JWT (login admin Google) ---
+# Backend `ring` (mismo que hickory-resolver): verificación RS256 del id_token contra JWKS.
+jsonwebtoken = "9"
+
 # --- Misc ---
 bytes = "1.12"
 futures = "0.3"

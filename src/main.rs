@@ -5,14 +5,22 @@ use axum::extract::State;
 use axum::Router;
 use tracing_subscriber::{fmt, EnvFilter};
 
+use tele_proxy::application::admin_service::{AdminService, AdminSettings};
+use tele_proxy::application::cache_key::sha256_hex;
 use tele_proxy::application::changes_feed::ChangesFeedListener;
+use tele_proxy::application::identity::{GoogleIdentityProvider, IdentityProviders};
 use tele_proxy::application::lua_engine::SandboxedLuaEngine;
 use tele_proxy::application::proxy_service::ProxyService;
 use tele_proxy::application::webhook_service::{self, ValidatingWebhookFetcher};
+use tele_proxy::domain::services::AdminRepository;
+use tele_proxy::domain::validators::validate_allowed_domain_list;
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
 use tele_proxy::infrastructure::dns_resolver::SecureDnsResolver;
-use tele_proxy::infrastructure::valkey_cache::ValkeyCacheStore;
-use tele_proxy::interfaces::control_api::control_routes;
+use tele_proxy::infrastructure::local_rate_limiter::LocalRateLimiter;
+use tele_proxy::infrastructure::valkey_cache::{ValkeyCacheStore, ValkeySessionStore};
+use tele_proxy::interfaces::admin_api::admin_routes;
+use tele_proxy::interfaces::admin_ui::admin_ui_routes;
+use tele_proxy::interfaces::control_api::{control_routes, ControlState};
 use tele_proxy::interfaces::proxy_handler::proxy_handler;
 
 #[derive(Debug)]
@@ -78,6 +86,79 @@ fn env_var_or(key: &str, default: &str) -> Result<String, String> {
     Ok(std::env::var(key).unwrap_or_else(|_| default.to_string()))
 }
 
+/// Variables de entorno de la administración global (§ Administración de `docs/ENVIRONMENT.md`).
+/// Los numéricos usan `parse_in_range` (fuera de rango = el arranque falla). El master token se
+/// guarda hasheado desde aquí: el valor en claro solo vive en el entorno del despliegue.
+fn admin_settings_from_env(control_port: u16) -> Result<AdminSettings, String> {
+    let master = std::env::var("MASTER_BEARER_TOKEN").unwrap_or_default();
+    let master_token_hash = if master.trim().is_empty() {
+        None
+    } else {
+        Some(format!("sha256:{}", sha256_hex(master.trim())))
+    };
+
+    let redirect_default = format!(
+        "http://127.0.0.1:{control_port}/api/v1/admin/auth/google/callback"
+    );
+    let google_redirect_uri = env_var_or("GOOGLE_REDIRECT_URI", &redirect_default)?;
+    let cookie_secure = google_redirect_uri.starts_with("https://");
+
+    let allowed_domains = validate_allowed_domain_list(&env_var_or(
+        "ADMIN_ALLOWED_DOMAINS",
+        "gmail.com,stringnet.pe",
+    )?)
+    .map_err(|e| e.to_string())?;
+
+    Ok(AdminSettings {
+        master_token_hash,
+        allowed_domains,
+        session_ttl_seconds: parse_in_range(
+            "ADMIN_SESSION_TTL_SECONDS",
+            "3600",
+            300u64,
+            86_400u64,
+        )?,
+        oauth_state_ttl_seconds: parse_in_range(
+            "ADMIN_OAUTH_STATE_TTL_SECONDS",
+            "300",
+            60u64,
+            3_600u64,
+        )?,
+        login_rate_limit_requests: parse_in_range(
+            "ADMIN_LOGIN_RATE_LIMIT_REQUESTS",
+            "5",
+            1u32,
+            100u32,
+        )?,
+        login_rate_limit_window_seconds: parse_in_range(
+            "ADMIN_LOGIN_RATE_LIMIT_WINDOW_SECONDS",
+            "60",
+            1u64,
+            3_600u64,
+        )?,
+        admin_rate_limit_requests: parse_in_range("ADMIN_RATE_LIMIT_REQUESTS", "120", 1u32, 10_000u32)?,
+        admin_rate_limit_window_seconds: parse_in_range(
+            "ADMIN_RATE_LIMIT_WINDOW_SECONDS",
+            "60",
+            1u64,
+            3_600u64,
+        )?,
+        control_rate_limit_requests: parse_in_range(
+            "CONTROL_RATE_LIMIT_REQUESTS",
+            "60",
+            1u32,
+            10_000u32,
+        )?,
+        control_rate_limit_window_seconds: parse_in_range(
+            "CONTROL_RATE_LIMIT_WINDOW_SECONDS",
+            "60",
+            1u64,
+            3_600u64,
+        )?,
+        cookie_secure,
+    })
+}
+
 /// `docs/ENVIRONMENT.md` § Validaciones: fuera de rango el arranque **falla**, no se degrada al
 /// default — un `LUA_TIMEOUT_MS` de 600000 escrito por error no puede convertir el sandbox en un
 /// callejón sin salida silencioso. Las activas hoy son los dos deadlines del sandbox
@@ -133,6 +214,13 @@ fn index_body(verbose: bool) -> String {
         "  PUT  /api/v1/clients/config                    Actualizacion parcial validada",
         "  POST /api/v1/clients/rotate-id                 Rota el crypt_id",
         "  GET  /health                                   Healthcheck",
+        "",
+        "Administracion (mismo puerto, cookie de sesion o master token):",
+        "  GET  /admin/                                   Panel de administracion",
+        "  GET  /api/v1/admin/auth/google/url             URL de login Google",
+        "  GET  /api/v1/admin/me                          Identidad autenticada",
+        "  GET/POST /api/v1/admin/clients                 Listar/crear clientes",
+        "  GET/POST /api/v1/admin/admins                  Listar/anadir administradores",
     ]
     .join("\n");
     format!("{NAME}\n{endpoints}\n")
@@ -181,7 +269,7 @@ async fn main() {
         tracing::warn!(error = %e, "No se pudo crear el design doc de CouchDB (se reintentará en la primera petición)");
     }
 
-    if let Err(e) = config_fetcher.seed_demo_client_if_empty().await {
+    if let Err(e) = config_fetcher.seed_demo_client_if_empty(config.modo_desarrollo).await {
         tracing::warn!(error = %e, "No se pudo sembrar el cliente demo");
     }
 
@@ -223,7 +311,7 @@ async fn main() {
     let proxy_service = Arc::new(
         ProxyService::new(
             Arc::clone(&config_fetcher) as Arc<_>,
-            cache_store,
+            Arc::clone(&cache_store) as Arc<dyn tele_proxy::domain::services::CacheStore>,
             Arc::clone(&dns_resolver) as Arc<_>,
             lua_executor,
         )
@@ -231,6 +319,59 @@ async fn main() {
         .with_verbose_errors(config.modo_desarrollo)
         .with_upstream_user_agent(config.upstream_user_agent),
     );
+
+    // --- Administración global (panel /api/v1/admin + /admin/) ---
+    let admin_settings = match admin_settings_from_env(config.http_control_port) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::error!(error = %e, "Error de configuración de administración, abortando el arranque");
+            std::process::exit(1);
+        }
+    };
+
+    let mut identity_providers = IdentityProviders::new();
+    let google_client_id = std::env::var("GOOGLE_CLIENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let google_client_secret = std::env::var("GOOGLE_CLIENT_SECRET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (google_client_id, google_client_secret) {
+        (Some(client_id), Some(client_secret)) => {
+            let redirect_uri = std::env::var("GOOGLE_REDIRECT_URI")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "http://127.0.0.1:{}/api/v1/admin/auth/google/callback",
+                        config.http_control_port
+                    )
+                });
+            match GoogleIdentityProvider::new(client_id, client_secret, redirect_uri) {
+                Ok(provider) => {
+                    identity_providers.register(Arc::new(provider));
+                    tracing::info!("Login de administración con Google habilitado");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "No se pudo construir el proveedor de Google; login Google deshabilitado (queda el master token)");
+                }
+            }
+        }
+        _ => {
+            tracing::warn!("GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET ausentes: login Google deshabilitado; la API admin funciona solo con master token");
+        }
+    }
+
+    let admin_repo: Arc<dyn AdminRepository> = config_fetcher.clone();
+    let session_store = Arc::new(ValkeySessionStore::new(cache_store.connection_manager()));
+    let admin_service = Arc::new(AdminService::new(
+        admin_repo,
+        session_store,
+        identity_providers,
+        admin_settings,
+    ));
 
     let changes_listener = ChangesFeedListener::new(
         config.couchdb_url,
@@ -250,9 +391,20 @@ async fn main() {
         .route("/", axum::routing::get(index))
         .with_state(Arc::clone(&proxy_service));
 
+    let control_state = ControlState {
+        service: Arc::clone(&proxy_service),
+        admin: admin_service,
+        login_limiter: Arc::new(LocalRateLimiter::new()),
+        admin_limiter: Arc::new(LocalRateLimiter::new()),
+        control_limiter: Arc::new(LocalRateLimiter::new()),
+        modo_desarrollo: config.modo_desarrollo,
+    };
+
     let control_app = control_routes()
+        .merge(admin_routes())
+        .merge(admin_ui_routes())
         .merge(Router::new().route("/health", axum::routing::get(healthcheck)))
-        .with_state(Arc::clone(&proxy_service));
+        .with_state(control_state);
 
     let proxy_addr = format!("{}:{}", config.http_host, config.http_proxy_port);
     let control_addr = format!("{}:{}", config.http_host, config.http_control_port);

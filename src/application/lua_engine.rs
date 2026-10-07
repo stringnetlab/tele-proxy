@@ -215,6 +215,7 @@ impl SandboxedLuaEngine {
         // interrumpible por el hook de deadline.
         let fetcher = Arc::clone(webhook_fetcher);
         let whitelist = context.config.whitelist.clone();
+        let wildcard = context.config.wildcard;
         let bridge_state = Arc::clone(state);
         let http_fn = lua
             .create_function(
@@ -236,6 +237,7 @@ impl SandboxedLuaEngine {
                         body: body.map(String::into_bytes),
                         timeout_ms,
                         whitelist: whitelist.clone(),
+                        wildcard,
                     };
 
                     let handle = match tokio::runtime::Handle::try_current() {
@@ -698,6 +700,8 @@ mod tests {
                 internal_id: "client_int_test".to_string(),
                 crypt_id: "test12345678".to_string(),
                 bearer_token_hash: "sha256:test".to_string(),
+                kind: crate::domain::models::ClientKind::Client,
+                wildcard: false,
                 config_version: 1,
                 whitelist: vec!["example.com".to_string()],
                 rate_limit: RateLimitConfig {

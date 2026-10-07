@@ -37,6 +37,22 @@ y fallbacks. Este documento describe cada campo, sus rangos válidos y cómo afe
 TLD alfabético) o una IP pública. Se rechazan: `localhost`, `shutterstock.com:8080`,
 `https://shutterstock.com`, `user:pass@shutterstock.com`, IPs privadas (`127.0.0.1`, `10.x`, etc.).
 
+### Salida libre (`wildcard`)
+
+Campo **solo-admin** del documento (`"wildcard": true`): el cliente se convierte en un cliente
+especial de confianza que puede salir a **cualquier dominio** — la whitelist se ignora por
+completo (puede incluso quedar vacía).
+
+- **Quién puede activarlo**: únicamente la API admin (`POST /api/v1/admin/clients` con
+  `{ "wildcard": true }` o `PUT .../clients/{id}` con `{ "wildcard": true|false }`). El cliente
+  jamás: `PUT /api/v1/clients/config` ni siquiera recibe el campo (`ClientConfigUpdate` no lo
+  tiene, es imposible por construcción). Cada toggle queda auditado (`event=admin_audit`).
+- **Lo que NO salta**: el anti-SSRF de IP sigue aplicando exactamente igual — IPs privadas
+  literales en la URL, pinning DNS y resolución validada. Un cliente wildcard puede salir a
+  dominios ajenos, pero no a redes internas.
+- **En scripting**: `proxy.http_request` hereda el flag, así que el webhook del sandbox salta
+  la whitelist del mismo modo (con las mismas garantías de IP).
+
 ---
 
 ## Rate Limit
@@ -216,6 +232,10 @@ cliente demo con permisos mínimos para pruebas:
 **Propósito**: permitir pruebas inmediatas tras el despliegue sin configuración manual. Los permisos
 son intencionalmente restrictivos: solo un dominio, rate limit bajo, sin scripting.
 
+> **Solo en `MODO=desarrollo`**: en cualquier otro modo el seed no se ejecuta (un cliente con
+> token conocido en producción sería una puerta trasera). El log de seed solo imprime el
+> `crypt_id` (público por diseño): el bearer token en claro jamás se registra.
+
 **Uso**:
 ```bash
 # Obtener la configuración del cliente demo
@@ -227,7 +247,7 @@ curl "http://localhost:8080/aq/<crypt_id>/?url=https://example.com/image.jpg"
 
 El `crypt_id` generado se imprime en los logs al arrancar:
 ```
-{"level":"INFO","fields":{"message":"Cliente demo sembrado (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)","crypt_id":"V1StGXR8_Z5j",...}}
+{"level":"INFO","fields":{"message":"Cliente demo sembrado (whitelist: example.com, 5 req/60s); el bearer token no se registra","crypt_id":"V1StGXR8_Z5j",...}}
 ```
 
 ---

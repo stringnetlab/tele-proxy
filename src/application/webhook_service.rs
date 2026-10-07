@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::domain::errors::ProxyError;
 use crate::domain::models::{WebhookRequest, WebhookResponse};
 use crate::domain::services::{DnsResolver, WebhookFetcher};
-use crate::domain::validators::{domain_matches_whitelist, extract_domain, validate_url_strict};
+use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
 use crate::infrastructure::http_client;
 
 /// Techo del cuerpo que un webhook puede devolver. La respuesta se reinyecta en la VM de Lua como
@@ -60,7 +60,9 @@ impl WebhookFetcher for ValidatingWebhookFetcher {
         let url = validate_url_strict(&request.url)?;
         let domain = extract_domain(&url)?;
 
-        if !domain_matches_whitelist(&domain, &request.whitelist) {
+        // `wildcard` heredado del cliente: salta la whitelist de dominios, no el anti-SSRF de IP
+        // (`validate_url_strict` arriba y el resolver validado abajo siguen aplicando).
+        if !host_allowed(&domain, &request.whitelist, request.wildcard) {
             return Err(ProxyError::DomainNotWhitelisted { domain });
         }
 
@@ -174,6 +176,7 @@ mod tests {
             body: None,
             timeout_ms: 1_000,
             whitelist: whitelist.iter().map(|entry| entry.to_string()).collect(),
+            wildcard: false,
         }
     }
 

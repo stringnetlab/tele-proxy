@@ -170,6 +170,15 @@ pub fn domain_matches_whitelist(domain: &str, whitelist: &[String]) -> bool {
     })
 }
 
+/// Autorización de salida por dominio del pipeline anti-SSRF. Con `wildcard: true` (cliente
+/// especial de confianza, fijado **solo** por la API admin) la whitelist se ignora: cualquier
+/// dominio pasa. Lo que wildcard NO salta es la capa de IP: las IP privadas literales las
+/// rechaza `validate_url_strict` antes de llegar aquí, y las resueltas por DNS las cierra el
+/// pinning con `resolve_and_validate`. Un cliente wildcard sigue sin poder tocar redes internas.
+pub fn host_allowed(domain: &str, whitelist: &[String], wildcard: bool) -> bool {
+    wildcard || domain_matches_whitelist(domain, whitelist)
+}
+
 /// Cotas de `ClientConfigUpdate` (`docs/api_contract.yaml`), comprobadas **antes** de escribir en
 /// CouchDB para que un `GET` nunca devuelva un valor que el propio contrato rechazaría.
 pub const MAX_WHITELIST_ENTRIES: usize = 100;
@@ -443,6 +452,64 @@ fn invalid_config(field: &str, reason: String) -> ProxyError {
     }
 }
 
+/// Validación de un email de administrador: formato básico (`local@dominio`) y dominio en la
+/// lista permitida con **comparación exacta** case-insensitive — un subdominio (`evil.gmail.com`)
+/// no coincide con `gmail.com` y queda fuera.
+pub fn validate_admin_email(email: &str, allowed_domains: &[String]) -> Result<(), ProxyError> {
+    let normalized = email.trim().to_lowercase();
+    let Some((local, domain)) = normalized.rsplit_once('@') else {
+        return Err(invalid_config(
+            "email",
+            format!("'{email}' is not a valid email address"),
+        ));
+    };
+    if local.is_empty() || !is_valid_hostname(domain) {
+        return Err(invalid_config(
+            "email",
+            format!("'{email}' is not a valid email address"),
+        ));
+    }
+    if !allowed_domains
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(domain))
+    {
+        return Err(invalid_config(
+            "email",
+            format!("domain '{domain}' is not an allowed admin domain"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parseo de `ADMIN_ALLOWED_DOMAINS` (lista separada por comas): trim + lowercase, sin duplicados
+/// y cada entrada tiene que ser un dominio válido. Resultado vacío = error de arranque: una
+/// lista vacía dejaría la API admin sin ningún email posible.
+pub fn validate_allowed_domain_list(raw: &str) -> Result<Vec<String>, ProxyError> {
+    let mut domains: Vec<String> = Vec::new();
+    for entry in raw.split(',') {
+        let domain = entry.trim().to_lowercase();
+        if domain.is_empty() {
+            continue;
+        }
+        if !is_valid_hostname(&domain) {
+            return Err(invalid_config(
+                "ADMIN_ALLOWED_DOMAINS",
+                format!("'{domain}' is not a valid domain"),
+            ));
+        }
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    if domains.is_empty() {
+        return Err(invalid_config(
+            "ADMIN_ALLOWED_DOMAINS",
+            "the allowed domain list cannot be empty".to_string(),
+        ));
+    }
+    Ok(domains)
+}
+
 /// Una entrada de `whitelist` tiene que ser el host desnudo: si admite `:`, `/`, `@`, espacios o
 /// caracteres de control, el cliente puede meter una cabecera `Host`/`Authorization` entera
 /// (`docs/BDD.md`, Feature 6); si admite una IP privada, fija la puerta anti-SSRF desde la config.
@@ -685,6 +752,29 @@ mod tests {
             "shutterstock.com.evil.com",
             &whitelist
         ));
+    }
+
+    #[test]
+    fn test_host_allowed_wildcard_salta_la_whitelist() {
+        let whitelist = vec!["example.com".to_string()];
+
+        // wildcard=true: cualquier dominio pasa, whitelist vacía incluida.
+        for domain in ["example.com", "api.cualquiera.org", "otro.net"] {
+            assert!(
+                host_allowed(domain, &[], true),
+                "{domain:?} debería pasar con wildcard"
+            );
+            assert!(
+                host_allowed(domain, &whitelist, true),
+                "{domain:?} debería pasar con wildcard aunque la whitelist diga otra cosa"
+            );
+        }
+
+        // wildcard=false (o ausente): comportamiento actual, exactamente la whitelist.
+        assert!(host_allowed("example.com", &whitelist, false));
+        assert!(host_allowed("cdn.example.com", &whitelist, false));
+        assert!(!host_allowed("api.cualquiera.org", &whitelist, false));
+        assert!(!host_allowed("example.com", &[], false));
     }
 
     #[test]
@@ -1105,6 +1195,64 @@ mod tests {
             invalid_field(validate_config_update(&update)),
             "header_rules"
         );
+    }
+
+    #[test]
+    fn validate_admin_email_acenta_dominios_permitidos_case_insensitive() {
+        let domains = vec!["gmail.com".to_string(), "stringnet.pe".to_string()];
+
+        for email in [
+            "juan@gmail.com",
+            "JUAN@GMAIL.COM",
+            "Juan.Stringnet@StringNet.PE",
+            "a.b+c@stringnet.pe",
+        ] {
+            assert!(
+                validate_admin_email(email, &domains).is_ok(),
+                "{email:?} debería ser aceptado"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_admin_email_rechaza_subdominios_y_dominios_ajenos() {
+        let domains = vec!["gmail.com".to_string(), "stringnet.pe".to_string()];
+
+        for email in [
+            // Subdominio: comparación exacta, `evil.gmail.com` no es `gmail.com`.
+            "juan@evil.gmail.com",
+            "juan@mail.gmail.com",
+            "juan@stringnet.pe.evil.com",
+            "juan@hotmail.com",
+            // Formato inválido.
+            "juan",
+            "@gmail.com",
+            "juan@",
+            "juan@gmail",
+            "juan@localhost",
+            "juan gmail.com",
+            "",
+        ] {
+            assert!(
+                validate_admin_email(email, &domains).is_err(),
+                "{email:?} debería ser rechazado"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_allowed_domain_list_parsea_normaliza_y_rechaza_vacia() {
+        let domains =
+            validate_allowed_domain_list(" Gmail.com , stringnet.pe ,GMAIL.COM ").expect("lista");
+        assert_eq!(domains, vec!["gmail.com", "stringnet.pe"]);
+
+        // Dominio inválido en la lista.
+        assert!(validate_allowed_domain_list("gmail.com,not a domain").is_err());
+        assert!(validate_allowed_domain_list("gmail.com,-bad-.com").is_err());
+
+        // Lista vacía = fallo de arranque (ningún email podría ser admin).
+        assert!(validate_allowed_domain_list("").is_err());
+        assert!(validate_allowed_domain_list(" , ,").is_err());
     }
 
     /// Regresión de docs/HEADER_RULES.md § 9.9: la configuración completa de ejemplo del

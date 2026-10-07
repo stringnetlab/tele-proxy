@@ -80,6 +80,12 @@ pub enum ProxyError {
     #[error("No autorizado: {reason}")]
     Unauthorized { reason: String },
 
+    #[error("Prohibido: {reason}")]
+    Forbidden { reason: String },
+
+    #[error("Servicio no disponible: {reason}")]
+    ServiceUnavailable { reason: String },
+
     #[error("Configuración no encontrada para el cliente: {internal_id}")]
     ConfigNotFound { internal_id: String },
 
@@ -120,6 +126,8 @@ impl ProxyError {
             Self::WebhookTimeout { .. } => 500,
             Self::WebhookFailed { .. } => 502,
             Self::Unauthorized { .. } => 401,
+            Self::Forbidden { .. } => 403,
+            Self::ServiceUnavailable { .. } => 503,
             Self::ConfigNotFound { .. } => 404,
             Self::Internal { .. } => 500,
         }
@@ -145,6 +153,8 @@ impl ProxyError {
             Self::WebhookTimeout { .. } => "webhook_timeout",
             Self::WebhookFailed { .. } => "webhook_failed",
             Self::Unauthorized { .. } => "unauthorized",
+            Self::Forbidden { .. } => "forbidden",
+            Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::ConfigNotFound { .. } => "config_not_found",
             Self::Internal { .. } => "internal_error",
         }
@@ -164,7 +174,9 @@ impl ProxyError {
             | Self::WebhookTimeout { .. }
             | Self::WebhookFailed { .. }
             | Self::UpstreamTimeout { .. }
-            | Self::Unauthorized { .. } => Level::WARN,
+            | Self::Unauthorized { .. }
+            | Self::Forbidden { .. }
+            | Self::ServiceUnavailable { .. } => Level::WARN,
 
             Self::InvalidCryptId { .. }
             | Self::SsrfBlocked { .. }
@@ -299,6 +311,8 @@ impl ProxyError {
                 vec![("url", url.clone()), ("reason", reason.clone())]
             }
             Self::Unauthorized { reason } => vec![("reason", reason.clone())],
+            Self::Forbidden { reason } => vec![("reason", reason.clone())],
+            Self::ServiceUnavailable { reason } => vec![("reason", reason.clone())],
             Self::ConfigNotFound { internal_id } => vec![("internal_id", internal_id.clone())],
             Self::Internal { reason } => vec![("reason", reason.clone())],
         }

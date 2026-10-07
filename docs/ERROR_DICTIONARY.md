@@ -55,6 +55,8 @@ vive en el log; **5xx** = el callback devuelve `Err(BError)` y `fail_to_proxy` r
 | `webhook_timeout`        | `WebhookTimeout`       | Llamada HTTP desde Lua excede su timeout                   | 500         | WARN         | `crypt_id`†, `webhook_url`, `timeout_ms`                    | degradación   |
 | `webhook_failed`         | `WebhookFailed`        | El webhook del sandbox no pudo completarse (fallo de transporte o TLS) | 502 | WARN        | `url`, `reason`                                             | degradación (hoy solo log) |
 | `unauthorized`           | `Unauthorized`         | Token Bearer inválido o ausente en `/api/v1/`              | 401         | WARN         | `ip_address`†, `reason`                                     | API           |
+| `forbidden`              | `Forbidden`            | Identidad válida sin permiso: admin en rutas de cliente/proxy, dominio de admin no permitido, autodesactivación o último admin activo | 403 | WARN | `reason`                        | API           |
+| `service_unavailable`    | `ServiceUnavailable`   | Función deshabilitada en el despliegue (p. ej. login Google sin credenciales, Valkey caído para sesiones) | 503 | WARN | `reason`             | API           |
 | `config_not_found`       | `ConfigNotFound`       | La configuración del cliente no existe en CouchDB          | 404         | ERROR        | `internal_id`                                               | 5xx           |
 | `internal_error`         | `Internal`             | Fallo no clasificado del proxy o de la API de control      | 500         | ERROR        | `crypt_id`†, `reason`                                       | 5xx / API     |
 

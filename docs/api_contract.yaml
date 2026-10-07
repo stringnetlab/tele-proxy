@@ -400,6 +400,275 @@ paths:
                 message: "Error interno: couchdb write failed"
 
   # ========================================
+  # ADMINISTRACIÓN GLOBAL (cookie de sesión o master token)
+  # ========================================
+  # Panel mínimo embebido en GET /admin/ (mismo puerto que la API de control). La autenticación
+  # acepta la cookie `teleproxy_admin` (login Google, HttpOnly + SameSite=Lax) o el
+  # `MASTER_BEARER_TOKEN` como Bearer — el master SOLO autoriza este router, nunca la API de
+  # cliente. Rate limits por IP: login (ADMIN_LOGIN_RATE_LIMIT_*), resto (ADMIN_RATE_LIMIT_*).
+  # El código Lua del cliente no aparece en listados; solo en el GET individual.
+  /api/v1/admin/auth/google/url:
+    get:
+      summary: URL de inicio de login con Google
+      description: |
+        Genera un state OAuth de un solo uso (TTL `ADMIN_OAUTH_STATE_TTL_SECONDS`) y devuelve
+        la URL de autorización de Google. La UI redirige el navegador a `url`.
+        Si el login Google no está configurado (sin GOOGLE_CLIENT_ID/SECRET): 503.
+      responses:
+        "200":
+          description: URL de autorización
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+        "429":
+          description: Rate limit de login excedido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Login Google no configurado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "service_unavailable"
+                message: "Servicio no disponible: login con Google no configurado"
+
+  /api/v1/admin/auth/google/callback:
+    get:
+      summary: Callback OAuth de Google
+      description: |
+        Consume el state (expirado/inexistente → 400), canjea el code, verifica el id_token
+        (JWKS RS256, iss/aud/exp/email_verified) y exige dominio permitido + `admin_user` activo.
+        En éxito: Set-Cookie de sesión y redirect 302 a `/admin/`. Los errores se renderizan
+        como HTML mínimo (es una ruta de navegador).
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "302":
+          description: Sesión creada; redirect a /admin/ con Set-Cookie
+        "400":
+          description: State expirado o desconocido
+        "401":
+          description: Google rechazó el code o el id_token no verifica
+        "403":
+          description: Email no verificado, dominio no permitido o admin inexistente/desactivado
+
+  /api/v1/admin/auth/logout:
+    post:
+      summary: Cierra la sesión admin
+      security:
+        - AdminSessionCookie: []
+        - MasterBearer: []
+      responses:
+        "200":
+          description: Sesión borrada y cookie expirada
+
+  /api/v1/admin/me:
+    get:
+      summary: Identidad del admin autenticado
+      security:
+        - AdminSessionCookie: []
+        - MasterBearer: []
+      responses:
+        "200":
+          description: Email, rol y vía de autenticación
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email: { type: string, example: "operador@gmail.com" }
+                  role: { type: string, example: "admin" }
+                  via: { type: string, enum: [session, master] }
+        "401":
+          description: Sin sesión válida ni master token
+
+  /api/v1/admin/admins:
+    get:
+      summary: Lista administradores
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Lista completa (email, role, active, created_at, created_by)
+    post:
+      summary: Añade un administrador
+      description: |
+        Body `{ "email": "operador@gmail.com" }`. El email debe tener formato válido y dominio
+        en `ADMIN_ALLOWED_DOMAINS` (exacto, case-insensitive). El primer admin se crea así,
+        autenticado con el master token.
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200": { description: Admin creado }
+        "400": { description: Formato de email inválido, dominio no permitido o duplicado }
+        "429": { description: Rate limit excedido }
+
+  /api/v1/admin/admins/{email}:
+    patch:
+      summary: Activa o desactiva un administrador
+      description: |
+        Body `{ "active": true|false }`. No permite desactivarse a sí mismo.
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Estado actualizado }
+        "403": { description: Intento de autodesactivación }
+        "404": { description: Admin no encontrado }
+    delete:
+      summary: Elimina un administrador
+      description: No permite eliminarse a sí mismo ni al último admin activo (anti-lockout; el master token conserva acceso de emergencia).
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Admin eliminado }
+        "403": { description: Autoborrado o último admin activo }
+
+  /api/v1/admin/clients:
+    get:
+      summary: Lista clientes paginada
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: skip
+          in: query
+          schema: { type: integer, default: 0 }
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Página de clientes y total de la vista
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  clients: { type: array, items: { type: object } }
+                  total: { type: integer }
+    post:
+      summary: Crea un cliente nuevo
+      description: |
+        Genera `internal_id`, `crypt_id` (nanoid 12) y bearer token (nanoid 32). El token en
+        claro se devuelve **una sola vez** en `token`; en CouchDB viaja hasheado (`sha256:<hex>`).
+        Body opcional `{ "wildcard": true }` para crearlo ya como salida libre (la whitelist
+        puede quedar vacía; el anti-SSRF de IP sigue aplicando).
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Cliente creado con su token de un solo uso
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: "Bearer token, se muestra una sola vez" }
+                  client: { type: object }
+
+  /api/v1/admin/clients/{id}:
+    get:
+      summary: Detalle de un cliente (incluye el código Lua)
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: internal_id del cliente
+          schema: { type: string }
+      responses:
+        "200": { description: Config completa (sin `bearer_token_hash`, con `scripting_code`) }
+        "404": { description: Cliente no encontrado }
+        "403": { description: El documento es kind=Admin, no un cliente }
+    put:
+      summary: Actualiza la configuración de un cliente
+      description: |
+        Mismo `ClientConfigUpdate` y mismas validaciones que `PUT /api/v1/clients/config`
+        (incluye incremento de `config_version`), más el campo solo-admin `wildcard`
+        (`{ "wildcard": true|false }`). El `kind` no es modificable por esta vía.
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientConfigUpdate"
+      responses:
+        "200":
+          description: Versión nueva de la configuración
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config_version: { type: integer }
+                  updated_at: { type: string, format: date-time }
+        "400": { description: Error de validación (mismas cotas que el PUT de cliente) }
+    delete:
+      summary: Elimina un cliente
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "204": { description: Cliente eliminado }
+        "404": { description: Cliente no encontrado }
+
+  /api/v1/admin/clients/{id}/rotate-token:
+    post:
+      summary: Rota el bearer token del cliente
+      description: El nuevo token se devuelve **una sola vez**; el hash anterior queda invalidado.
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Nuevo token y config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  client: { type: object }
+
+  /api/v1/admin/clients/{id}/rotate-id:
+    post:
+      summary: Rota el crypt_id público del cliente
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Nuevo crypt_id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  new_crypt_id: { type: string }
+                  rotated_at: { type: string, format: date-time }
+
+  # ========================================
   # SALUD (sin autenticación, en ambos puertos)
   # ========================================
   /health:
@@ -427,6 +696,20 @@ components:
       type: http
       scheme: bearer
       description: Token único por cliente para endpoints de control
+    AdminSessionCookie:
+      type: apiKey
+      in: cookie
+      name: teleproxy_admin
+      description: |
+        Sesión de administrador creada por el login Google (HttpOnly, SameSite=Lax, TTL
+        `ADMIN_SESSION_TTL_SECONDS`). Alternativa en todas las rutas admin el header
+        `Authorization: Bearer <MASTER_BEARER_TOKEN>` (MasterBearer).
+    MasterBearer:
+      type: http
+      scheme: bearer
+      description: |
+        `MASTER_BEARER_TOKEN` como fallback de emergencia. SOLO autoriza `/api/v1/admin/*`:
+        la API de cliente (`/api/v1/clients/*`) y el proxy (`/aq/`) no lo aceptan nunca.
 
   # Nombres de cabecera en el alambre: Pingora escribe en minúsculas los nombres `&'static str`
   # que se le pasan a `ResponseHeader::insert_header` (pingora-http 0.9.0 conserva la casing
@@ -479,6 +762,16 @@ components:
           pattern: "^[A-Za-z0-9_-]{12}$"
           example: "V1StGXR8_Z5j"
           description: ID público rotable
+        wildcard:
+          type: boolean
+          default: false
+          description: |
+            Cliente especial de confianza con salida libre: salta la whitelist de dominios
+            y puede salir a CUALQUIER dominio. El anti-SSRF de IP (rechazo de IP privadas,
+            pinning DNS, resolución validada) **sigue aplicando igual** — wildcard solo salta
+            la capa de whitelist. NO es modificable por el cliente: ni `ClientConfigUpdate`
+            ni el `PUT /api/v1/clients/config` lo reciben; solo la API admin
+            (`POST/PUT /api/v1/admin/clients`) puede fijarlo o modificarlo.
         config_version:
           type: integer
           description: Versión actual de la configuración
@@ -540,6 +833,11 @@ components:
             límites completos viven en `docs/HEADER_RULES.md` (sintaxis Cloudflare Rules Engine).
 
     ClientConfigUpdate:
+      type: object
+      description: |
+        Actualización parcial de la API de cliente (`PUT /api/v1/clients/config`). No incluye
+        ni acepta `wildcard` (salida libre) ni `kind`: esos campos son solo-admin y ni siquiera
+        deserializan en este payload; activarlos desde el cliente es imposible por construcción.
       type: object
       properties:
         whitelist:

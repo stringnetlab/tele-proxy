@@ -48,6 +48,12 @@ impl ValkeyCacheStore {
         self.conn.is_some()
     }
 
+    /// Conexión compartida para otros almacenes (p. ej. sesiones de admin): la misma instancia
+    /// de `ConnectionManager` auto-reconecta, así que sesiones y caché no abren pools distintos.
+    pub fn connection_manager(&self) -> Option<redis::aio::ConnectionManager> {
+        self.conn.clone()
+    }
+
     /// `None` significa "Valkey no decidió": sin conexión, el `EVAL` falló o la respuesta no
     /// tiene la forma esperada. El llamador cae al limiter local; nunca se permite por omitir.
     async fn distributed_count(&self, key: &str, window_seconds: u64) -> Option<(u32, i64)> {
@@ -235,5 +241,65 @@ impl CacheStore for ValkeyCacheStore {
             },
             None => self.local.check(crypt_id, max_requests, window_seconds),
         }
+    }
+}
+
+/// Almacén de sesiones y estados OAuth de la API admin sobre la **misma** conexión de Valkey que
+/// la caché (`ValkeyCacheStore::connection_manager`). `None` = Valkey no disponible en el
+/// arranque: las operaciones devuelven error en vez de fingir persistencia (un login que no
+/// persiste la sesión es peor que uno que falla en claro).
+pub struct ValkeySessionStore {
+    conn: Option<redis::aio::ConnectionManager>,
+}
+
+impl ValkeySessionStore {
+    pub fn new(conn: Option<redis::aio::ConnectionManager>) -> Self {
+        Self { conn }
+    }
+
+    fn require_conn(&self) -> Result<redis::aio::ConnectionManager, ProxyError> {
+        self.conn.clone().ok_or_else(|| {
+            tracing::warn!(event = "session_store_degraded", "Valkey no disponible para el almacén de sesiones");
+            ProxyError::ServiceUnavailable {
+                reason: "Valkey no disponible".to_string(),
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl crate::application::admin_service::SessionStore for ValkeySessionStore {
+    async fn setex(&self, key: &str, value: &str, ttl_seconds: u64) -> Result<(), ProxyError> {
+        let mut conn = self.require_conn()?;
+        conn.set_ex::<_, _, ()>(key, value, ttl_seconds)
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("SETEX de sesión en Valkey falló: {}", e),
+            })
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<String>, ProxyError> {
+        let mut conn = self.require_conn()?;
+        conn.get(key).await.map_err(|e| ProxyError::Internal {
+            reason: format!("GET de sesión en Valkey falló: {}", e),
+        })
+    }
+
+    async fn getdel(&self, key: &str) -> Result<Option<String>, ProxyError> {
+        let mut conn = self.require_conn()?;
+        redis::cmd("GETDEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("GETDEL en Valkey falló: {}", e),
+            })
+    }
+
+    async fn del(&self, key: &str) -> Result<(), ProxyError> {
+        let mut conn = self.require_conn()?;
+        conn.del::<_, ()>(key).await.map_err(|e| ProxyError::Internal {
+            reason: format!("DEL en Valkey falló: {}", e),
+        })
     }
 }

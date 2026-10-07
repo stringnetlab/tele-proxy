@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{FromRequestParts, State};
 use axum::http::header::{HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -10,10 +10,93 @@ use axum::{Json, Router};
 use sha2::{Digest, Sha256};
 use tracing::Span;
 
+use crate::application::admin_service::AdminService;
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ErrorResponse, ProxyError};
-use crate::domain::models::{ClientConfigResponse, ClientConfigUpdate, RotateIdResponse};
+use crate::domain::models::{ClientConfig, ClientConfigResponse, ClientConfigUpdate, RotateIdResponse};
 use crate::domain::validators::validate_config_update;
+use crate::infrastructure::local_rate_limiter::LocalRateLimiter;
+
+/// Estado compartido del listener de control: el `ProxyService` de las rutas de cliente, el
+/// `AdminService` del router admin y los limiters por IP (login / admin / control). Un solo
+/// estado permite mergear `control_routes()` y `admin_routes()` en el mismo listener.
+#[derive(Clone)]
+pub struct ControlState {
+    pub service: Arc<ProxyService>,
+    pub admin: Arc<AdminService>,
+    pub login_limiter: Arc<LocalRateLimiter>,
+    pub admin_limiter: Arc<LocalRateLimiter>,
+    pub control_limiter: Arc<LocalRateLimiter>,
+    /// `MODO=desarrollo`: cuerpos de error verbosos (se propaga a `ApiError::detailed`).
+    pub modo_desarrollo: bool,
+}
+
+/// IP del cliente para el rate limit por IP de las APIs de control/admin. `axum::serve` sin
+/// `into_make_service_with_connect_info` no pone `ConnectInfo` en las extensiones, así que la
+/// fuente es `X-Forwarded-For`/`X-Real-IP` (el despliegue va tras un proxy) y la última
+/// instancia un literal fijo: sin IP no hay bypass de la cuota.
+pub struct ClientIp(pub String);
+
+impl<S> FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let from_header = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let ip = from_header("x-forwarded-for")
+            .or_else(|| from_header("x-real-ip"))
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|connect| connect.0.ip().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(Self(ip))
+    }
+}
+
+/// Separa admin de cliente en las rutas de la API de control: un documento `kind == Admin`
+/// nunca puede operar como cliente (defensa en profundidad; el master token tampoco se acepta
+/// aquí, solo en `/api/v1/admin/*`).
+pub fn ensure_client_kind(config: &ClientConfig) -> Result<(), ProxyError> {
+    AdminService::ensure_client_kind(config)
+}
+
+/// Aplica el rate limit por IP de una de las tres APIs. El límite es por proceso (`LocalRateLimiter`,
+/// LRU acotada): la API admin/control es loopback, así que la cuota por instancia es suficiente
+/// y no hace falta el contador distribuido de Valkey.
+pub fn check_ip_rate_limit(
+    limiter: &LocalRateLimiter,
+    ip: &str,
+    max_requests: u32,
+    window_seconds: u64,
+    scope: &str,
+) -> Result<(), ProxyError> {
+    let decision = limiter.check(&format!("{scope}:{ip}"), max_requests, window_seconds);
+    if decision.allowed {
+        return Ok(());
+    }
+    Err(ProxyError::RateLimitExceeded {
+        current_count: decision.current_count,
+        max_requests,
+        retry_after_secs: decision.retry_after_secs,
+    })
+}
 
 /// Adaptador HTTP del dominio hacia Axum. Vive en `interfaces/` porque `domain/` no importa `axum`
 /// (docs/ERROR_DICTIONARY.md, § Camino Axum).
@@ -99,33 +182,51 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn control_routes() -> Router<Arc<ProxyService>> {
+pub fn control_routes() -> Router<ControlState> {
     Router::new()
         .route("/api/v1/clients/config", get(get_config).put(update_config))
         .route("/api/v1/clients/rotate-id", post(rotate_id))
 }
 
+/// Rate limit por IP (`CONTROL_RATE_LIMIT_*`, hallazgo A1) aplicado a las tres rutas de cliente.
+fn check_control_rate(state: &ControlState, ip: &ClientIp) -> Result<(), ProxyError> {
+    let settings = state.admin.settings();
+    check_ip_rate_limit(
+        &state.control_limiter,
+        &ip.0,
+        settings.control_rate_limit_requests,
+        settings.control_rate_limit_window_seconds,
+        "control",
+    )
+}
+
 async fn get_config(
-    State(service): State<Arc<ProxyService>>,
+    State(state): State<ControlState>,
     headers: HeaderMap,
+    ip: ClientIp,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
-    let verbose = service.verbose_errors();
+    let verbose = state.modo_desarrollo;
+    check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     let token = extract_bearer_token(&headers)?;
     let token_hash = hash_token(&token);
-    let config = service
+    let config = state
+        .service
         .config_fetcher()
         .get_by_token_hash(&token_hash)
         .await
         .map_err(|e| ApiError::detailed(e, verbose))?;
+    ensure_client_kind(&config).map_err(|e| ApiError::detailed(e, verbose))?;
     Ok(Json(ClientConfigResponse::from(config)))
 }
 
 async fn update_config(
-    State(service): State<Arc<ProxyService>>,
+    State(state): State<ControlState>,
     headers: HeaderMap,
+    ip: ClientIp,
     body: Result<Json<ClientConfigUpdate>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let verbose = service.verbose_errors();
+    let verbose = state.modo_desarrollo;
+    check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     // Un cuerpo que no deserializa (p. ej. `error_handling.mode = "aggressive"`) es 400
     // `invalid_config`, no el 422 en texto plano que devuelve Axum por defecto.
     let Json(update) = body.map_err(|rejection| {
@@ -140,11 +241,13 @@ async fn update_config(
 
     let token = extract_bearer_token(&headers)?;
     let token_hash = hash_token(&token);
-    let config = service
+    let config = state
+        .service
         .config_fetcher()
         .get_by_token_hash(&token_hash)
         .await
         .map_err(|e| ApiError::detailed(e, verbose))?;
+    ensure_client_kind(&config).map_err(|e| ApiError::detailed(e, verbose))?;
 
     // Se valida antes de escribir: CouchDB no debe recibir un documento fuera de cota. El span se
     // adjunta al error porque el registro ocurre en `into_response`.
@@ -152,7 +255,8 @@ async fn update_config(
     validate_config_update(&update)
         .map_err(|error| ApiError::with_span_verbose(error, span, verbose))?;
 
-    let updated = service
+    let updated = state
+        .service
         .config_fetcher()
         .update_config(&config.internal_id, &update)
         .await
@@ -164,18 +268,23 @@ async fn update_config(
 }
 
 async fn rotate_id(
-    State(service): State<Arc<ProxyService>>,
+    State(state): State<ControlState>,
     headers: HeaderMap,
+    ip: ClientIp,
 ) -> Result<Json<RotateIdResponse>, ApiError> {
-    let verbose = service.verbose_errors();
+    let verbose = state.modo_desarrollo;
+    check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     let token = extract_bearer_token(&headers)?;
     let token_hash = hash_token(&token);
-    let config = service
+    let config = state
+        .service
         .config_fetcher()
         .get_by_token_hash(&token_hash)
         .await
         .map_err(|e| ApiError::detailed(e, verbose))?;
-    let new_crypt_id = service
+    ensure_client_kind(&config).map_err(|e| ApiError::detailed(e, verbose))?;
+    let new_crypt_id = state
+        .service
         .config_fetcher()
         .rotate_crypt_id(&config.internal_id)
         .await
@@ -186,7 +295,7 @@ async fn rotate_id(
     }))
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Result<String, ProxyError> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<String, ProxyError> {
     let auth_header = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -328,5 +437,83 @@ mod tests {
         assert_eq!(dev["message"], prod["message"]);
         assert_eq!(dev["details"]["field"], "rate_limit.max_requests");
         assert_eq!(dev["details"]["reason"], "0 is outside 1..=10000");
+    }
+
+    #[test]
+    fn kind_admin_es_rechazado_en_la_api_de_cliente() {
+        let mut config = ClientConfig {
+            id: "admin_doc".to_string(),
+            rev: None,
+            r#type: "client_config".to_string(),
+            internal_id: "admin_doc".to_string(),
+            crypt_id: "abcdefghijkl".to_string(),
+            bearer_token_hash: "sha256:x".to_string(),
+            config_version: 1,
+            kind: crate::domain::models::ClientKind::Admin,
+            wildcard: false,
+            whitelist: vec![],
+            rate_limit: crate::domain::models::RateLimitConfig {
+                max_requests: 50,
+                window_seconds: 60,
+            },
+            max_scripting_body_bytes: 0,
+            scripting: crate::domain::models::ScriptingConfig {
+                enabled: false,
+                code: String::new(),
+                code_hash: String::new(),
+                expression: String::new(),
+            },
+            error_handling: crate::domain::models::ErrorHandlingConfig {
+                mode: crate::domain::models::ErrorMode::Transparent,
+                fallback_urls: Default::default(),
+            },
+            header_rules: Vec::new(),
+        };
+
+        // Un admin no puede usar la API de cliente: 403 `forbidden`.
+        let error = ensure_client_kind(&config).expect_err("admin debe ser rechazado");
+        assert_eq!(error.to_http_status(), 403);
+        assert_eq!(error.to_error_code(), "forbidden");
+
+        // Un cliente normal sigue pasando.
+        config.kind = crate::domain::models::ClientKind::Client;
+        assert!(ensure_client_kind(&config).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_por_ip_devuelve_429_estandar() {
+        let limiter = LocalRateLimiter::new();
+        for _ in 0..2 {
+            assert!(check_ip_rate_limit(&limiter, "10.0.0.1", 2, 60, "control").is_ok());
+        }
+        let error = check_ip_rate_limit(&limiter, "10.0.0.1", 2, 60, "control")
+            .expect_err("tercera petición excede la cuota");
+        assert_eq!(error.to_http_status(), 429);
+        assert_eq!(error.to_error_code(), "rate_limit_exceeded");
+        assert_eq!(error.retry_after_secs(), Some(60));
+
+        // Otra IP tiene su propia cuota.
+        assert!(check_ip_rate_limit(&limiter, "10.0.0.2", 2, 60, "control").is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_ip_prefiere_x_forwarded_for() {
+        let request = axum::http::Request::builder()
+            .header("x-forwarded-for", "203.0.113.7, 70.41.3.18")
+            .body(())
+            .expect("request de prueba");
+        let (mut parts, _) = request.into_parts();
+        let ClientIp(ip) = ClientIp::from_request_parts(&mut parts, &())
+            .await
+            .expect("extractor infalible");
+        assert_eq!(ip, "203.0.113.7");
+
+        // Sin cabeceras de proxy: literal fijo, nunca una cuota compartida accidental.
+        let request = axum::http::Request::builder().body(()).expect("request");
+        let (mut parts, _) = request.into_parts();
+        let ClientIp(ip) = ClientIp::from_request_parts(&mut parts, &())
+            .await
+            .expect("extractor infalible");
+        assert_eq!(ip, "unknown");
     }
 }

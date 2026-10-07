@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use super::errors::ProxyError;
 use super::models::{
-    CachedResponse, ClientConfig, ClientConfigUpdate, RateLimitDecision, WebhookRequest,
+    AdminUser, CachedResponse, ClientConfig, ClientConfigUpdate, RateLimitDecision, WebhookRequest,
     WebhookResponse,
 };
 
@@ -64,4 +64,30 @@ pub trait LuaExecutor: Send + Sync {
 #[async_trait]
 pub trait WebhookFetcher: Send + Sync {
     async fn fetch(&self, request: &WebhookRequest) -> Result<WebhookResponse, ProxyError>;
+}
+
+/// Persistencia de la administración global: operadores (`AdminUser`) y gestión CRUD de
+/// clientes desde el panel. Los tests usan implementaciones manuales del trait (el proyecto no
+/// depende de mockall; véase el patrón de `interfaces/control_api.rs`).
+#[async_trait]
+pub trait AdminRepository: Send + Sync {
+    async fn get_admin(&self, email: &str) -> Result<AdminUser, ProxyError>;
+    async fn list_admins(&self) -> Result<Vec<AdminUser>, ProxyError>;
+    /// Escribe el documento completo y devuelve el admin con el `_rev` actualizado.
+    async fn put_admin(&self, admin: &AdminUser) -> Result<AdminUser, ProxyError>;
+    async fn delete_admin(&self, email: &str) -> Result<(), ProxyError>;
+    /// Página de clientes `(skip..skip+limit)` contra la vista `list_clients`; el `u64` es
+    /// `total_rows` de la vista, para paginar la UI sin conteos extra.
+    async fn list_clients(
+        &self,
+        limit: u64,
+        skip: u64,
+    ) -> Result<(Vec<ClientConfig>, u64), ProxyError>;
+    async fn get_client_by_internal_id(&self, internal_id: &str)
+        -> Result<ClientConfig, ProxyError>;
+    /// Escribe el documento completo, invalida la caché local bajo los identificadores
+    /// anteriores y devuelve el config con el `_rev` actualizado.
+    async fn put_client(&self, config: &ClientConfig) -> Result<ClientConfig, ProxyError>;
+    async fn delete_client(&self, internal_id: &str) -> Result<(), ProxyError>;
+    async fn client_count(&self) -> Result<u64, ProxyError>;
 }

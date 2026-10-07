@@ -3,6 +3,18 @@ use std::collections::HashMap;
 
 use crate::domain::header_rules::HeaderRule;
 
+/// Naturaleza de un documento `client_config`. Un `Admin` identifica a un operador del panel de
+/// administración: **nunca** puede usar el proxy ni la API de cliente (la separación se fuerza en
+/// `interfaces/`, no solo en el modelo). `serde(default)` mantiene compatibles los documentos de
+/// CouchDB anteriores al campo: todo cliente existente parsea como `Client`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKind {
+    #[default]
+    Client,
+    Admin,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     #[serde(rename = "_id")]
@@ -14,6 +26,15 @@ pub struct ClientConfig {
     pub crypt_id: String,
     pub bearer_token_hash: String,
     pub config_version: u64,
+    #[serde(default)]
+    pub kind: ClientKind,
+    /// Cliente especial de confianza: salta la capa de whitelist de dominios y puede salir a
+    /// CUALQUIER dominio. El anti-SSRF de IP (IP privadas, pinning DNS, resolución validada)
+    /// **sigue aplicando igual** — wildcard solo salta la whitelist. Solo la API admin puede
+    /// fijarlo/modificarlo; el `PUT` de cliente ni lo recibe. `serde(default)`: los documentos
+    /// de CouchDB anteriores al campo parsean como `false`.
+    #[serde(default)]
+    pub wildcard: bool,
     pub whitelist: Vec<String>,
     pub rate_limit: RateLimitConfig,
     pub max_scripting_body_bytes: u64,
@@ -103,6 +124,9 @@ pub struct WebhookRequest {
     pub body: Option<Vec<u8>>,
     pub timeout_ms: u64,
     pub whitelist: Vec<String>,
+    /// Heredado de `ClientConfig.wildcard`: si es true, el webhook del sandbox salta la
+    /// whitelist de dominios (el anti-SSRF de IP sigue aplicando, igual que en el proxy).
+    pub wildcard: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +164,8 @@ impl ClientConfig {
             crypt_id: "default".to_string(),
             bearer_token_hash: String::new(),
             config_version: 0,
+            kind: ClientKind::Client,
+            wildcard: false,
             whitelist: vec![],
             rate_limit: RateLimitConfig {
                 max_requests: 3,
@@ -208,6 +234,63 @@ pub struct RotateIdResponse {
     pub rotated_at: String,
 }
 
+/// Operador autorizado del panel de administración. Documento CouchDB independiente de los
+/// `client_config` (`type: "admin_user"`, `_id = admin_user:{email}`): los admins no usan el
+/// proxy y los clientes no pueden ser admins; el modelo solo describe, la separación se fuerza
+/// en `interfaces/` (403 en la API de cliente y en `/aq/`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUser {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(rename = "_rev", skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    pub r#type: String,
+    pub email: String,
+    /// Rol de autorización. Hoy solo existe `"admin"`: se guarda como String para poder
+    /// añadir roles sin migración de documentos.
+    pub role: String,
+    #[serde(default = "default_admin_active")]
+    pub active: bool,
+    /// ISO 8601 (`chrono::Utc::now().to_rfc3339()`), mismo formato que `RotateIdResponse`.
+    pub created_at: String,
+    pub updated_at: String,
+    /// Email del actor que creó el admin, o `"master_token"` cuando fue el token maestro.
+    pub created_by: String,
+}
+
+fn default_admin_active() -> bool {
+    true
+}
+
+impl AdminUser {
+    pub fn doc_id(email: &str) -> String {
+        format!("admin_user:{}", email.to_lowercase())
+    }
+}
+
+/// Vista pública de un admin (no hay secretos que ocultar, pero se sigue el patrón de
+/// `ClientConfigResponse`: snake_case en el alambre, sin campos internos de CouchDB).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUserResponse {
+    pub email: String,
+    pub role: String,
+    pub active: bool,
+    pub created_at: String,
+    pub created_by: String,
+}
+
+impl From<AdminUser> for AdminUserResponse {
+    fn from(admin: AdminUser) -> Self {
+        Self {
+            email: admin.email,
+            role: admin.role,
+            active: admin.active,
+            created_at: admin.created_at,
+            created_by: admin.created_by,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +314,33 @@ mod tests {
     }
 
     #[test]
+    fn documento_sin_wildcard_parsea_como_false() {
+        // Compatibilidad con documentos de CouchDB anteriores al campo: sin `wildcard` en el
+        // JSON, el config parsea con `wildcard: false` (no salta la whitelist nadie por sorpresa).
+        let json = r#"{
+            "_id": "cliente_viejo",
+            "type": "client_config",
+            "internal_id": "cliente_viejo",
+            "crypt_id": "abcdefghijkl",
+            "bearer_token_hash": "sha256:aa",
+            "config_version": 3,
+            "whitelist": ["example.com"],
+            "rate_limit": {"max_requests": 50, "window_seconds": 60},
+            "max_scripting_body_bytes": 5242880,
+            "scripting": {"enabled": false},
+            "error_handling": {"mode": "transparent"}
+        }"#;
+        let config: ClientConfig = serde_json::from_str(json).expect("documento existente");
+        assert!(!config.wildcard);
+        assert_eq!(config.kind, ClientKind::Client);
+
+        // Y con el campo explícito se respeta.
+        let json_wildcard = json.replace("\"config_version\": 3", "\"config_version\": 3, \"wildcard\": true");
+        let config: ClientConfig = serde_json::from_str(&json_wildcard).expect("documento wildcard");
+        assert!(config.wildcard);
+    }
+
+    #[test]
     fn test_normal_config_is_not_degraded() {
         let config = ClientConfig {
             id: "client_123".to_string(),
@@ -240,6 +350,8 @@ mod tests {
             crypt_id: "abc123".to_string(),
             bearer_token_hash: "sha256:abc".to_string(),
             config_version: 1,
+            kind: ClientKind::Client,
+            wildcard: false,
             whitelist: vec!["example.com".to_string()],
             rate_limit: RateLimitConfig {
                 max_requests: 50,

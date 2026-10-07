@@ -13,7 +13,7 @@ use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::header_rules::{self, RuleContext};
 use crate::domain::models::{CachedResponse, ClientConfig, ProxyContext};
-use crate::domain::validators::{domain_matches_whitelist, extract_domain, validate_url_strict};
+use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
 use crate::infrastructure::http_client;
 use crate::interfaces::control_api::ApiError;
 
@@ -50,6 +50,9 @@ pub async fn proxy_handler(
         .await
         .map_err(&api_err)?;
 
+    // Separación admin/cliente: un documento `kind == Admin` nunca sirve tráfico por `/aq/`.
+    crate::interfaces::control_api::ensure_client_kind(&config).map_err(&api_err)?;
+
     let limit = service
         .cache_store()
         .check_rate_limit(
@@ -70,7 +73,10 @@ pub async fn proxy_handler(
     let url = validate_url_strict(&query.url).map_err(&api_err)?;
     let domain = extract_domain(&url).map_err(&api_err)?;
 
-    if !domain_matches_whitelist(&domain, &config.whitelist) {
+    // `wildcard` (cliente de confianza) salta solo la whitelist de dominios: la capa de IP
+    // (IP privadas literales aquí arriba en `validate_url_strict`, pinning DNS después) sigue
+    // aplicando exactamente igual.
+    if !host_allowed(&domain, &config.whitelist, config.wildcard) {
         return Err(api_err(ProxyError::DomainNotWhitelisted { domain }));
     }
 
@@ -818,8 +824,32 @@ mod tests {
     use super::{infer_mime_from_url, must_not_forward_header};
 
     #[test]
-    fn strips_framing_and_encoding_headers() {
-        for name in [
+    fn wildcard_no_salta_el_antissrf_de_ip() {
+        use crate::domain::validators::{host_allowed, validate_url_strict};
+
+        // Cliente wildcard: la whitelist de dominios se ignora (cualquier host pasa)...
+        assert!(host_allowed("169.254.169.254", &[], true));
+        assert!(host_allowed("api.cualquiera.org", &[], true));
+
+        // ...pero la capa de IP está **antes** y no depende de wildcard: la IP privada literal
+        // sigue cayendo con 403 `ssrf_blocked` en `validate_url_strict`, igual que para un
+        // cliente normal. Y un hostname que resolviera a IP privada moriría después en el
+        // pinning DNS (`resolve_and_validate`), que tampoco mira `wildcard`.
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/admin",
+            "http://192.168.1.1/router",
+        ] {
+            let result = validate_url_strict(url);
+            assert!(
+                matches!(result, Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })),
+                "{url:?} debería seguir bloqueado aunque el cliente sea wildcard"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_framing_and_encoding_headers() {        for name in [
             "transfer-encoding",
             "Transfer-Encoding",
             "content-length",
@@ -1068,6 +1098,8 @@ mod tests {
             crypt_id: "crypt_id_123".to_string(),
             bearer_token_hash: "sha256:x".to_string(),
             config_version: 1,
+            kind: crate::domain::models::ClientKind::Client,
+            wildcard: false,
             whitelist: vec![],
             rate_limit: crate::domain::models::RateLimitConfig {
                 max_requests: 50,
