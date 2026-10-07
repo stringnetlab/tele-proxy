@@ -504,6 +504,39 @@ el bloque (sustituye la lista completa de `header_rules`):
 El orden importa: las reglas se evalúan en secuencia y cada una ve las modificaciones de las
 anteriores — por eso la limpieza general va primero y las correcciones condicionales después.
 
+### 9.10 Permitir embeber el contenido en un iframe
+
+**Escenario**: el HTML del origen trae cabeceras anti-embebido (`X-Frame-Options: SAMEORIGIN`
+y/o `Content-Security-Policy` con `frame-ancestors`) y tu app quiere cargarlo en un `<iframe>`.
+El proxy las reenvía tal cual, así que el navegador bloquea el render. Nota: **CORS no es lo
+que bloquea iframes** — solo hace falta neutralizar estas dos cabeceras.
+
+```json
+{
+  "expression": "true eq true",
+  "action": "set",
+  "action_parameters": {
+    "headers": [
+      { "name": "x-frame-options", "operation": "remove" },
+      { "name": "content-security-policy", "value": "frame-ancestors https://mi-app.example.com", "operation": "set" }
+    ]
+  }
+}
+```
+
+- `x-frame-options` hay que **quitarlo**: si queda presente, anula cualquier
+  `frame-ancestors` permisivo.
+- `content-security-policy` con `set` **reemplaza** la CSP completa del origen (no se puede
+  editar solo un directive). Para permitir el embebido desde cualquier sitio:
+  `frame-ancestors *` — solo para contenido público pensado para embeds, porque pierde la
+  protección contra clickjacking.
+- No combines con la receta 9.3 (`x-frame-options: SAMEORIGIN`): son opuestas; la última
+  regla que toque el header gana.
+- Si el origen manda `cross-origin-embedder-policy: require-corp` (bloquea el render del
+  iframe), añade `{ "name": "cross-origin-embedder-policy", "operation": "remove" }`.
+- Si tu app es `https://`, el contenido embebido también debe venir por `https://`
+  (contenido mixto lo bloquea el navegador igual). La regla aplica igual en caché HIT y MISS.
+
 ---
 
 ## 10. Referencia de compatibilidad con Cloudflare
