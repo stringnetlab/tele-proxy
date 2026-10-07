@@ -95,6 +95,15 @@ Antes de las recetas, qué es viable con el sandbox actual:
 en el reemplazo como **`$1`**, `$2`, … (no `%1` como en Lua patterns), y los flags van inline:
 `(?i)` case-insensitive, `(?s)` que `.` cruce saltos de línea, combinables `(?si)`.
 
+Dos trampas del motor, ambas **sin error visible** (el script corre y devuelve un body
+corrupto; el proxy degrada solo cuando el regex no compila):
+
+- **`$1` seguido de texto alfanumérico se come el texto**: el crate parsea `$1https` como
+  referencia a un grupo llamado `1https`; al no existir, lo sustituye por vacío en silencio.
+  Usa llaves cuando el backreference toque letras o dígitos: **`${1}https://…`**.
+- **No hay look-around**: `(?<=…)` y `(?=…)` no están soportados y el `Regex::new` falla
+  (el script degrada al cuerpo original). Reformula con grupos de captura en su lugar.
+
 ### 4.1 Redactar claves internas de un JSON de API
 
 **Escenario**: el origen devuelve campos que el frontend no debe ver (`internal_id`,
