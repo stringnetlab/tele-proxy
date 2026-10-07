@@ -201,7 +201,7 @@ async fn index(State(service): State<Arc<ProxyService>>) -> String {
 /// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
 /// identificar. Es deliberadamente un entero simple, sin semver ni hash: `GET /` lo devuelve tal
 /// cual y permite verificar con un curl qué release está sirviendo.
-const RELEASE: &str = "3";
+const RELEASE: &str = "4";
 
 fn index_body(verbose: bool, release: &str) -> String {
     const NAME: &str = "TELE - PROXY";

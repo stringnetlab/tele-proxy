@@ -60,8 +60,9 @@
     <button id="btnGoogle">Iniciar sesión con Google</button>
     <div id="masterBox" hidden>
       <p class="muted" style="margin-top:1rem;">
-        El login con Google no está configurado en este despliegue. Modo emergencia: pega el
-        <strong>master token</strong>. Se guarda solo en este navegador (localStorage).
+        ¿Sin acceso con Google (o login no configurado)? Modo emergencia: pega el
+        <strong>master token</strong>. Se guarda solo en este navegador (localStorage) y sirve
+        para el bootstrap del primer administrador.
       </p>
       <label for="masterInput">Master token</label>
       <div class="row">
@@ -223,12 +224,18 @@ async function boot() {
   await Promise.all([loadClients(), loadAdmins()]);
 }
 
-// ¿Hay login Google configurado? Si no, mostramos el fallback de master token.
+// El campo de master token se muestra SIEMPRE: es la vía de bootstrap del primer admin, y justo
+// en ese momento el login Google ya está configurado (si no lo estuviera, también haría falta).
+// Solo deshabilitamos el botón de Google cuando el backend confirma que no está configurado.
 async function probeGoogleLogin() {
   try {
     const response = await fetch("/api/v1/admin/auth/google/url");
-    $("masterBox").hidden = response.status !== 503;
+    if (response.status === 503) {
+      $("btnGoogle").disabled = true;
+    }
   } catch (_) {
+    // Sin conectividad no podemos sondear; el campo de master token ya queda visible.
+  } finally {
     $("masterBox").hidden = false;
   }
 }
