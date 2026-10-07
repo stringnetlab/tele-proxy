@@ -34,6 +34,23 @@ services:
       - LUA_TIMEOUT_MS=${LUA_TIMEOUT_MS:-200}
       - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
       - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
+      # --- Administración (docs/ENVIRONMENT.md § Administración) ---
+      # Fallback de emergencia para /api/v1/admin/*; vacío = deshabilitado. Nunca fijarlo en el repo.
+      - MASTER_BEARER_TOKEN=${MASTER_BEARER_TOKEN:-}
+      # Login Google del panel: sin ambas el login OAuth queda deshabilitado (solo master token).
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-}
+      # Solo emails de estos dominios pueden ser admin (comparación exacta, case-insensitive).
+      - ADMIN_ALLOWED_DOMAINS=${ADMIN_ALLOWED_DOMAINS:-gmail.com,stringnet.pe}
+      - ADMIN_SESSION_TTL_SECONDS=${ADMIN_SESSION_TTL_SECONDS:-3600}
+      - ADMIN_OAUTH_STATE_TTL_SECONDS=${ADMIN_OAUTH_STATE_TTL_SECONDS:-300}
+      - ADMIN_LOGIN_RATE_LIMIT_REQUESTS=${ADMIN_LOGIN_RATE_LIMIT_REQUESTS:-5}
+      - ADMIN_LOGIN_RATE_LIMIT_WINDOW_SECONDS=${ADMIN_LOGIN_RATE_LIMIT_WINDOW_SECONDS:-60}
+      - ADMIN_RATE_LIMIT_REQUESTS=${ADMIN_RATE_LIMIT_REQUESTS:-120}
+      - ADMIN_RATE_LIMIT_WINDOW_SECONDS=${ADMIN_RATE_LIMIT_WINDOW_SECONDS:-60}
+      - CONTROL_RATE_LIMIT_REQUESTS=${CONTROL_RATE_LIMIT_REQUESTS:-60}
+      - CONTROL_RATE_LIMIT_WINDOW_SECONDS=${CONTROL_RATE_LIMIT_WINDOW_SECONDS:-60}
     restart: unless-stopped
     # Debe superar a PROXY_GRACE_PERIOD_SECONDS o Docker manda SIGKILL antes de que Pingora
     # drene las conexiones en curso (el proceso no se daemoniza nunca: sin -d/--daemon).
