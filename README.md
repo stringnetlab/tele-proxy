@@ -179,7 +179,7 @@ curl http://localhost:8080/health
 En el primer arranque con la base vacía, el servicio siembra automáticamente un **cliente demo**:
 
 ```
-{"level":"INFO","fields":{"message":"Demo client seeded","crypt_id":"V1StGXR8_Z5j",...}}
+{"level":"INFO","fields":{"message":"Cliente demo sembrado (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)","crypt_id":"V1StGXR8_Z5j",...}}
 ```
 
 - Token Bearer del demo: `demo-token`
@@ -247,7 +247,7 @@ Headers relevantes de la respuesta:
 Las respuestas de error son JSON con códigos del diccionario (`docs/ERROR_DICTIONARY.md`):
 
 ```json
-{"error":"domain_not_whitelisted","message":"Domain not whitelisted: evil.com","url":"https://evil.com/x"}
+{"error":"domain_not_whitelisted","message":"Dominio no permitido: evil.com","url":"https://evil.com/x"}
 ```
 
 Con `MODO=desarrollo` los cuerpos de error son diagnósticos: los 5xx exponen el motivo interno
@@ -257,7 +257,7 @@ completo y todos los errores incluyen un objeto `details` con los campos estruct
 ```json
 {
   "error": "rate_limit_exceeded",
-  "message": "Rate limit exceeded",
+  "message": "Límite de peticiones excedido",
   "details": {
     "current_count": "51",
     "max_requests": "50",
@@ -266,9 +266,9 @@ completo y todos los errores incluyen un objeto `details` con los campos estruct
 }
 ```
 
-En cualquier otro modo los 5xx devuelven el mensaje escueto `Internal server error` y sin
+En cualquier otro modo los 5xx devuelven el mensaje escueto `Error interno del servidor` y sin
 `details`. Los fallos del **origen** se distinguen de los del propio proxy sin filtrar detalles
-internos: `upstream_error` → `Bad gateway`, `upstream_timeout` → `Gateway timeout`:
+internos: `upstream_error` → `El origen no responde`, `upstream_timeout` → `El origen no responde a tiempo`:
 
 | Código | HTTP | Causa típica |
 |---|---|---|
@@ -692,7 +692,7 @@ que `extra_hosts` resuelva `velone-servicios` y que Tailscale esté activo en el
 validación; si el feature `proxy` no se compiló, el listener no existe y el contenedor
 entra en ciclo de reinicio.
 
-**El proceso no arranca con `Configuration error, aborting startup`.**
+**El proceso no arranca con `Error de configuración, abortando el arranque`.**
 Alguna variable numérica está fuera de rango (p. ej. `LUA_TIMEOUT_MS=99999`; rango 1–60000).
 El error sale por `tracing` en JSON con el motivo exacto.
 

@@ -108,7 +108,7 @@ alt/dimensiones; el <img>/<link>/<script> sigue siendo HTML estándar.
 - 403 domain_not_whitelisted: el dominio no está en la whitelist del cliente → corrige la
   config (paso 1), no es un fallo transitorio.
 - 429 rate_limit_exceeded: respeta el header Retry-After (segundos) antes de reintentar.
-- 502 Bad gateway / 504 Gateway timeout: el ORIGEN falló (no el proxy). Reintenta con
+- 502 El origen no responde / 504 El origen no responde a tiempo: el ORIGEN falló (no el proxy). Reintenta con
   backoff; si persiste, el origen está caído o nos bloquea.
 - 3xx: el proxy NO sigue redirects, pero reescribe Location a una URL del proxy → tu cliente
   HTTP debe seguir redirects normalmente y la cadena funcionará.

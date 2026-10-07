@@ -227,7 +227,7 @@ curl "http://localhost:8080/aq/<crypt_id>/?url=https://example.com/image.jpg"
 
 El `crypt_id` generado se imprime en los logs al arrancar:
 ```
-{"level":"INFO","fields":{"message":"Demo client seeded","crypt_id":"V1StGXR8_Z5j",...}}
+{"level":"INFO","fields":{"message":"Cliente demo sembrado (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)","crypt_id":"V1StGXR8_Z5j",...}}
 ```
 
 ---

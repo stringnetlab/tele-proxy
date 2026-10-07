@@ -4,86 +4,86 @@ use tracing::Level;
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
-    #[error("Invalid crypt_id: {reason}")]
+    #[error("crypt_id inválido: {reason}")]
     InvalidCryptId { reason: String },
 
-    #[error("Domain not whitelisted: {domain}")]
+    #[error("Dominio no permitido: {domain}")]
     DomainNotWhitelisted { domain: String },
 
-    #[error("Rate limit exceeded")]
+    #[error("Límite de peticiones excedido")]
     RateLimitExceeded {
         current_count: u32,
         max_requests: u32,
         retry_after_secs: u32,
     },
 
-    #[error("SSRF blocked: {reason}")]
+    #[error("Bloqueo anti-SSRF: {reason}")]
     SsrfBlocked {
         url: String,
         resolved_ip: String,
         reason: String,
     },
 
-    #[error("Invalid URL format: {reason}")]
+    #[error("Formato de URL inválido: {reason}")]
     InvalidUrlFormat { url: String, reason: String },
 
-    #[error("Invalid config: {field} {reason}")]
+    #[error("Configuración inválida: {field} {reason}")]
     InvalidConfig { field: String, reason: String },
 
-    #[error("DNS resolution failed for {hostname}: {reason}")]
+    #[error("Falló la resolución DNS de {hostname}: {reason}")]
     DnsResolutionFailed { hostname: String, reason: String },
 
-    #[error("Lua sandbox violation: attempted to call {attempted_function}")]
+    #[error("Violación del sandbox Lua: intento de llamar a {attempted_function}")]
     LuaSandboxViolation { attempted_function: String },
 
-    #[error("ReDoS blocked: pattern={pattern}, elapsed={elapsed_ms}ms")]
+    #[error("ReDoS bloqueado: pattern={pattern}, transcurrido={elapsed_ms}ms")]
     ReDosBlocked { pattern: String, elapsed_ms: u64 },
 
-    #[error("Integrity check failed for {resource_type}")]
+    #[error("Falló la verificación de integridad de {resource_type}")]
     IntegrityCheckFailed {
         resource_type: String,
         expected_hash: String,
         actual_hash: String,
     },
 
-    #[error("Payload too large: {content_length} bytes (max: {max_allowed})")]
+    #[error("Cuerpo demasiado grande: {content_length} bytes (máx: {max_allowed})")]
     PayloadTooLarge {
         content_length: u64,
         max_allowed: u64,
     },
 
-    #[error("Upstream error: status={upstream_status}, reason={reason}")]
+    #[error("Error del origen: status={upstream_status}, motivo={reason}")]
     UpstreamError {
         url: String,
         upstream_status: u16,
         reason: String,
     },
 
-    #[error("Upstream timeout: {timeout_ms}ms (url={url})")]
+    #[error("Timeout del origen: {timeout_ms}ms (url={url})")]
     UpstreamTimeout { url: String, timeout_ms: u64 },
 
-    #[error("Script timeout: {elapsed_ms}ms (max: {timeout_ms}ms)")]
+    #[error("Timeout del script: {elapsed_ms}ms (máx: {timeout_ms}ms)")]
     ScriptTimeout { timeout_ms: u64, elapsed_ms: u64 },
 
-    #[error("Script memory limit exceeded: {used_mb}MB (max: {memory_limit_mb}MB)")]
+    #[error("Límite de memoria del script excedido: {used_mb}MB (máx: {memory_limit_mb}MB)")]
     ScriptMemoryLimit { memory_limit_mb: u32, used_mb: u32 },
 
-    #[error("Webhook timeout: url={webhook_url}, timeout={timeout_ms}ms")]
+    #[error("Timeout del webhook: url={webhook_url}, timeout={timeout_ms}ms")]
     WebhookTimeout {
         webhook_url: String,
         timeout_ms: u64,
     },
 
-    #[error("Webhook failed: {reason}")]
+    #[error("El webhook falló: {reason}")]
     WebhookFailed { url: String, reason: String },
 
-    #[error("Unauthorized: {reason}")]
+    #[error("No autorizado: {reason}")]
     Unauthorized { reason: String },
 
-    #[error("Configuration not found for client: {internal_id}")]
+    #[error("Configuración no encontrada para el cliente: {internal_id}")]
     ConfigNotFound { internal_id: String },
 
-    #[error("Internal error: {reason}")]
+    #[error("Error interno: {reason}")]
     Internal { reason: String },
 }
 
@@ -181,13 +181,15 @@ impl ProxyError {
     /// Mensaje escueto para el cuerpo de error en producción (los 5xx no filtran el motivo
     /// interno, docs/ERROR_DICTIONARY.md § Camino Axum). Los fallos del **origen** se
     /// distinguen de los fallos del propio proxy: `upstream_error`/`dns_resolution_failed`
-    /// → "Bad gateway", `upstream_timeout` → "Gateway timeout". En `MODO=desarrollo` el
-    /// cuerpo lleva el mensaje completo (`ApiError` con `verbose`).
+    /// → "El origen no responde", `upstream_timeout` → "El origen no responde a tiempo". En
+    /// `MODO=desarrollo` el cuerpo lleva el mensaje completo (`ApiError` con `verbose`).
     pub fn escueto_message(&self) -> &'static str {
         match self {
-            Self::UpstreamError { .. } | Self::DnsResolutionFailed { .. } => "Bad gateway",
-            Self::UpstreamTimeout { .. } => "Gateway timeout",
-            _ => "Internal server error",
+            Self::UpstreamError { .. } | Self::DnsResolutionFailed { .. } => {
+                "El origen no responde"
+            }
+            Self::UpstreamTimeout { .. } => "El origen no responde a tiempo",
+            _ => "Error interno del servidor",
         }
     }
 
@@ -452,7 +454,7 @@ mod tests {
         assert_eq!(e.to_http_status(), 504);
         assert_eq!(e.to_error_code(), "upstream_timeout");
         assert_eq!(e.log_level(), Level::WARN);
-        assert_eq!(e.escueto_message(), "Gateway timeout");
+        assert_eq!(e.escueto_message(), "El origen no responde a tiempo");
         assert_eq!(e.url(), Some("https://lento.example/x.jpg"));
     }
 
@@ -465,7 +467,7 @@ mod tests {
                 reason: "connect refused".to_string(),
             }
             .escueto_message(),
-            "Bad gateway"
+            "El origen no responde"
         );
         assert_eq!(
             ProxyError::DnsResolutionFailed {
@@ -473,14 +475,14 @@ mod tests {
                 reason: "nxdomain".to_string(),
             }
             .escueto_message(),
-            "Bad gateway"
+            "El origen no responde"
         );
         assert_eq!(
             ProxyError::Internal {
                 reason: "algo interno".to_string(),
             }
             .escueto_message(),
-            "Internal server error"
+            "Error interno del servidor"
         );
     }
 }
