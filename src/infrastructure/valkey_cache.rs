@@ -28,13 +28,13 @@ pub struct ValkeyCacheStore {
 impl ValkeyCacheStore {
     pub async fn new(url: &str) -> Result<Self, ProxyError> {
         let client = redis::Client::open(url).map_err(|e| ProxyError::Internal {
-            reason: format!("Invalid Valkey URL: {}", e),
+            reason: format!("URL de Valkey inválida: {}", e),
         })?;
 
         let conn = match redis::aio::ConnectionManager::new(client).await {
             Ok(conn) => Some(conn),
             Err(e) => {
-                tracing::warn!(error = %e, "Valkey connection failed at startup, entering degraded cache mode");
+                tracing::warn!(error = %e, "Falló la conexión a Valkey en el arranque, entrando en modo de caché degradado");
                 None
             }
         };
@@ -54,7 +54,7 @@ impl ValkeyCacheStore {
         let Some(conn) = &self.conn else {
             tracing::warn!(
                 event = "rate_limit_degraded",
-                "Valkey unavailable, deciding locally"
+                "Valkey no disponible, decidiendo localmente"
             );
             return None;
         };
@@ -72,7 +72,7 @@ impl ValkeyCacheStore {
         {
             Ok(reply) => reply,
             Err(e) => {
-                tracing::warn!(error = %e, event = "rate_limit_degraded", "Valkey EVAL failed, deciding locally");
+                tracing::warn!(error = %e, event = "rate_limit_degraded", "EVAL de Valkey falló, decidiendo localmente");
                 return None;
             }
         };
@@ -86,7 +86,7 @@ impl ValkeyCacheStore {
                 tracing::warn!(
                     event = "rate_limit_degraded",
                     len = reply.len(),
-                    "Unexpected Valkey EVAL reply, deciding locally"
+                    "Respuesta EVAL de Valkey inesperada, decidiendo localmente"
                 );
                 None
             }
@@ -119,7 +119,7 @@ impl CacheStore for ValkeyCacheStore {
         let data: Option<Vec<u8>> = match conn.get(key).await {
             Ok(data) => data,
             Err(e) => {
-                tracing::warn!(error = %e, key = %key, "Valkey GET failed, skipping cache");
+                tracing::warn!(error = %e, key = %key, "GET de Valkey falló, omitiendo la caché");
                 return Ok(None);
             }
         };
@@ -131,7 +131,7 @@ impl CacheStore for ValkeyCacheStore {
                 match postcard::from_bytes::<CachedResponse>(&bytes) {
                     Ok(response) => Ok(Some(response)),
                     Err(e) => {
-                        tracing::warn!(error = %e, key = %key, "Failed to decode cached response, treating as miss");
+                        tracing::warn!(error = %e, key = %key, "No se pudo decodificar la respuesta en caché, tratando como miss");
                         Ok(None)
                     }
                 }
@@ -153,7 +153,7 @@ impl CacheStore for ValkeyCacheStore {
         let mut conn = conn.clone();
 
         let bytes = postcard::to_allocvec(response).map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to serialize response for cache: {}", e),
+            reason: format!("No se pudo serializar la respuesta para la caché: {}", e),
         })?;
 
         let result = if ttl_seconds == 0 {
@@ -163,7 +163,7 @@ impl CacheStore for ValkeyCacheStore {
         };
 
         if let Err(e) = result {
-            tracing::warn!(error = %e, key = %key, "Valkey SET failed, skipping cache store");
+            tracing::warn!(error = %e, key = %key, "SET de Valkey falló, omitiendo el guardado en caché");
         }
 
         Ok(())
@@ -180,7 +180,7 @@ impl CacheStore for ValkeyCacheStore {
         let data: Option<String> = match conn.get(&key).await {
             Ok(data) => data,
             Err(e) => {
-                tracing::warn!(error = %e, hostname = %hostname, "Valkey GET ip failed");
+                tracing::warn!(error = %e, hostname = %hostname, "GET ip de Valkey falló");
                 return Ok(None);
             }
         };
@@ -188,7 +188,7 @@ impl CacheStore for ValkeyCacheStore {
         match data {
             Some(ip_str) => {
                 let ip: IpAddr = ip_str.parse().map_err(|e| ProxyError::Internal {
-                    reason: format!("Invalid cached IP: {}", e),
+                    reason: format!("IP cacheada inválida: {}", e),
                 })?;
                 Ok(Some(ip))
             }
@@ -213,7 +213,7 @@ impl CacheStore for ValkeyCacheStore {
             .set_ex::<_, _, ()>(&key, ip.to_string(), ttl_seconds)
             .await
         {
-            tracing::warn!(error = %e, hostname = %hostname, "Valkey SET ip failed");
+            tracing::warn!(error = %e, hostname = %hostname, "SET ip de Valkey falló");
         }
 
         Ok(())

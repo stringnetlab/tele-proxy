@@ -833,3 +833,7 @@ docker run --rm -v "$PWD":/src -w /src -v teleproxy_cargo:/usr/local/cargo \
 - El `cargo build --release` del `Dockerfile` usa `--features proxy`: si la imagen se construye sin
   el feature, binariamente no hay proxy y el `HEALTHCHECK` pasa igualmente. Verificar el feature,
   no solo que la imagen arranque.
+- Al tocar `infrastructure/http_client.rs` o cualquier cosa bajo `cfg(feature = "proxy-openssl")`,
+  verificar **ambas variantes**: el comando de arriba con `--features proxy` y la réplica con
+  `--features proxy-openssl` (son hermanas excluyentes; compilan código distinto tras el cfg de
+  `pinned_client`, docs/DEPLOYMENT.md § "Variante proxy-openssl").

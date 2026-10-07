@@ -341,7 +341,7 @@ pub fn log_domain_error(e: &ProxyError) {
                 status = e.to_http_status(),
                 error_message = %e,
                 fields = %campos,
-                "proxy error"
+                "error del proxy"
             )
         };
     }

@@ -2,8 +2,10 @@ FROM rust:bookworm AS builder
 
 WORKDIR /app
 
-# cmake/pkg-config: los que pide el build de dependencias C (mlua vendored compila Lua 5.4).
-# libssl-dev NO lo necesita nuestro árbol (TLS por rustls), pero se mantiene en la etapa de
+# cmake/pkg-config: los que pide el build de dependencias C (mlua vendored compila Lua 5.4;
+# la variante proxy-openssl añade openssl-src, que además necesita perl — incluido en la base
+# buildpack-deps de rust:bookworm). libssl-dev NO lo necesita ninguna variante (rustls es
+# puro Rust; native-tls-vendored compila OpenSSL estático), pero se mantiene en la etapa de
 # build porque no altera el tamaño de la imagen final y evita romper el caché del builder.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -11,20 +13,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
+# Variante del binario: "proxy" (default, rustls) o "proxy-openssl" (OpenSSL vendored, para
+# orígenes que fingerprintan el JA3 de rustls — docs/DEPLOYMENT.md, "Variante proxy-openssl").
+ARG PROXY_FEATURES=proxy
+
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
 # --locked: Cargo.lock tiene que casar con el `rev = "4487f7b2…"` que declara Cargo.toml
 # (RUST_STYLE_GUIDE.md §8). Si al regenerar el lock ese hash cambia, se subió Pingora sin
 # re-verificar las firmas citadas en docs/. El builder necesita red: la dependencia es git.
-# --features proxy: sin el feature las crates de pingora son `optional` y el binario
+# Sin --features: sin el feature las crates de pingora son `optional` y el binario
 # saldría sin motor de proxy (escucharía 8080/8081 pero no serviría /aq/).
-RUN cargo build --release --locked --features proxy
+RUN cargo build --release --locked --features ${PROXY_FEATURES}
 RUN rm -rf src
 
 COPY src/ ./src/
 COPY config/ ./config/
 RUN touch src/main.rs src/lib.rs
-RUN cargo build --release --locked --features proxy
+RUN cargo build --release --locked --features ${PROXY_FEATURES}
 
 FROM debian:bookworm-slim AS runtime
 

@@ -65,7 +65,7 @@ y scripting con Lua sandboxed por cliente.
 | Componente | Tecnología |
 |---|---|
 | Lenguaje | Rust (Edition 2021, `rust-version = "1.85"`) |
-| Motor de proxy | [Pingora](https://github.com/cloudflare/pingora) 0.9 (rev pineado `4487f7b2`, feature `proxy`, TLS via rustls) |
+| Motor de proxy | [Pingora](https://github.com/cloudflare/pingora) 0.9 (rev pineado `4487f7b2`, feature `proxy`, TLS via rustls; variante opt-in `proxy-openssl` para orígenes con JA3-blocking — docs/DEPLOYMENT.md) |
 | API de control | `axum` 0.8 (mismo binario, como servicio de fondo) |
 | Runtime async | `tokio` 1.x |
 | Base de datos | CouchDB 3.3 (configuración y metadatos) |

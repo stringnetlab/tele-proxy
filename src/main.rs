@@ -152,7 +152,7 @@ async fn main() {
         Err(e) => {
             // `init_tracing()` ya corrió, así que el fallo de arranque sale por el mismo canal
             // estructurado que el resto de logs; un `eprintln!` aquí se perdería en el agregador.
-            tracing::error!(error = %e, "Configuration error, aborting startup");
+            tracing::error!(error = %e, "Error de configuración, abortando el arranque");
             std::process::exit(1);
         }
     };
@@ -165,7 +165,7 @@ async fn main() {
         } else {
             "produccion"
         },
-        "Starting tele-proxy"
+        "Iniciando tele-proxy"
     );
 
     let config_fetcher = Arc::new(CouchDbRepository::new(
@@ -178,24 +178,26 @@ async fn main() {
     ));
 
     if let Err(e) = config_fetcher.ensure_design_doc().await {
-        tracing::warn!(error = %e, "Failed to create CouchDB design doc (will retry on first request)");
+        tracing::warn!(error = %e, "No se pudo crear el design doc de CouchDB (se reintentará en la primera petición)");
     }
 
     if let Err(e) = config_fetcher.seed_demo_client_if_empty().await {
-        tracing::warn!(error = %e, "Failed to seed demo client");
+        tracing::warn!(error = %e, "No se pudo sembrar el cliente demo");
     }
 
     let cache_store = match ValkeyCacheStore::new(&config.valkey_url).await {
         Ok(store) => Arc::new(store),
         Err(e) => {
-            tracing::error!(error = %e, "Failed to initialize Valkey cache store");
+            tracing::error!(error = %e, "No se pudo inicializar el almacén de caché de Valkey");
             std::process::exit(1);
         }
     };
 
     let valkey_degraded = !cache_store.is_connected();
     if valkey_degraded {
-        tracing::warn!("Valkey unavailable at startup — cache and rate limiting disabled");
+        tracing::warn!(
+            "Valkey no disponible en el arranque — caché y rate limiting deshabilitados"
+        );
     }
 
     let dns_config_json = include_str!("../config/dns_resolvers.json");
@@ -255,13 +257,13 @@ async fn main() {
     let proxy_addr = format!("{}:{}", config.http_host, config.http_proxy_port);
     let control_addr = format!("{}:{}", config.http_host, config.http_control_port);
 
-    tracing::info!(addr = %proxy_addr, "Proxy listener starting");
-    tracing::info!(addr = %control_addr, "Control API listener starting");
+    tracing::info!(addr = %proxy_addr, "Iniciando listener del proxy");
+    tracing::info!(addr = %control_addr, "Iniciando listener de la API de control");
 
     let proxy_listener = match tokio::net::TcpListener::bind(&proxy_addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(addr = %proxy_addr, error = %e, "Failed to bind proxy listener");
+            tracing::error!(addr = %proxy_addr, error = %e, "No se pudo bindear el listener del proxy");
             std::process::exit(1);
         }
     };
@@ -269,29 +271,29 @@ async fn main() {
     let control_listener = match tokio::net::TcpListener::bind(&control_addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(addr = %control_addr, error = %e, "Failed to bind control listener");
+            tracing::error!(addr = %control_addr, error = %e, "No se pudo bindear el listener de control");
             std::process::exit(1);
         }
     };
 
     let proxy_server = tokio::spawn(async move {
         if let Err(e) = axum::serve(proxy_listener, proxy_app).await {
-            tracing::error!(error = %e, "Proxy server error");
+            tracing::error!(error = %e, "Error del servidor del proxy");
         }
     });
 
     let control_server = tokio::spawn(async move {
         if let Err(e) = axum::serve(control_listener, control_app).await {
-            tracing::error!(error = %e, "Control API server error");
+            tracing::error!(error = %e, "Error del servidor de la API de control");
         }
     });
 
     tokio::select! {
-        _ = proxy_server => tracing::error!("Proxy server exited unexpectedly"),
-        _ = control_server => tracing::error!("Control API server exited unexpectedly"),
-        _ = changes_task => tracing::error!("Changes feed listener exited unexpectedly"),
+        _ = proxy_server => tracing::error!("El servidor del proxy terminó inesperadamente"),
+        _ = control_server => tracing::error!("El servidor de la API de control terminó inesperadamente"),
+        _ = changes_task => tracing::error!("El listener del feed de cambios terminó inesperadamente"),
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutdown signal received");
+            tracing::info!("Señal de apagado recibida");
         }
     }
 }

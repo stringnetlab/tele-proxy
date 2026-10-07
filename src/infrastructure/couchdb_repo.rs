@@ -89,7 +89,7 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB connection failed: {}", e),
+                reason: format!("Falló la conexión a CouchDB: {}", e),
             })?;
 
         if resp.status().is_success() {
@@ -115,17 +115,17 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create design doc: {}", e),
+                reason: format!("No se pudo crear el design doc: {}", e),
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProxyError::Internal {
-                reason: format!("Failed to create design doc: {}", body),
+                reason: format!("No se pudo crear el design doc: {}", body),
             });
         }
 
-        tracing::info!("CouchDB design doc created");
+        tracing::info!("Design doc de CouchDB creado");
         Ok(())
     }
 
@@ -143,7 +143,7 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB view check failed: {}", e),
+                reason: format!("Falló la comprobación de la vista de CouchDB: {}", e),
             })?;
 
         if !resp.status().is_success() {
@@ -151,7 +151,7 @@ impl CouchDbRepository {
         }
 
         let view_resp: ViewResponse = resp.json().await.map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to parse view response: {}", e),
+            reason: format!("No se pudo parsear la respuesta de la vista: {}", e),
         })?;
 
         if !view_resp.rows.is_empty() {
@@ -204,19 +204,19 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create demo client: {}", e),
+                reason: format!("No se pudo crear el cliente demo: {}", e),
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProxyError::Internal {
-                reason: format!("Failed to create demo client: {}", body),
+                reason: format!("No se pudo crear el cliente demo: {}", body),
             });
         }
 
         tracing::info!(
             crypt_id = %demo_config.crypt_id,
-            "Demo client seeded (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)"
+            "Cliente demo sembrado (bearer token: 'demo-token', whitelist: example.com, 5 req/60s)"
         );
         Ok(())
     }
@@ -242,7 +242,7 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB request failed: {}", e),
+                reason: format!("Falló la petición a CouchDB: {}", e),
             })?;
 
         match resp.status().as_u16() {
@@ -255,13 +255,13 @@ impl CouchDbRepository {
             status => {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(ProxyError::Internal {
-                    reason: format!("CouchDB error {}: {}", status, body),
+                    reason: format!("Error de CouchDB {}: {}", status, body),
                 });
             }
         }
 
         let config: ClientConfig = resp.json().await.map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to parse CouchDB response: {}", e),
+            reason: format!("No se pudo parsear la respuesta de CouchDB: {}", e),
         })?;
 
         Ok(config)
@@ -282,18 +282,18 @@ impl CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB view query failed: {}", e),
+                reason: format!("Falló la consulta de la vista de CouchDB: {}", e),
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProxyError::Internal {
-                reason: format!("CouchDB view error: {}", body),
+                reason: format!("Error de la vista de CouchDB: {}", body),
             });
         }
 
         let view_resp: ViewResponse = resp.json().await.map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to parse view response: {}", e),
+            reason: format!("No se pudo parsear la respuesta de la vista: {}", e),
         })?;
 
         let row = view_resp
@@ -339,7 +339,7 @@ impl ConfigFetcher for CouchDbRepository {
                     tracing::warn!(
                         crypt_id = %crypt_id,
                         error = %e,
-                        "CouchDB unavailable, returning degraded default config"
+                        "CouchDB no disponible, devolviendo config por defecto degradada"
                     );
                     Ok(ClientConfig::default_degraded())
                 } else {
@@ -363,7 +363,7 @@ impl ConfigFetcher for CouchDbRepository {
                 if is_connection_error(&e) {
                     tracing::warn!(
                         error = %e,
-                        "CouchDB unavailable, returning degraded default config"
+                        "CouchDB no disponible, devolviendo config por defecto degradada"
                     );
                     Ok(ClientConfig::default_degraded())
                 } else {
@@ -421,13 +421,13 @@ impl ConfigFetcher for CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB update failed: {}", e),
+                reason: format!("Falló la actualización en CouchDB: {}", e),
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProxyError::Internal {
-                reason: format!("CouchDB update error: {}", body),
+                reason: format!("Error de actualización de CouchDB: {}", body),
             });
         }
 
@@ -437,7 +437,7 @@ impl ConfigFetcher for CouchDbRepository {
         }
 
         let update_resp: UpdateResp = resp.json().await.map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to parse update response: {}", e),
+            reason: format!("No se pudo parsear la respuesta de actualización: {}", e),
         })?;
 
         config.rev = Some(update_resp.rev);
@@ -467,13 +467,13 @@ impl ConfigFetcher for CouchDbRepository {
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
-                reason: format!("CouchDB rotate failed: {}", e),
+                reason: format!("Falló la rotación en CouchDB: {}", e),
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(ProxyError::Internal {
-                reason: format!("CouchDB rotate error: {}", body),
+                reason: format!("Error de rotación de CouchDB: {}", body),
             });
         }
 
@@ -488,7 +488,7 @@ impl ConfigFetcher for CouchDbRepository {
             internal_id = %internal_id,
             old_crypt_id = %old_crypt_id,
             new_crypt_id = %new_crypt_id,
-            "crypt_id rotated"
+            "crypt_id rotado"
         );
 
         Ok(new_crypt_id)
@@ -502,7 +502,7 @@ impl ConfigFetcher for CouchDbRepository {
             tracing::info!(
                 internal_id = %internal_id,
                 crypt_id = %crypt_id,
-                "Cache invalidated via _changes feed"
+                "Caché invalidada vía feed _changes"
             );
         }
     }
@@ -519,10 +519,10 @@ pub async fn verify_couchdb_connection(
         .basic_auth(username, Some(password))
         .send()
         .await
-        .map_err(|e| format!("CouchDB connection failed: {}", e))?;
+        .map_err(|e| format!("Falló la conexión a CouchDB: {}", e))?;
 
     if !resp.status().is_success() {
-        return Err(format!("CouchDB returned status {}", resp.status()));
+        return Err(format!("CouchDB devolvió status {}", resp.status()));
     }
 
     Ok(())
@@ -531,7 +531,7 @@ pub async fn verify_couchdb_connection(
 fn is_connection_error(error: &ProxyError) -> bool {
     match error {
         ProxyError::Internal { reason } => {
-            reason.contains("connection failed")
+            reason.contains("Falló la conexión")
                 || reason.contains("Connection refused")
                 || reason.contains("connect")
                 || reason.contains("dns error")
