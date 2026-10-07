@@ -76,7 +76,7 @@ impl SecureDnsResolver {
     pub fn from_json(json: &str) -> Result<Self, ProxyError> {
         let config: DnsResolverConfig =
             serde_json::from_str(json).map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to parse DNS config: {}", e),
+                reason: format!("No se pudo parsear la config DNS: {}", e),
             })?;
         Ok(Self::new(config))
     }
@@ -109,7 +109,7 @@ impl SecureDnsResolver {
                         resolver = %resolver.name,
                         hostname = %hostname,
                         error = %e,
-                        "DNS resolver failed, trying next"
+                        "Resolver DNS falló, probando el siguiente"
                     );
                     continue;
                 }
@@ -118,7 +118,7 @@ impl SecureDnsResolver {
 
         Err(ProxyError::DnsResolutionFailed {
             hostname: hostname.to_string(),
-            reason: format!("All resolvers failed. Last error: {}", last_error),
+            reason: format!("Todos los resolvers fallaron. Último error: {}", last_error),
         })
     }
 
@@ -133,7 +133,7 @@ impl SecureDnsResolver {
                 .parse()
                 .map_err(|e| ProxyError::DnsResolutionFailed {
                     hostname: hostname.to_string(),
-                    reason: format!("Invalid resolver IP {}: {}", resolver_config.ip, e),
+                    reason: format!("IP de resolver inválida {}: {}", resolver_config.ip, e),
                 })?;
 
         let mut opts = ResolverOpts::default();
@@ -160,7 +160,7 @@ impl SecureDnsResolver {
             .build()
             .map_err(|e| ProxyError::DnsResolutionFailed {
                 hostname: hostname.to_string(),
-                reason: format!("Failed to build resolver: {}", e),
+                reason: format!("No se pudo construir el resolver: {}", e),
             })?;
 
         let response =
@@ -169,7 +169,7 @@ impl SecureDnsResolver {
                 .await
                 .map_err(|e| ProxyError::DnsResolutionFailed {
                     hostname: hostname.to_string(),
-                    reason: format!("Lookup failed: {}", e),
+                    reason: format!("Falló la búsqueda DNS (lookup): {}", e),
                 })?;
 
         // Deployment networks may lack IPv6 routing, so prefer an IPv4 address when the
@@ -184,7 +184,7 @@ impl SecureDnsResolver {
                 tracing::warn!(
                     hostname = %hostname,
                     resolved_ip = %ip,
-                    "DNS resolved to private IP, blocking"
+                    "El DNS resolvió a una IP privada, bloqueando"
                 );
                 return Err(ProxyError::SsrfBlocked {
                     url: hostname.to_string(),
@@ -197,7 +197,7 @@ impl SecureDnsResolver {
 
         Err(ProxyError::DnsResolutionFailed {
             hostname: hostname.to_string(),
-            reason: "No IPs returned from resolver".to_string(),
+            reason: "El resolver no devolvió IPs".to_string(),
         })
     }
 }
@@ -206,7 +206,7 @@ impl SecureDnsResolver {
 impl DnsResolver for SecureDnsResolver {
     async fn resolve_and_validate(&self, hostname: &str) -> Result<IpAddr, ProxyError> {
         if let Some(cached_ip) = self.get_cached_ip(hostname).await {
-            tracing::debug!(hostname = %hostname, ip = %cached_ip, "DNS cache hit");
+            tracing::debug!(hostname = %hostname, ip = %cached_ip, "Hit en la caché DNS");
             return Ok(cached_ip);
         }
 
@@ -214,7 +214,7 @@ impl DnsResolver for SecureDnsResolver {
 
         self.cache_ip(hostname.to_string(), ip).await;
 
-        tracing::debug!(hostname = %hostname, ip = %ip, "DNS resolved and cached");
+        tracing::debug!(hostname = %hostname, ip = %ip, "DNS resuelto y puesto en caché");
 
         Ok(ip)
     }

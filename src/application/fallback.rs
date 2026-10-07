@@ -20,7 +20,7 @@ impl FallbackService {
 
         let stale_key = format!("px:{}:{}:{}:stale", internal_id, config_version, url_hash);
         if let Ok(Some(cached)) = cache_store.get_response(&stale_key).await {
-            tracing::debug!(key = %stale_key, "Serving stale cache fallback");
+            tracing::debug!(key = %stale_key, "Sirviendo fallback desde caché stale");
             return Some(FallbackResponse {
                 source: FallbackSource::ClientCache,
                 cached,
@@ -30,7 +30,7 @@ impl FallbackService {
         let mime = mime_hint.unwrap_or("application/octet-stream");
         let global_key = crate::application::cache_key::fallback_cache_key(mime);
         if let Ok(Some(cached)) = cache_store.get_response(&global_key).await {
-            tracing::debug!(key = %global_key, "Serving global Valkey fallback");
+            tracing::debug!(key = %global_key, "Sirviendo fallback global de Valkey");
             return Some(FallbackResponse {
                 source: FallbackSource::GlobalCache,
                 cached,
@@ -38,7 +38,7 @@ impl FallbackService {
         }
 
         let (content_type, body) = embedded_fallback_for_mime(mime);
-        tracing::debug!(mime = %mime, content_type = %content_type, "Serving embedded binary fallback");
+        tracing::debug!(mime = %mime, content_type = %content_type, "Sirviendo fallback binario embebido");
         Some(FallbackResponse {
             source: FallbackSource::Embedded,
             cached: CachedResponse {

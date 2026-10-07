@@ -105,7 +105,7 @@ impl SandboxedLuaEngine {
         state: &Arc<RunState>,
     ) -> Result<(), ProxyError> {
         let proxy_table = lua.create_table().map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to create proxy table: {}", e),
+            reason: format!("No se pudo crear la tabla proxy: {}", e),
         })?;
 
         let crypt_id = context.crypt_id.clone();
@@ -129,13 +129,13 @@ impl SandboxedLuaEngine {
                 Ok(())
             })
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create log function: {}", e),
+                reason: format!("No se pudo crear la función log: {}", e),
             })?;
 
         proxy_table
             .set("log", log_fn)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set log: {}", e),
+                reason: format!("No se pudo fijar log: {}", e),
             })?;
 
         let regex_fn = lua
@@ -164,13 +164,13 @@ impl SandboxedLuaEngine {
                 },
             )
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create regex_replace function: {}", e),
+                reason: format!("No se pudo crear la función regex_replace: {}", e),
             })?;
 
         proxy_table
             .set("regex_replace", regex_fn)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set regex_replace: {}", e),
+                reason: format!("No se pudo fijar regex_replace: {}", e),
             })?;
 
         // `proxy.json_parse` / `proxy.json_stringify`: el sandbox no tiene `require`, así que
@@ -184,12 +184,12 @@ impl SandboxedLuaEngine {
                 json_to_lua_value(lua, value)
             })
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create json_parse function: {}", e),
+                reason: format!("No se pudo crear la función json_parse: {}", e),
             })?;
         proxy_table
             .set("json_parse", json_parse)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set json_parse: {}", e),
+                reason: format!("No se pudo fijar json_parse: {}", e),
             })?;
 
         let json_stringify = lua
@@ -199,12 +199,12 @@ impl SandboxedLuaEngine {
                     .map_err(|e| LuaError::external(format!("cannot serialize to JSON: {e}")))
             })
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create json_stringify function: {}", e),
+                reason: format!("No se pudo crear la función json_stringify: {}", e),
             })?;
         proxy_table
             .set("json_stringify", json_stringify)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set json_stringify: {}", e),
+                reason: format!("No se pudo fijar json_stringify: {}", e),
             })?;
 
         // `proxy.http_request` es **síncrona** a propósito. Una `create_async_function` de mlua
@@ -245,7 +245,7 @@ impl SandboxedLuaEngine {
                                 &bridge_state,
                                 ProxyError::WebhookFailed {
                                     url,
-                                    reason: "no tokio runtime on this thread".to_string(),
+                                    reason: "sin runtime tokio en este hilo".to_string(),
                                 },
                             ))
                         }
@@ -286,19 +286,19 @@ impl SandboxedLuaEngine {
                 },
             )
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to create http_request function: {}", e),
+                reason: format!("No se pudo crear la función http_request: {}", e),
             })?;
 
         proxy_table
             .set("http_request", http_fn)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set http_request: {}", e),
+                reason: format!("No se pudo fijar http_request: {}", e),
             })?;
 
         lua.globals()
             .set("proxy", proxy_table)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set global proxy: {}", e),
+                reason: format!("No se pudo fijar el proxy global: {}", e),
             })?;
 
         Ok(())
@@ -322,7 +322,7 @@ impl SandboxedLuaEngine {
 
         lua.set_memory_limit(self.memory_limit_mb as usize * 1024 * 1024)
             .map_err(|e| ProxyError::Internal {
-                reason: format!("Failed to set memory limit: {}", e),
+                reason: format!("No se pudo fijar el límite de memoria: {}", e),
             })?;
 
         // Deadline real: el hook se evalúa cada `LUA_HOOK_INSTRUCTIONS` instrucciones y aborta la
@@ -344,7 +344,7 @@ impl SandboxedLuaEngine {
             },
         )
         .map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to install Lua deadline hook: {e}"),
+            reason: format!("No se pudo instalar el hook de deadline de Lua: {e}"),
         })?;
 
         let body_str = String::from_utf8_lossy(body).to_string();
@@ -360,7 +360,10 @@ impl SandboxedLuaEngine {
         let user_func = match lua.load(&chunk).eval::<mlua::Function>() {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!("Lua script did not compile: {}, returning original body", e);
+                tracing::warn!(
+                    "El script Lua no compiló: {}, devolviendo el cuerpo original",
+                    e
+                );
                 return Ok(body.to_vec());
             }
         };
@@ -391,7 +394,7 @@ impl SandboxedLuaEngine {
                     tracing::warn!(
                         event = "lua_sandbox_violation",
                         error = %err_msg,
-                        "Lua sandbox violation"
+                        "Violación del sandbox Lua"
                     );
                     return Err(ProxyError::LuaSandboxViolation {
                         attempted_function: err_msg,
@@ -405,7 +408,7 @@ impl SandboxedLuaEngine {
                     });
                 }
 
-                tracing::warn!(error = %err_msg, "Lua script error, returning original body");
+                tracing::warn!(error = %err_msg, "Error de script Lua, devolviendo el cuerpo original");
                 Ok(body.to_vec())
             }
         }
@@ -564,7 +567,7 @@ impl LuaExecutor for SandboxedLuaEngine {
             tracing::debug!(
                 body_size = body.len(),
                 max_bytes = context.config.max_scripting_body_bytes,
-                "Body exceeds max_scripting_body_bytes, bypassing Lua"
+                "El cuerpo excede max_scripting_body_bytes, omitiendo Lua"
             );
             return Ok(body.to_vec());
         }
@@ -589,11 +592,11 @@ impl LuaExecutor for SandboxedLuaEngine {
         match tokio::time::timeout(budget, task).await {
             Ok(Ok(result)) => result,
             Ok(Err(join_error)) => Err(ProxyError::Internal {
-                reason: format!("spawn_blocking join: {join_error}"),
+                reason: format!("join de spawn_blocking: {join_error}"),
             }),
             Err(_) => {
                 tracing::warn!(
-                    "Lua execution outlived its deadline: the VM hook did not stop it (blocked inside a native call)"
+                    "La ejecución de Lua superó su deadline: el hook de la VM no la detuvo (bloqueada dentro de una llamada nativa)"
                 );
                 Err(ProxyError::ScriptTimeout {
                     timeout_ms: self.timeout_ms,

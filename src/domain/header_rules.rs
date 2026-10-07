@@ -929,7 +929,7 @@ pub fn apply_header_rules(
                 // escrito a mano en CouchDB), se salta la regla y queda en el log.
                 tracing::warn!(
                     reason = %reason,
-                    "header rule expression failed to parse at runtime; rule skipped"
+                    "la expresión de la regla de headers falló al parsear en runtime; regla omitida"
                 );
                 continue;
             }

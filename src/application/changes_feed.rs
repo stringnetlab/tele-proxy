@@ -64,7 +64,7 @@ impl ChangesFeedListener {
         let client = match Client::builder().timeout(Duration::from_secs(30)).build() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, "Changes feed: failed to build HTTP client, listener disabled");
+                tracing::error!(error = %e, "Feed de cambios: no se pudo construir el cliente HTTP, listener deshabilitado");
                 return;
             }
         };
@@ -94,7 +94,7 @@ impl ChangesFeedListener {
                                     doc_id = %change.id,
                                     internal_id = %internal_id,
                                     config_version = doc.config_version,
-                                    "Config change detected via _changes feed"
+                                    "Cambio de config detectado vía feed _changes"
                                 );
                                 self.config_fetcher.invalidate_cache(internal_id).await;
                             }
@@ -106,7 +106,7 @@ impl ChangesFeedListener {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "Changes feed error, backing off before retry");
+                    tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "Error del feed de cambios, esperando antes de reintentar");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
@@ -130,16 +130,16 @@ impl ChangesFeedListener {
             ])
             .send()
             .await
-            .map_err(|e| format!("CouchDB _changes request failed: {}", e))?;
+            .map_err(|e| format!("Falló la petición _changes a CouchDB: {}", e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("CouchDB _changes error {}: {}", status, body));
+            return Err(format!("Error _changes de CouchDB {}: {}", status, body));
         }
 
         resp.json::<ChangesResponse>()
             .await
-            .map_err(|e| format!("Failed to parse _changes response: {}", e))
+            .map_err(|e| format!("No se pudo parsear la respuesta _changes: {}", e))
     }
 }

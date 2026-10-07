@@ -126,7 +126,7 @@ pub async fn proxy_handler(
     let upstream_response = match upstream_result {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::warn!(error = %e, url = %query.url, "Upstream request failed, trying fallbacks");
+            tracing::warn!(error = %e, url = %query.url, "Falló la petición al upstream, probando fallbacks");
             return try_fallback_or_error(
                 &service,
                 &config,
@@ -146,12 +146,12 @@ pub async fn proxy_handler(
         // Modo transparent (docs/CLIENT_CONFIG.md): el error del upstream viaja al cliente tal
         // cual — status, headers y cuerpo — no un 502 genérico que esconde qué pasó.
         if config.error_handling.mode == crate::domain::models::ErrorMode::Transparent {
-            tracing::warn!(status = status, url = %query.url, "Upstream returned error, passing through (transparent mode)");
+            tracing::warn!(status = status, url = %query.url, "El upstream devolvió error, pasándolo tal cual (modo transparente)");
             return passthrough_upstream_error(upstream_response, degraded)
                 .await
                 .map_err(&api_err);
         }
-        tracing::warn!(status = status, url = %query.url, "Upstream returned error, trying fallbacks");
+        tracing::warn!(status = status, url = %query.url, "El upstream devolvió error, probando fallbacks");
         return try_fallback_or_error(
             &service,
             &config,
@@ -229,7 +229,7 @@ pub async fn proxy_handler(
             .set_response(&cache_key, &cached, ttl)
             .await
         {
-            tracing::warn!(error = %e, "Failed to cache response");
+            tracing::warn!(error = %e, "No se pudo guardar la respuesta en caché");
         }
 
         if let Err(e) = FallbackService::store_stale_fallback(
@@ -242,7 +242,7 @@ pub async fn proxy_handler(
         )
         .await
         {
-            tracing::warn!(error = %e, "Failed to store stale fallback");
+            tracing::warn!(error = %e, "No se pudo guardar el fallback stale");
         }
     }
 
@@ -312,7 +312,7 @@ fn should_apply_scripting(
         Err(reason) => {
             tracing::warn!(
                 reason = %reason,
-                "scripting expression failed at runtime; script skipped"
+                "la expresión de scripting falló en runtime; script omitido"
             );
             false
         }
@@ -417,7 +417,7 @@ async fn try_fallback_or_error(
             headers.insert("X-Cache", HeaderValue::from_static("FALLBACK"));
             headers.insert("X-Fallback-Source", HeaderValue::from_static(x_fallback));
 
-            tracing::info!(source = x_fallback, url = %url, "Serving fallback response");
+            tracing::info!(source = x_fallback, url = %url, "Sirviendo respuesta de fallback");
 
             build_response(StatusCode::OK, headers, fallback.cached.body)
         }
@@ -555,12 +555,12 @@ async fn make_upstream_request(
     default_user_agent: &str,
 ) -> Result<reqwest::Response, ProxyError> {
     let hostname = url.host_str().ok_or_else(|| ProxyError::Internal {
-        reason: "Upstream URL has no host".to_string(),
+        reason: "La URL del upstream no tiene host".to_string(),
     })?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ProxyError::Internal {
-            reason: "Upstream URL has no determinable port".to_string(),
+            reason: "La URL del upstream no tiene puerto determinable".to_string(),
         })?;
 
     let client = http_client::pinned_client(
@@ -585,7 +585,7 @@ async fn make_upstream_request(
             pinned_ip = %resolved_ip,
             port = port,
             error = %reason,
-            "Upstream connection failed"
+            "Falló la conexión al upstream"
         );
         // El timeout del origen es un 504, no un 502: el cliente puede distinguir "el origen
         // no respondió a tiempo" de "el origen rechazó la conexión".
@@ -678,7 +678,7 @@ fn rewrite_redirect_location(
             .parse(&pair.1)
             .map_err(|e| ProxyError::InvalidUrlFormat {
                 url: pair.1.clone(),
-                reason: format!("redirect Location does not parse: {e}"),
+                reason: format!("el Location del redirect no parsea: {e}"),
             })?;
 
         if let Err(reason) = validate_url_strict(resolved.as_str()) {
@@ -686,7 +686,7 @@ fn rewrite_redirect_location(
                 location = %pair.1,
                 resolved = %resolved,
                 reason = %reason,
-                "Redirect Location failed validation; request blocked"
+                "El Location del redirect falló la validación; petición bloqueada"
             );
             return Err(ProxyError::SsrfBlocked {
                 resolved_ip: resolved
@@ -713,7 +713,7 @@ fn rewrite_redirect_location(
             [("url", resolved.as_str())],
         )
         .map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to build proxied redirect URL: {e}"),
+            reason: format!("No se pudo construir la URL de redirect del proxy: {e}"),
         })?;
         pair.1 = proxied.to_string();
     }
@@ -797,7 +797,7 @@ fn build_response(
             resp
         })
         .map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to build response: {}", e),
+            reason: format!("No se pudo construir la respuesta: {}", e),
         })
 }
 
