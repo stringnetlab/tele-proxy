@@ -16,6 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Variante del binario: "proxy" (default, rustls) o "proxy-openssl" (OpenSSL vendored, para
 # orígenes que fingerprintan el JA3 de rustls — docs/DEPLOYMENT.md, "Variante proxy-openssl").
 ARG PROXY_FEATURES=proxy
+# Hash del commit desplegado: `GET /` lo devuelve para visibilidad del release. Dokploy (u otro
+# desplegador) debe pasarlo como build arg; sin él, el binario dice "desconocido".
+ARG GIT_SHA=desconocido
+ENV GIT_SHA=$GIT_SHA
 
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs

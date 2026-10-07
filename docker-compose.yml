@@ -2,6 +2,10 @@ services:
   tele-proxy:
     build:
       context: .
+      args:
+        # Hornea el hash del commit en el binario (`GET /` lo devuelve). El desplegador lo pasa
+        # como variable de entorno GIT_SHA; sin ella, el build arg por defecto aplica.
+        GIT_SHA: ${GIT_SHA:-desconocido}
     ports:
       # 8080 = /aq/ + /health. Objetivo Pingora (`add_tcp`); hoy lo sirve Axum, porque la portación
       # de la Fase 3 no está terminada (docs/spec.md, "Estado de la migración"). Es el único puerto
@@ -35,6 +39,9 @@ services:
       - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
       - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
       # --- Administración (docs/ENVIRONMENT.md § Administración) ---
+      # Hash del commit desplegado: `GET /` lo devuelve para visibilidad. En runtime pisa el valor
+      # horneado en compilación (build arg GIT_SHA), así basta con fijarla en el despliegue.
+      - GIT_SHA=${GIT_SHA:-desconocido}
       # Fallback de emergencia para /api/v1/admin/*; vacío = deshabilitado. Nunca fijarlo en el repo.
       - MASTER_BEARER_TOKEN=${MASTER_BEARER_TOKEN:-}
       # Login Google del panel: sin ambas el login OAuth queda deshabilitado (solo master token).
