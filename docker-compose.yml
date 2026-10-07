@@ -58,6 +58,11 @@ services:
       - ADMIN_RATE_LIMIT_WINDOW_SECONDS=${ADMIN_RATE_LIMIT_WINDOW_SECONDS:-60}
       - CONTROL_RATE_LIMIT_REQUESTS=${CONTROL_RATE_LIMIT_REQUESTS:-60}
       - CONTROL_RATE_LIMIT_WINDOW_SECONDS=${CONTROL_RATE_LIMIT_WINDOW_SECONDS:-60}
+      # --- UI externa (CORS, docs/ENVIRONMENT.md § Administración) ---
+      # Vacío = modo embebido actual. Fijada: cookie SameSite=None y redirect post-login a la UI.
+      - ADMIN_UI_URL=${ADMIN_UI_URL:-}
+      # Allowlist de orígenes EXACTOS (coma-separada). Vacío = sin capa CORS (comportamiento actual).
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
     restart: unless-stopped
     # Debe superar a PROXY_GRACE_PERIOD_SECONDS o Docker manda SIGKILL antes de que Pingora
     # drene las conexiones en curso (el proceso no se daemoniza nunca: sin -d/--daemon).

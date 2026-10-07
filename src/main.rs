@@ -13,7 +13,7 @@ use tele_proxy::application::lua_engine::SandboxedLuaEngine;
 use tele_proxy::application::proxy_service::ProxyService;
 use tele_proxy::application::webhook_service::{self, ValidatingWebhookFetcher};
 use tele_proxy::domain::services::AdminRepository;
-use tele_proxy::domain::validators::validate_allowed_domain_list;
+use tele_proxy::domain::validators::{validate_allowed_domain_list, validate_cors_allowed_origins};
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
 use tele_proxy::infrastructure::dns_resolver::SecureDnsResolver;
 use tele_proxy::infrastructure::local_rate_limiter::LocalRateLimiter;
@@ -21,6 +21,7 @@ use tele_proxy::infrastructure::valkey_cache::{ValkeyCacheStore, ValkeySessionSt
 use tele_proxy::interfaces::admin_api::admin_routes;
 use tele_proxy::interfaces::admin_ui::admin_ui_routes;
 use tele_proxy::interfaces::control_api::{control_routes, ControlState};
+use tele_proxy::interfaces::cors::cors_layer;
 use tele_proxy::interfaces::proxy_handler::proxy_handler;
 
 #[derive(Debug)]
@@ -109,6 +110,18 @@ fn admin_settings_from_env(control_port: u16) -> Result<AdminSettings, String> {
     )?)
     .map_err(|e| e.to_string())?;
 
+    // UI externa (proyecto SvelteKit en otro origen). Vacío = modo embebido actual: cookie
+    // SameSite=Lax y el callback redirige a /admin/. Con UI externa: SameSite=None y redirect
+    // a la URL (el CORS se arma desde `cors_allowed_origins`, no desde aquí).
+    let admin_ui_url = match env_var_or("ADMIN_UI_URL", "")?.trim() {
+        "" => None,
+        url => Some(url.trim_end_matches('/').to_string()),
+    };
+    // Allowlist CORS: vacía = sin capa CORS (comportamiento actual de siempre).
+    let cors_allowed_origins =
+        validate_cors_allowed_origins(&env_var_or("CORS_ALLOWED_ORIGINS", "")?)
+            .map_err(|e| e.to_string())?;
+
     Ok(AdminSettings {
         master_token_hash,
         allowed_domains,
@@ -156,6 +169,8 @@ fn admin_settings_from_env(control_port: u16) -> Result<AdminSettings, String> {
             3_600u64,
         )?,
         cookie_secure,
+        admin_ui_url,
+        cors_allowed_origins,
     })
 }
 
@@ -201,7 +216,7 @@ async fn index(State(service): State<Arc<ProxyService>>) -> String {
 /// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
 /// identificar. Es deliberadamente un entero simple, sin semver ni hash: `GET /` lo devuelve tal
 /// cual y permite verificar con un curl qué release está sirviendo.
-const RELEASE: &str = "4";
+const RELEASE: &str = "5";
 
 fn index_body(verbose: bool, release: &str) -> String {
     const NAME: &str = "TELE - PROXY";
@@ -335,6 +350,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if let Some(ref url) = admin_settings.admin_ui_url {
+        tracing::info!(admin_ui_url = %url, "UI externa de administración configurada: cookie SameSite=None y redirect post-login a la UI");
+    }
+    let admin_service_settings_origins = admin_settings.cors_allowed_origins.clone();
 
     let mut identity_providers = IdentityProviders::new();
     let google_client_id = std::env::var("GOOGLE_CLIENT_ID")
@@ -412,6 +431,17 @@ async fn main() {
         .merge(admin_ui_routes())
         .merge(Router::new().route("/health", axum::routing::get(healthcheck)))
         .with_state(control_state);
+
+    // CORS solo cuando la allowlist no está vacía; con lista vacía el app queda exactamente
+    // como antes (sin cabeceras CORS). `cors_layer` consume la lista de los settings, que ya se
+    // movieron al servicio: se reconstruye desde lo que el servicio expone.
+    let control_app = match cors_layer(&admin_service_settings_origins) {
+        Some(layer) => {
+            tracing::info!(origins = ?admin_service_settings_origins, "CORS activo para la UI externa");
+            control_app.layer(layer)
+        }
+        None => control_app,
+    };
 
     let proxy_addr = format!("{}:{}", config.http_host, config.http_proxy_port);
     let control_addr = format!("{}:{}", config.http_host, config.http_control_port);

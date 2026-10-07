@@ -40,6 +40,41 @@ pub struct AdminSettings {
     pub control_rate_limit_window_seconds: u64,
     /// `Secure` en la cookie de sesión: solo cuando `GOOGLE_REDIRECT_URI` es https.
     pub cookie_secure: bool,
+    /// Origen de la UI externa (`ADMIN_UI_URL`), sin slash final. `None` = modo embebido
+    /// actual: cookie SameSite=Lax y el callback redirige a `/admin/`.
+    pub admin_ui_url: Option<String>,
+    /// Allowlist CORS (`CORS_ALLOWED_ORIGINS`), ya normalizada a orígenes exactos. Vacía = sin
+    /// capa CORS (comportamiento actual). Cuando no está vacía, además, las mutaciones del
+    /// router admin exigen el header `X-Admin-UI` (CSRF por header).
+    pub cors_allowed_origins: Vec<String>,
+}
+
+impl AdminSettings {
+    /// `SameSite` de la cookie de sesión. Con UI externa (`ADMIN_UI_URL` fijada) el navegador
+    /// no enviaría una cookie Lax en peticiones cross-origin fetch → `None`. SameSite=None
+    /// exige `Secure`, que ya queda garantizado: la UI externa en HTTPS implica
+    /// `GOOGLE_REDIRECT_URI` en https, que es lo que decide `cookie_secure`.
+    pub fn cookie_same_site(&self) -> &'static str {
+        if self.admin_ui_url.is_some() {
+            "None"
+        } else {
+            "Lax"
+        }
+    }
+
+    /// Destino del redirect tras el login Google: la UI externa si está configurada, `/admin/`
+    /// (embebida) si no.
+    pub fn post_login_redirect(&self) -> String {
+        match &self.admin_ui_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => "/admin/".to_string(),
+        }
+    }
+
+    /// CORS activo: la allowlist no está vacía.
+    pub fn cors_enabled(&self) -> bool {
+        !self.cors_allowed_origins.is_empty()
+    }
 }
 
 /// Sesiones y estados OAuth efímeros sobre Valkey. Trait propio (no `CacheStore`) porque el
@@ -560,7 +595,7 @@ impl AdminService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -573,9 +608,9 @@ mod tests {
     // --- Fakes manuales (el proyecto no usa mockall) ---
 
     #[derive(Default)]
-    struct FakeRepo {
-        admins: Mutex<Vec<AdminUser>>,
-        clients: Mutex<Vec<ClientConfig>>,
+    pub(crate) struct FakeRepo {
+        pub(crate) admins: Mutex<Vec<AdminUser>>,
+        pub(crate) clients: Mutex<Vec<ClientConfig>>,
     }
 
     #[async_trait]
@@ -669,8 +704,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeSessions {
-        map: Mutex<HashMap<String, String>>,
+    pub(crate) struct FakeSessions {
+        pub(crate) map: Mutex<HashMap<String, String>>,
     }
 
     #[async_trait]
@@ -714,8 +749,8 @@ mod tests {
         }
     }
 
-    struct FakeGoogle {
-        identity: VerifiedIdentity,
+    pub(crate) struct FakeGoogle {
+        pub(crate) identity: VerifiedIdentity,
     }
 
     #[async_trait]
@@ -733,7 +768,7 @@ mod tests {
         }
     }
 
-    fn settings(master: Option<&str>) -> AdminSettings {
+    pub(crate) fn settings(master: Option<&str>) -> AdminSettings {
         AdminSettings {
             master_token_hash: master.map(|token| keyed_hash(token)),
             allowed_domains: vec!["gmail.com".to_string(), "stringnet.pe".to_string()],
@@ -746,10 +781,12 @@ mod tests {
             control_rate_limit_requests: 60,
             control_rate_limit_window_seconds: 60,
             cookie_secure: false,
+            admin_ui_url: None,
+            cors_allowed_origins: Vec::new(),
         }
     }
 
-    fn service(
+    pub(crate) fn service(
         repo: Arc<dyn AdminRepository>,
         sessions: Arc<dyn SessionStore>,
         providers: IdentityProviders,
@@ -758,7 +795,7 @@ mod tests {
         AdminService::new(repo, sessions, providers, settings(master))
     }
 
-    fn admin(email: &str, active: bool) -> AdminUser {
+    pub(crate) fn admin(email: &str, active: bool) -> AdminUser {
         AdminUser {
             id: AdminUser::doc_id(email),
             rev: None,
@@ -772,10 +809,31 @@ mod tests {
         }
     }
 
-    fn google(identity: VerifiedIdentity) -> IdentityProviders {
+    pub(crate) fn google(identity: VerifiedIdentity) -> IdentityProviders {
         let mut providers = IdentityProviders::new();
         providers.register(Arc::new(FakeGoogle { identity }));
         providers
+    }
+
+    #[test]
+    fn settings_de_ui_externa_cambian_cookie_redirect_y_csrf() {
+        // Modo embebido (sin ADMIN_UI_URL): exactamente el comportamiento actual.
+        let embebido = settings(Some("supersecret"));
+        assert_eq!(embebido.cookie_same_site(), "Lax");
+        assert_eq!(embebido.post_login_redirect(), "/admin/");
+        assert!(!embebido.cors_enabled());
+
+        // Modo UI externa: SameSite=None (exige Secure, que ya decide cookie_secure por el
+        // esquema https del redirect), redirect a la UI y CORS activo con la allowlist.
+        let mut externa = settings(Some("supersecret"));
+        externa.admin_ui_url = Some("https://admteleproxy.velone.ai/".to_string());
+        externa.cors_allowed_origins = vec!["https://admteleproxy.velone.ai".to_string()];
+        assert_eq!(externa.cookie_same_site(), "None");
+        assert_eq!(
+            externa.post_login_redirect(),
+            "https://admteleproxy.velone.ai"
+        );
+        assert!(externa.cors_enabled());
     }
 
     #[test]

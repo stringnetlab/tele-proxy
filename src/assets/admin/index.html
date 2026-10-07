@@ -162,8 +162,10 @@ let editing = null;     // cliente en edición
 let lastToken = null;   // token de un solo uso (crear/rotar)
 
 // ---------- API ----------
+// `X-Admin-UI` se envía siempre: si el operador activa CORS + CSRF por header
+// (CORS_ALLOWED_ORIGINS no vacía), las mutaciones del router admin lo exigen.
 async function api(path, options = {}) {
-  const headers = Object.assign({}, options.headers || {});
+  const headers = Object.assign({ "X-Admin-UI": "1" }, options.headers || {});
   if (options.json !== undefined) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(options.json);

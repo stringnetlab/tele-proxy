@@ -452,6 +452,51 @@ fn invalid_config(field: &str, reason: String) -> ProxyError {
     }
 }
 
+/// Parseo de `CORS_ALLOWED_ORIGINS` (allowlist coma-separada de orígenes para la UI externa).
+/// Cada entrada tiene que ser un origen **exacto** (esquema + host [+ puerto]) http/https:
+/// nunca `*` ni comodines de subdominio — con credenciales un comodín sería un agujero CSRF.
+/// Vacío = `Ok(vec![])`: sin capa CORS, comportamiento actual del listener de control.
+pub fn validate_cors_allowed_origins(raw: &str) -> Result<Vec<String>, ProxyError> {
+    let mut origins: Vec<String> = Vec::new();
+    for entry in raw.split(',') {
+        let origin = entry.trim();
+        if origin.is_empty() {
+            continue;
+        }
+        if origin.contains('*') {
+            return Err(invalid_config(
+                "CORS_ALLOWED_ORIGINS",
+                format!("'{origin}' must be an exact origin, wildcards are not allowed"),
+            ));
+        }
+        let url = url::Url::parse(origin).map_err(|e| {
+            invalid_config(
+                "CORS_ALLOWED_ORIGINS",
+                format!("'{origin}' is not a valid origin: {e}"),
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(invalid_config(
+                "CORS_ALLOWED_ORIGINS",
+                format!("'{origin}' must be an http(s) origin with a host"),
+            ));
+        }
+        // `origin.ascii_serialization()` normaliza a `scheme://host[:puerto]` (omite el puerto
+        // default), que es la forma en la que los navegadores envían el header `Origin`.
+        let normalized = url.origin().ascii_serialization();
+        if normalized == "null" {
+            return Err(invalid_config(
+                "CORS_ALLOWED_ORIGINS",
+                format!("'{origin}' is not a tuple origin"),
+            ));
+        }
+        if !origins.contains(&normalized) {
+            origins.push(normalized);
+        }
+    }
+    Ok(origins)
+}
+
 /// Validación de un email de administrador: formato básico (`local@dominio`) y dominio en la
 /// lista permitida con **comparación exacta** case-insensitive — un subdominio (`evil.gmail.com`)
 /// no coincide con `gmail.com` y queda fuera.
@@ -1253,6 +1298,40 @@ mod tests {
         // Lista vacía = fallo de arranque (ningún email podría ser admin).
         assert!(validate_allowed_domain_list("").is_err());
         assert!(validate_allowed_domain_list(" , ,").is_err());
+    }
+
+    #[test]
+    fn validate_cors_allowed_origins_exige_origenes_exactos() {
+        // Lista válida: normaliza esquema/host, deduplica y omite el puerto default.
+        let origins = validate_cors_allowed_origins(
+            "https://admteleproxy.velone.ai, http://localhost:5173 ,https://admteleproxy.velone.ai",
+        )
+        .expect("allowlist válida");
+        assert_eq!(
+            origins,
+            vec![
+                "https://admteleproxy.velone.ai".to_string(),
+                "http://localhost:5173".to_string(),
+            ]
+        );
+
+        // Vacío = sin capa CORS (comportamiento actual).
+        assert_eq!(validate_cors_allowed_origins("").expect("vacío"), Vec::<String>::new());
+        assert_eq!(validate_cors_allowed_origins(" , ").expect("vacío"), Vec::<String>::new());
+
+        // Comodines y orígenes incompletos se rechazan (con credenciales, '*' sería CSRF).
+        for raw in [
+            "*",
+            "https://*.velone.ai",
+            "admteleproxy.velone.ai",
+            "ftp://admteleproxy.velone.ai",
+            "https://admteleproxy.velone.ai/*",
+        ] {
+            assert!(
+                validate_cors_allowed_origins(raw).is_err(),
+                "{raw:?} debería ser rechazado"
+            );
+        }
     }
 
     /// Regresión de docs/HEADER_RULES.md § 9.9: la configuración completa de ejemplo del

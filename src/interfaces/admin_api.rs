@@ -1,7 +1,7 @@
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,30 @@ impl axum::extract::FromRequestParts<ControlState> for AdminIdentity {
     ) -> Result<Self, Self::Rejection> {
         let verbose = state.modo_desarrollo;
 
+        // CSRF por header: cuando CORS está activo (UI externa configurada), las mutaciones del
+        // router admin exigen `X-Admin-UI`. SameSite=None hace que la cookie viaje en
+        // cross-origin, así que la cookie sola ya no basta como defensa CSRF: el header no se
+        // envía en un formulario/imagen cross-origin clásico. Aplica también al master token.
+        // Con CORS desactivado (modo embebido) no se exige nada: comportamiento actual.
+        // Las rutas de auth son GET de navegación (callback Google, url de login) y quedan fuera.
+        if state.admin.settings().cors_enabled()
+            && matches!(
+                parts.method,
+                axum::http::Method::POST
+                    | axum::http::Method::PUT
+                    | axum::http::Method::PATCH
+                    | axum::http::Method::DELETE
+            )
+            && !parts.headers.contains_key("x-admin-ui")
+        {
+            return Err(ApiError::detailed(
+                ProxyError::Forbidden {
+                    reason: "falta el header X-Admin-UI (CSRF)".to_string(),
+                },
+                verbose,
+            ));
+        }
+
         // 1) Cookie de sesión (el camino normal).
         if let Some(session_id) = session_cookie(&parts.headers) {
             if let Some(email) = state.admin.resolve_session(&session_id).await {
@@ -108,11 +132,18 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-/// Cabecera `Set-Cookie` de la sesión: HttpOnly, SameSite=Lax, `Secure` solo si el callback de
-/// Google es https (mismo criterio de transporte).
-fn session_cookie_header(session_id: &str, ttl_seconds: u64, secure: bool) -> String {
+/// Cabecera `Set-Cookie` de la sesión: HttpOnly, `Secure` solo si el callback de Google es
+/// https (mismo criterio de transporte), y `SameSite` según `AdminSettings::cookie_same_site`
+/// (`None` con UI externa, `Lax` en modo embebido). SameSite=None exige Secure: garantizado
+/// porque la UI externa en HTTPS implica `GOOGLE_REDIRECT_URI` en https.
+fn session_cookie_header(
+    session_id: &str,
+    ttl_seconds: u64,
+    secure: bool,
+    same_site: &str,
+) -> String {
     let mut cookie = format!(
-        "teleproxy_admin={session_id}; HttpOnly; SameSite=Lax; Path=/; Max-Age={ttl_seconds}"
+        "teleproxy_admin={session_id}; HttpOnly; SameSite={same_site}; Path=/; Max-Age={ttl_seconds}"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -120,8 +151,9 @@ fn session_cookie_header(session_id: &str, ttl_seconds: u64, secure: bool) -> St
     cookie
 }
 
-fn expired_cookie_header(secure: bool) -> String {
-    let mut cookie = "teleproxy_admin=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string();
+fn expired_cookie_header(secure: bool, same_site: &str) -> String {
+    let mut cookie =
+        format!("teleproxy_admin=; HttpOnly; SameSite={same_site}; Path=/; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -201,10 +233,29 @@ async fn auth_google_callback(
         .await
     {
         Ok(session) => {
-            let mut response = Redirect::temporary("/admin/").into_response();
-            let secure = state.admin.settings().cookie_secure;
-            let ttl = state.admin.settings().session_ttl_seconds;
-            set_cookie(&mut response, &session_cookie_header(&session.session_id, ttl, secure));
+            let settings = state.admin.settings();
+            // 302 (found): navegación GET, el navegador sigue al destino con la cookie. Axum 0.8
+            // no expone `Redirect::found`, así que se construye a mano.
+            let location = settings.post_login_redirect();
+            let mut response = (
+                StatusCode::FOUND,
+                [(
+                    axum::http::header::LOCATION,
+                    HeaderValue::from_str(&location).unwrap_or_else(|_| {
+                        HeaderValue::from_static("/admin/")
+                    }),
+                )],
+            )
+                .into_response();
+            set_cookie(
+                &mut response,
+                &session_cookie_header(
+                    &session.session_id,
+                    settings.session_ttl_seconds,
+                    settings.cookie_secure,
+                    settings.cookie_same_site(),
+                ),
+            );
             Ok(response)
         }
         Err(error) => Ok(html_error_page(&state, error)),
@@ -228,8 +279,11 @@ async fn auth_logout(
         }
     }
     let mut response = Json(serde_json::json!({ "ok": true })).into_response();
-    let secure = state.admin.settings().cookie_secure;
-    set_cookie(&mut response, &expired_cookie_header(secure));
+    let settings = state.admin.settings();
+    set_cookie(
+        &mut response,
+        &expired_cookie_header(settings.cookie_secure, settings.cookie_same_site()),
+    );
     Ok(response)
 }
 
@@ -589,16 +643,21 @@ mod tests {
     }
 
     #[test]
-    fn cookie_de_sesion_lleva_httponly_y_secure_condicional() {
-        let cookie = session_cookie_header("sid", 3600, false);
+    fn cookie_de_sesion_lleva_httponly_secure_y_samesite_condicional() {
+        let cookie = session_cookie_header("sid", 3600, false, "Lax");
         assert!(cookie.starts_with("teleproxy_admin=sid; HttpOnly; SameSite=Lax; Path=/"));
         assert!(cookie.contains("Max-Age=3600"));
         assert!(!cookie.contains("Secure"));
 
-        let secure = session_cookie_header("sid", 3600, true);
+        let secure = session_cookie_header("sid", 3600, true, "Lax");
         assert!(secure.contains("; Secure"));
 
-        let expired = expired_cookie_header(false);
+        // UI externa: SameSite=None para que la cookie viaje cross-origin (con Secure).
+        let externa = session_cookie_header("sid", 3600, true, "None");
+        assert!(externa.contains("SameSite=None"));
+        assert!(externa.contains("; Secure"));
+
+        let expired = expired_cookie_header(false, "Lax");
         assert!(expired.contains("Max-Age=0"));
     }
 
@@ -648,5 +707,242 @@ mod tests {
             .expect("serializar vista individual");
         assert_eq!(individual["scripting_code"], "return body");
         assert!(!individual.to_string().contains("secreto"));
+    }
+
+    // --- Callback de Google y CSRF: requieren un ControlState de verdad ---
+
+    use crate::application::admin_service::tests as fakes;
+    use crate::application::admin_service::AdminService;
+    use crate::application::identity::VerifiedIdentity;
+    use crate::application::proxy_service::ProxyService;
+    use crate::domain::services::{AdminRepository, CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+    use axum::extract::FromRequestParts;
+    use axum::http::Request;
+    use std::sync::Arc;
+
+    /// Stubs mínimos para construir un `ProxyService` real: el extractor `AdminIdentity` y el
+    /// callback no tocan el servicio del proxy, solo el `AdminService`.
+    struct StubFetcher;
+    #[async_trait::async_trait]
+    impl ConfigFetcher for StubFetcher {
+        async fn get_by_crypt_id(&self, _: &str) -> Result<ClientConfig, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn get_by_token_hash(&self, _: &str) -> Result<ClientConfig, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn update_config(
+            &self,
+            _: &str,
+            _: &crate::domain::models::ClientConfigUpdate,
+        ) -> Result<ClientConfig, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn rotate_crypt_id(&self, _: &str) -> Result<String, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn invalidate_cache(&self, _: &str) {}
+    }
+
+    struct StubCache;
+    #[async_trait::async_trait]
+    impl CacheStore for StubCache {
+        async fn get_response(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::domain::models::CachedResponse>, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn set_response(
+            &self,
+            _: &str,
+            _: &crate::domain::models::CachedResponse,
+            _: u64,
+        ) -> Result<(), ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn get_ip(&self, _: &str) -> Result<Option<std::net::IpAddr>, ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn set_ip(
+            &self,
+            _: &str,
+            _: &std::net::IpAddr,
+            _: u64,
+        ) -> Result<(), ProxyError> {
+            unimplemented!("stub de test")
+        }
+        async fn check_rate_limit(
+            &self,
+            _: &str,
+            _: u32,
+            _: u64,
+        ) -> crate::domain::models::RateLimitDecision {
+            unimplemented!("stub de test")
+        }
+    }
+
+    struct StubDns;
+    #[async_trait::async_trait]
+    impl DnsResolver for StubDns {
+        async fn resolve_and_validate(&self, _: &str) -> Result<std::net::IpAddr, ProxyError> {
+            unimplemented!("stub de test")
+        }
+    }
+
+    struct StubLua;
+    #[async_trait::async_trait]
+    impl LuaExecutor for StubLua {
+        async fn execute(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &crate::domain::models::ProxyContext,
+        ) -> Result<Vec<u8>, ProxyError> {
+            unimplemented!("stub de test")
+        }
+    }
+
+    fn test_control_state(mut settings: crate::application::admin_service::AdminSettings) -> ControlState {
+        let repo = Arc::new(fakes::FakeRepo::default());
+        repo.admins
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(fakes::admin("juan@gmail.com", true));
+        settings.cookie_secure = true;
+        let providers = fakes::google(VerifiedIdentity {
+            email: "juan@gmail.com".to_string(),
+            email_verified: true,
+        });
+        let admin = Arc::new(AdminService::new(
+            repo as Arc<dyn crate::domain::services::AdminRepository>,
+            Arc::new(fakes::FakeSessions::default()),
+            providers,
+            settings,
+        ));
+        ControlState {
+            service: Arc::new(ProxyService::new(
+                Arc::new(StubFetcher),
+                Arc::new(StubCache),
+                Arc::new(StubDns),
+                Arc::new(StubLua),
+            )),
+            admin,
+            login_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
+            admin_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
+            control_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
+            modo_desarrollo: false,
+        }
+    }
+
+    fn master_parts(method: &str, extra_headers: &[(&str, &str)]) -> axum::http::request::Parts {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .header(axum::http::header::AUTHORIZATION, "Bearer supersecret");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(()).expect("request de prueba");
+        request.into_parts().0
+    }
+
+    /// El callback devuelve `Result<Response, ApiError>`; ApiError no es Debug (lleva Span), así
+    /// que se desempaqueta a mano para poder hacer assertions sobre el error.
+    async fn callback_response(
+        state: ControlState,
+    ) -> Response {
+        let url = state.admin.google_login_url().await.expect("url de login");
+        let oauth_state = url.split("state=").nth(1).expect("state en la url").to_string();
+        match auth_google_callback(
+            State(state),
+            ClientIp("10.0.0.1".to_string()),
+            Query(GoogleCallbackQuery {
+                code: "code".to_string(),
+                state: oauth_state,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(error) => {
+                let status = error.into_response().status();
+                panic!("el callback falló: status {status}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_redirige_a_admin_ui_url_con_samesite_none_cuando_hay_ui_externa() {
+        let mut settings = fakes::settings(None);
+        settings.admin_ui_url = Some("https://admteleproxy.velone.ai/".to_string());
+        settings.cors_allowed_origins = vec!["https://admteleproxy.velone.ai".to_string()];
+
+        let response = callback_response(test_control_state(settings)).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        // Redirect a la UI externa (sin slash final) y cookie SameSite=None + Secure.
+        assert_eq!(
+            response.headers().get(axum::http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("https://admteleproxy.velone.ai")
+        );
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("Set-Cookie del callback");
+        assert!(cookie.contains("SameSite=None"), "{cookie}");
+        assert!(cookie.contains("; Secure"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn callback_redirige_a_admin_embebido_con_samesite_lax_sin_ui_externa() {
+        let response = callback_response(test_control_state(fakes::settings(None))).await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(axum::http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/admin/")
+        );
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("Set-Cookie del callback");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn csrf_header_en_mutaciones_con_cors_activo() {
+        let mut settings = fakes::settings(Some("supersecret"));
+        settings.cors_allowed_origins = vec!["https://admteleproxy.velone.ai".to_string()];
+        let state = test_control_state(settings);
+
+        // Mutación sin X-Admin-UI → 403 `forbidden`, aunque el master token sea correcto.
+        let mut parts = master_parts("POST", &[]);
+        let rejection = match AdminIdentity::from_request_parts(&mut parts, &state).await {
+            Ok(_) => panic!("sin header X-Admin-UI debe ser 403"),
+            Err(error) => error,
+        };
+        assert_eq!(rejection.into_response().status(), StatusCode::FORBIDDEN);
+
+        // Con el header → el master token autoriza.
+        let mut parts = master_parts("POST", &[("x-admin-ui", "1")]);
+        let identity = match AdminIdentity::from_request_parts(&mut parts, &state).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                let status = error.into_response().status();
+                panic!("con header X-Admin-UI debe pasar: status {status}");
+            }
+        };
+        assert!(identity.via_master);
+
+        // GET no es mutación: no aplica (las rutas de auth de navegador siguen funcionando).
+        let mut parts = master_parts("GET", &[]);
+        assert!(AdminIdentity::from_request_parts(&mut parts, &state).await.is_ok());
+
+        // Sin CORS activo (modo embebido) no se exige el header: comportamiento actual.
+        let state = test_control_state(fakes::settings(Some("supersecret")));
+        let mut parts = master_parts("POST", &[]);
+        assert!(AdminIdentity::from_request_parts(&mut parts, &state).await.is_ok());
     }
 }

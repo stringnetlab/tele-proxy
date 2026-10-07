@@ -191,6 +191,8 @@ fallback de emergencia. Toda mutación queda auditada (`event=admin_audit` en el
 | `ADMIN_RATE_LIMIT_WINDOW_SECONDS` | Ventana del rate limit general admin | `60` | No | **activa** — `parse_in_range` |
 | `CONTROL_RATE_LIMIT_REQUESTS` | Cuota por IP de la API de control de clientes (`/api/v1/clients/*`; hallazgo A1) | `60` | No | **activa** — `parse_in_range` |
 | `CONTROL_RATE_LIMIT_WINDOW_SECONDS` | Ventana del rate limit de la API de control | `60` | No | **activa** — `parse_in_range` |
+| `ADMIN_UI_URL` | Origen de la UI externa (p. ej. `https://admteleproxy.velone.ai`). Vacío = **modo embebido actual**: cookie SameSite=Lax y el callback de Google redirige a `/admin/`. Fijada: cookie SameSite=None (exige Secure, ya garantizado porque la UI externa en HTTPS implica `GOOGLE_REDIRECT_URI` en https) y el callback redirige a esta URL | vacío (embebido) | No | **activa** — `admin_settings_from_env` → `AdminSettings::cookie_same_site`/`post_login_redirect` |
+| `CORS_ALLOWED_ORIGINS` | Allowlist coma-separada de orígenes **exactos** (esquema+host) con CORS en el listener de control. Vacío = **sin capa CORS** (comportamiento actual, sin cabeceras). Nunca `*` ni comodines de subdominio — con credenciales serían un agujero CSRF. Cuando está activa, además, las mutaciones `/api/v1/admin/*` exigen el header `X-Admin-UI` | vacío (sin CORS) | No | **activa** — validada por `validate_cors_allowed_origins`; capa en `interfaces/cors.rs` |
 
 > El número de release que `GET /` devuelve **no** es una variable de entorno: es la constante
 > `RELEASE` en `main.rs`, que se incrementa a mano en cada deploy que se quiera identificar.
