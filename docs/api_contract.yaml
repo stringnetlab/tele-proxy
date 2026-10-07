@@ -89,7 +89,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "invalid_url_format"
-                message: "Invalid URL format: URL contains credentials"
+                message: "Formato de URL inválido: URL contains credentials"
 
         "403":
           description: Dominio no autorizado o SSRF bloqueado
@@ -105,12 +105,12 @@ paths:
                   summary: Dominio fuera de whitelist
                   value:
                     error: "domain_not_whitelisted"
-                    message: "Domain not whitelisted: malicious.com"
+                    message: "Dominio no permitido: malicious.com"
                 ssrf_blocked:
                   summary: Intento de SSRF
                   value:
                     error: "ssrf_blocked"
-                    message: "SSRF blocked: resolves to private IP"
+                    message: "Bloqueo anti-SSRF: resolves to private IP"
 
         "404":
           description: crypt_id inválido o inexistente
@@ -126,12 +126,12 @@ paths:
                   summary: crypt_id con formato inválido o sin cliente en CouchDB
                   value:
                     error: "invalid_crypt_id"
-                    message: "Invalid crypt_id: not found"
+                    message: "crypt_id inválido: not found"
                 config_not_found:
                   summary: La configuración del cliente no existe
                   value:
                     error: "config_not_found"
-                    message: "Configuration not found for client: client_123"
+                    message: "Configuración no encontrada para el cliente: client_123"
 
         "413":
           description: El cuerpo superado `max_response_size_bytes`
@@ -144,7 +144,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "payload_too_large"
-                message: "Payload too large: 15728640 bytes (max: 10485760)"
+                message: "Cuerpo demasiado grande: 15728640 bytes (máx: 10485760)"
 
         "429":
           description: Rate limit excedido
@@ -162,7 +162,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "rate_limit_exceeded"
-                message: "Rate limit exceeded"
+                message: "Límite de peticiones excedido"
 
         "500":
           description: Fallo del proxy o del script Lua (ver ERROR_DICTIONARY.md)
@@ -178,12 +178,12 @@ paths:
                   summary: Fallo no clasificado
                   value:
                     error: "internal_error"
-                    message: "Internal error: cache write failed"
+                    message: "Error interno: cache write failed"
                 integrity_check_failed:
                   summary: El hash del script o del fallback no coincide
                   value:
                     error: "integrity_check_failed"
-                    message: "Integrity check failed for lua_script"
+                    message: "Falló la verificación de integridad de lua_script"
 
         "502":
           description: Error al obtener el recurso del origen o fallo DNS
@@ -199,12 +199,12 @@ paths:
                   summary: El origen devolvió 4xx/5xx sin fallback aplicable
                   value:
                     error: "upstream_error"
-                    message: "Upstream error: status=503"
+                    message: "Error del origen: status=503, motivo=upstream returned an error status"
                 dns_resolution_failed:
                   summary: Todos los resolvers DoT fallaron
                   value:
                     error: "dns_resolution_failed"
-                    message: "DNS resolution failed for unknown.example: nxdomain"
+                    message: "Falló la resolución DNS de unknown.example: nxdomain"
 
   # ========================================
   # ENDPOINTS DE CONTROL (Bearer Token)
@@ -236,7 +236,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "unauthorized"
-                message: "Unauthorized: Missing Authorization header"
+                message: "No autorizado: Missing Authorization header"
         "404":
           description: Ningún cliente con ese token
           content:
@@ -245,7 +245,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "config_not_found"
-                message: "Configuration not found for client: client_123"
+                message: "Configuración no encontrada para el cliente: client_123"
         "500":
           description: Fallo de CouchDB u otro error no clasificado
           content:
@@ -254,7 +254,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "internal_error"
-                message: "Internal error: couchdb view query failed"
+                message: "Error interno: couchdb view query failed"
 
     put:
       summary: Actualiza la configuración del cliente
@@ -307,17 +307,17 @@ paths:
                   summary: Un límite fuera del rango permitido
                   value:
                     error: "invalid_config"
-                    message: "Invalid config: rate_limit.max_requests 20000 is outside 1..=10000"
+                    message: "Configuración inválida: rate_limit.max_requests 20000 is outside 1..=10000"
                 whitelist_entry_not_a_host:
                   summary: Entrada de whitelist que lleva una cabecera o una IP privada
                   value:
                     error: "invalid_config"
-                    message: "Invalid config: whitelist 'shutterstock.com:8080' is not a bare domain name"
+                    message: "Configuración inválida: whitelist 'shutterstock.com:8080' is not a bare domain name"
                 bad_fallback_url:
                   summary: URL de fallback malformada
                   value:
                     error: "invalid_url_format"
-                    message: "Invalid URL format: Invalid scheme 'ftp': only http and https are allowed"
+                    message: "Formato de URL inválido: Invalid scheme 'ftp': only http and https are allowed"
         "401":
           description: Token Bearer inválido o ausente
           content:
@@ -326,7 +326,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "unauthorized"
-                message: "Unauthorized: Invalid Authorization format, expected Bearer"
+                message: "No autorizado: Invalid Authorization format, expected Bearer"
         "404":
           description: Ningún cliente con ese token
           content:
@@ -335,7 +335,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "config_not_found"
-                message: "Configuration not found for client: client_123"
+                message: "Configuración no encontrada para el cliente: client_123"
         "500":
           description: Fallo de CouchDB u otro error no clasificado
           content:
@@ -344,7 +344,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "internal_error"
-                message: "Internal error: couchdb write failed"
+                message: "Error interno: couchdb write failed"
 
   /api/v1/clients/rotate-id:
     post:
@@ -379,7 +379,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "unauthorized"
-                message: "Unauthorized: Empty bearer token"
+                message: "No autorizado: Empty bearer token"
         "404":
           description: Ningún cliente con ese token
           content:
@@ -388,7 +388,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "config_not_found"
-                message: "Configuration not found for client: client_123"
+                message: "Configuración no encontrada para el cliente: client_123"
         "500":
           description: Fallo de CouchDB u otro error no clasificado
           content:
@@ -397,7 +397,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error: "internal_error"
-                message: "Internal error: couchdb write failed"
+                message: "Error interno: couchdb write failed"
 
   # ========================================
   # SALUD (sin autenticación, en ambos puertos)
@@ -469,7 +469,7 @@ components:
         message:
           type: string
           description: Display del `ProxyError` (dominio/errors.rs); no un texto libre
-          example: "Domain not whitelisted: malicious.com"
+          example: "Dominio no permitido: malicious.com"
 
     ClientConfigResponse:
       type: object

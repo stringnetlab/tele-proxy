@@ -92,7 +92,7 @@ impl IntoResponse for ApiError {
         }
 
         let payload = serde_json::to_vec(&body).unwrap_or_else(|_| {
-            Vec::from(r#"{"error":"internal_error","message":"Internal server error"}"#)
+            Vec::from(r#"{"error":"internal_error","message":"Error interno del servidor"}"#)
         });
 
         (status, response_headers, payload).into_response()
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(response).await;
         assert_eq!(body["error"], "internal_error");
-        assert_eq!(body["message"], "Internal server error");
+        assert_eq!(body["message"], "Error interno del servidor");
         assert!(body.get("details").is_none(), "{body}");
     }
 
@@ -289,7 +289,7 @@ mod tests {
         )
         .await;
         assert_eq!(timeout["error"], "upstream_timeout");
-        assert_eq!(timeout["message"], "Gateway timeout");
+        assert_eq!(timeout["message"], "El origen no responde a tiempo");
         assert!(timeout.get("details").is_none(), "{timeout}");
 
         let desarrollo = body_json(
@@ -320,7 +320,7 @@ mod tests {
         let prod = body_json(ApiError::detailed(make_error(), false).into_response()).await;
         assert_eq!(
             prod["message"],
-            "Invalid config: rate_limit.max_requests 0 is outside 1..=10000"
+            "Configuración inválida: rate_limit.max_requests 0 is outside 1..=10000"
         );
         assert!(prod.get("details").is_none(), "{prod}");
 

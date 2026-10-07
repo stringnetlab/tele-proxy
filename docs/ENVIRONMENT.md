@@ -23,7 +23,7 @@ El efecto de `MODO` son dos, ambos sobre las **respuestas HTTP**: (1) la verbosi
 cuerpos de error que devuelven `/aq/` y `/api/v1/` — en `desarrollo` un 5xx expone el motivo
 interno completo y un objeto `details` con los campos estructurados del error (`reason`,
 `domain`, `retry_after_secs`, ...), y en cualquier otro modo los 5xx siguen siendo
-`{"error":"internal_error","message":"Internal server error"}` y los 4xx mantienen su mensaje
+`{"error":"internal_error","message":"Error interno del servidor"}` y los 4xx mantienen su mensaje
 actual sin `details`; y (2) el cuerpo de `GET /` en el puerto del proxy — en `desarrollo`
 incluye la lista de endpoints definidos, en producción solo el nombre del proyecto (`TELE -
 PROXY`). La comparación es case-insensitive (`DESARROLLO` también activa). No existe
@@ -192,7 +192,7 @@ rango: si `LUA_TIMEOUT_MS=99999`, el proceso **no** arranca. Verificado ejecutan
 emite un único evento y sale con código 1:
 
 ```json
-{"timestamp":"…","level":"ERROR","fields":{"message":"Configuration error, aborting startup","error":"Invalid LUA_TIMEOUT_MS: 99999 is outside 1..=60000"}}
+{"timestamp":"…","level":"ERROR","fields":{"message":"Error de configuración, abortando el arranque","error":"Invalid LUA_TIMEOUT_MS: 99999 is outside 1..=60000"}}
 ```
 
 El mensaje sale por `tracing`, no por `eprintln!` (`RUST_STYLE_GUIDE.md:109` lo prohíbe):

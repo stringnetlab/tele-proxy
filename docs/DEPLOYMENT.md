@@ -443,8 +443,8 @@ docker compose up -d
 
 ### Problema: el diseño `_design/proxy_lookup` no existe
 
-El arranque lo intenta y si falla solo avisa (`Failed to create CouchDB design doc (will retry on
-first request)`). Causa casi siempre: la base no está creada todavía → ver
+El arranque lo intenta y si falla solo avisa (`No se pudo crear el design doc de CouchDB (se reintentará en
+la primera petición)`). Causa casi siempre: la base no está creada todavía → ver
 *Creación de la Base de Datos*.
 
 ### Problema: Valkey no acepta conexiones
