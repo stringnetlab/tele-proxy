@@ -209,9 +209,10 @@ pub async fn proxy_handler(
     .await
     .map_err(&api_err)?;
 
-    // Los 3xx quedan fuera de la caché: su Location reescrito depende del Host de cada
-    // petición y no se puede servir tal cual en un HIT.
-    let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT && status < 300;
+    // Solo los 200 se cachean: un anti-bot que responde 202/403 con cuerpo vacío (Amazon/IMDB
+    // lo hace) quedaría servido desde la caché en blanco durante todo su TTL. Los 3xx ya
+    // quedaban fuera (su Location reescrito depende del Host de cada petición).
+    let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT && status == 200;
     if cacheable {
         let cached = CachedResponse {
             status,
