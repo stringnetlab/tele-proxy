@@ -20,13 +20,21 @@ pub fn pinned_client(
 ) -> Result<Client, ProxyError> {
     let pinned = SocketAddr::new(resolved_ip, port);
 
-    Client::builder()
+    let builder = Client::builder();
+    // `proxy` y `proxy-openssl` son hermanas excluyentes (ver [features] en Cargo.toml);
+    // este cfg solo existe para que un --all-features accidentado no deje el backend TLS de
+    // reqwest a su heurística interna: con la variante openssl activa, OpenSSL. El shadowing
+    // (sin `mut`) evita el warning de mutabilidad cuando la variante no está compilada.
+    #[cfg(feature = "proxy-openssl")]
+    let builder = builder.use_native_tls();
+
+    builder
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .resolve(hostname, pinned)
         .build()
         .map_err(|e| ProxyError::Internal {
-            reason: format!("Failed to build HTTP client: {e}"),
+            reason: format!("No se pudo construir el cliente HTTP: {e}"),
         })
 }
 
@@ -47,7 +55,7 @@ pub async fn read_body_capped(
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| ProxyError::Internal {
-        reason: format!("Failed to read response body: {e}"),
+        reason: format!("No se pudo leer el cuerpo de la respuesta: {e}"),
     })? {
         if (body.len() + chunk.len()) as u64 > max_bytes {
             return Err(ProxyError::PayloadTooLarge {

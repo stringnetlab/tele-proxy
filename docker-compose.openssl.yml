@@ -1,0 +1,13 @@
+# Override para construir y correr la variante del binario con backend TLS OpenSSL
+# (docs/DEPLOYMENT.md, "Variante proxy-openssl"). Uso:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.openssl.yml up -d --build
+#
+# Mismos puertos: corre una variante a la vez. La imagen lleva tag propio para no pisar la
+# default (rustls).
+services:
+  tele-proxy:
+    build:
+      args:
+        PROXY_FEATURES: proxy-openssl
+    image: teleproxy-tele-proxy-openssl

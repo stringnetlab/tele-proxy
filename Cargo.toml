@@ -12,10 +12,22 @@ name = "tele-proxy"
 path = "src/main.rs"
 
 [features]
-# `proxy` queda opcional mientras la portación Axum -> Pingora no termine (docs/spec.md Fase 3):
-# en Windows no se puede compilar pingora. El Dockerfile construye SIEMPRE con --features proxy.
+# `proxy-engine`/`proxy` quedan opcionales mientras la portación Axum -> Pingora no termine
+# (docs/spec.md Fase 3): en Windows no se puede compilar pingora. El Dockerfile construye
+# SIEMPRE con --features proxy (default) salvo que se pase el build arg PROXY_FEATURES.
 default = []
-proxy = ["pingora-core", "pingora-proxy", "pingora-http", "pingora-limits"]
+# Motor de proxy (Pingora). No incluye backend TLS de reqwest: cada variante lo trae.
+proxy-engine = ["pingora-core", "pingora-proxy", "pingora-http", "pingora-limits"]
+# Variante DEFAULT y documentada: reqwest sobre rustls (coherencia del árbol cripto con el
+# `ring` de hickory-resolver, runtime sin OpenSSL, build más rápido).
+proxy = ["proxy-engine", "reqwest/rustls"]
+# Variante opt-in para orígenes que fingerprintan el JA3 de rustls (Meta properties responden
+# 302 a /unsupportedbrowser; con OpenSSL devuelven 200 — verificado contra el contenedor).
+# OpenSSL **vendored** (compilado estático desde openssl-src): el runtime sigue sin libssl.
+# EXCLUYENTE con `proxy` (features hermanas, no aditivas): no las actives a la vez; si ambas
+# cayeran activas (--all-features), http_client::pinned_client fuerza native-tls. El DoT del
+# resolver DNS se queda en ring en ambas variantes.
+proxy-openssl = ["proxy-engine", "reqwest/native-tls-vendored"]
 
 [dependencies]
 # --- Async Runtime ---
@@ -28,7 +40,8 @@ axum = { version = "0.8", features = ["macros"] }
 # default-features = false + features = ["rustls"]: pingora-core/pingora-proxy declaran
 # `default = []`, así que NINGÚN backend TLS viene activado por defecto y sin `rustls` las
 # peticiones https:// al origen fallan. rustls mantiene el runtime sin libssl y coincide con
-# el backend `ring` de hickory-resolver (tls-ring) y reqwest (rustls).
+# el backend `ring` de hickory-resolver (tls-ring); el backend TLS de reqwest lo elige la
+# variante del binario (`proxy` = rustls, `proxy-openssl` = native-tls-vendored).
 # rev exacto, nunca rama móvil (RUST_STYLE_GUIDE.md §8): con `branch = "main"` un push de
 # Cloudflare cambiaría el commit al regenerar el lock, y aquí las firmas de la documentación
 # están citadas línea por línea contra 4487f7b2.
@@ -41,7 +54,10 @@ pingora-limits = { git = "https://github.com/cloudflare/pingora", rev = "4487f7b
 # --- HTTP ---
 hyper = { version = "1.11", features = ["full"] }
 http = "1.5"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "query"] }
+# Backend TLS de reqwest según la variante del binario: `proxy` añade "rustls" y
+# `proxy-openssl` añade "native-tls-vendored" (ver [features]). En desarrollo en Windows
+# (default = []) reqwest compila sin TLS: las pruebas unitarias no hacen red.
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "query"] }
 
 # --- Serialization ---
 serde = { version = "1.0", features = ["derive"] }

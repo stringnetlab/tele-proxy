@@ -13,12 +13,48 @@ Pingora es **Linux/Unix-only** (`epoll`, señales POSIX, `daemon()`):
 2. El `Dockerfile` compila con `cargo build --release --locked --features proxy`. Sin el feature,
    `pingora-core`/`pingora-proxy` son dependencias `optional` y el binario resultante **no trae motor
    de proxy**: arranca pero no sirve `/aq/`.
-3. TLS del upstream por el feature **`rustls`**. Los manifiestos de `pingora-core` y `pingora-proxy`
-   declaran `default = []`, así que **ningún** backend TLS viene activado por defecto; sin `rustls`
-   (o `openssl`/`boringssl`/`s2n`) las peticiones `https://` al origen fallan. `rustls` es la opción
+3. TLS del upstream por el feature **`rustls`** (variante default). Los manifiestos de `pingora-core` y
+   `pingora-proxy` declaran `default = []`, así que **ningún** backend TLS viene activado por defecto; sin
+   `rustls` (o `openssl`/`boringssl`/`s2n`) las peticiones `https://` al origen fallan. `rustls` es la opción
    elegida: deja el runtime `debian:bookworm-slim` sin `libssl` y reutiliza el backend `ring` que ya
-   traen `hickory-resolver` (`tls-ring`) y `reqwest` (`rustls`).
+   trae `hickory-resolver` (`tls-ring`). Existe una variante opt-in `proxy-openssl` — ver la sección
+   dedicada más abajo.
 4. MSRV: `pingora-proxy` del rev pide **Rust 1.85**; `rust:bookworm` la cumple.
+
+## Variante `proxy-openssl` (orígenes con JA3-blocking)
+
+El backend TLS **default del binario es rustls**. Algunos orígenes (las properties de Meta:
+Instagram, Facebook…) fingerprintan el JA3 de rustls como cliente no-navegador y bloquean:
+responden `302` a `facebook.com/unsupportedbrowser`. Con OpenSSL esos mismos orígenes
+devuelven `200` (verificado: el perfil de Instagram con el HTML real y sus metadatos OG).
+Cloudflare con bot score estricto puede seguir bloqueando ambos fingerprints — ese límite
+no lo resuelve ninguna de las dos variantes.
+
+Para esos despliegues existe la feature hermana **`proxy-openssl`**: mismo binario y mismas
+funciones, con reqwest sobre OpenSSL **vendored** (compilado estático desde `openssl-src`;
+el runtime sigue sin `libssl`). Reglas:
+
+- **Excluyentes**: `proxy` y `proxy-openssl` son features hermanas — no las actives a la vez.
+  `--all-features` queda cubierto: `http_client::pinned_client` fuerza `use_native_tls()`
+  cuando `proxy-openssl` está activa.
+- **Default intacto**: la imagen del `Dockerfile` sigue construyéndose con `proxy` (rustls);
+  nada del flujo documentado cambia si no usas la variante.
+- **Coste de la variante**: build más lento (openssl-src compila OpenSSL en C; perl ya viene
+  en la base `rust:bookworm`), dos pilas TLS en el binario (`ring` para hickory/pingora +
+  OpenSSL para reqwest) y doble verificación al tocar `http_client`.
+
+Construcción:
+
+```bash
+# Docker directo
+docker build --build-arg PROXY_FEATURES=proxy-openssl -t tele-proxy:openssl .
+
+# Compose (override con tag de imagen propio; mismos puertos, una variante a la vez)
+docker compose -f docker-compose.yml -f docker-compose.openssl.yml up -d --build
+```
+
+En Dokploy: mismo repo y Dockerfile, añadiendo el build arg `PROXY_FEATURES=proxy-openssl`
+(sección Build → Build Args de la app).
 
 ## Requisitos Previos
 
