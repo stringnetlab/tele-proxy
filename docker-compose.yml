@@ -39,9 +39,9 @@ services:
       - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
       - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
       # --- Administración (docs/ENVIRONMENT.md § Administración) ---
-      # Hash del commit desplegado: `GET /` lo devuelve para visibilidad. En runtime pisa el valor
-      # horneado en compilación (build arg GIT_SHA), así basta con fijarla en el despliegue.
-      - GIT_SHA=${GIT_SHA:-desconocido}
+      # Hash del commit desplegado: `GET /` lo devuelve para visibilidad. Vacío = se usa el valor
+      # horneado en compilación (derivado del .git en el build); fijarlo aquí lo sobrescribe.
+      - GIT_SHA=${GIT_SHA:-}
       # Fallback de emergencia para /api/v1/admin/*; vacío = deshabilitado. Nunca fijarlo en el repo.
       - MASTER_BEARER_TOKEN=${MASTER_BEARER_TOKEN:-}
       # Login Google del panel: sin ambas el login OAuth queda deshabilitado (solo master token).

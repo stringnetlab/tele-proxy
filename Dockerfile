@@ -16,8 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Variante del binario: "proxy" (default, rustls) o "proxy-openssl" (OpenSSL vendored, para
 # orígenes que fingerprintan el JA3 de rustls — docs/DEPLOYMENT.md, "Variante proxy-openssl").
 ARG PROXY_FEATURES=proxy
-# Hash del commit desplegado: `GET /` lo devuelve para visibilidad del release. Dokploy (u otro
-# desplegador) debe pasarlo como build arg; sin él, el binario dice "desconocido".
+# Hash del commit desplegado: fallback para builds sin .git en el contexto. Con .git (el caso
+# normal: Dokploy clona el repo) el Dockerfile lo sobreescribe con el hash real más abajo y
+# `GET /` lo devuelve para visibilidad del release.
 ARG GIT_SHA=desconocido
 ENV GIT_SHA=$GIT_SHA
 
@@ -33,8 +34,16 @@ RUN rm -rf src
 
 COPY src/ ./src/
 COPY config/ ./config/
-RUN touch src/main.rs src/lib.rs
-RUN cargo build --release --locked --features ${PROXY_FEATURES}
+# Derivar el hash real del commit desde el .git del contexto (se excluye de .dockerignore para
+# esto). `git rev-parse` lo resuelve con refs sueltas o packed; sin git, queda el ARG. El valor
+# se pasa al build de abajo, donde `option_env!` lo hornea en el binario.
+COPY .git .git
+RUN GIT_SHA_RESOLVED="$(git rev-parse HEAD 2>/dev/null || echo "${GIT_SHA}")" && \
+    rm -rf .git && \
+    echo "commit desplegado: ${GIT_SHA_RESOLVED}" && \
+    echo "${GIT_SHA_RESOLVED}" > /app/.build-sha
+RUN touch src/main.rs src/lib.rs && \
+    GIT_SHA="$(cat /app/.build-sha)" cargo build --release --locked --features ${PROXY_FEATURES}
 
 FROM debian:bookworm-slim AS runtime
 

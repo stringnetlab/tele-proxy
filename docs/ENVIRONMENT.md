@@ -191,7 +191,7 @@ fallback de emergencia. Toda mutación queda auditada (`event=admin_audit` en el
 | `ADMIN_RATE_LIMIT_WINDOW_SECONDS` | Ventana del rate limit general admin | `60` | No | **activa** — `parse_in_range` |
 | `CONTROL_RATE_LIMIT_REQUESTS` | Cuota por IP de la API de control de clientes (`/api/v1/clients/*`; hallazgo A1) | `60` | No | **activa** — `parse_in_range` |
 | `CONTROL_RATE_LIMIT_WINDOW_SECONDS` | Ventana del rate limit de la API de control | `60` | No | **activa** — `parse_in_range` |
-| `GIT_SHA` | Hash del commit desplegado; `GET /` lo devuelve tal cual para visibilidad del release. Se lee primero del entorno (lo inyecta el despliegue) y, si falta, del valor horneado en compilación (build arg `GIT_SHA` del Dockerfile) | `desconocido` | No | **activa** — `commit_sha` (main.rs), build arg + runtime en compose |
+| `GIT_SHA` | Hash del commit desplegado; `GET /` lo devuelve tal cual para visibilidad del release. **Se deriva solo en el build**: el Dockerfile resuelve `git rev-parse HEAD` sobre el `.git` del contexto (por eso `.dockerignore` ya no lo excluye) y lo hornea en el binario. En runtime solo se lee si se fija explícitamente (vacío = el horneado manda) | derivado del `.git` en build; `desconocido` si no hay `.git` | No | **activa** — `commit_sha` (main.rs), build en Dockerfile |
 
 Los rate limits de estas APIs son por proceso (`LocalRateLimiter`, LRU acotada): son endpoints
 internos/loopback, así que la cuota por instancia es suficiente y no hace falta el contador
