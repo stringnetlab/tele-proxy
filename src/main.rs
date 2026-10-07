@@ -191,32 +191,26 @@ fn init_tracing() {
         .init();
 }
 
-/// `GET /` en el puerto del proxy. En producción devuelve solo el hash del commit desplegado
+/// `GET /` en el puerto del proxy. En producción devuelve solo el número de release desplegado
 /// (visibilidad del release sin exponer nada más); en `MODO=desarrollo` también el nombre y la
 /// lista de endpoints, para descubrir la API a mano.
 async fn index(State(service): State<Arc<ProxyService>>) -> String {
-    index_body(service.verbose_errors(), &commit_sha())
+    index_body(service.verbose_errors(), RELEASE)
 }
 
-/// Hash del commit desplegado. Resolución en orden: variable de entorno `GIT_SHA` (la inyecta el
-/// despliegue en runtime), valor horneado en compilación (`option_env!`, alimentado por el build
-/// arg `GIT_SHA` del Dockerfile) o `desconocido` cuando ninguno está disponible.
-fn commit_sha() -> String {
-    std::env::var("GIT_SHA")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| option_env!("GIT_SHA").map(|v| v.trim().to_string()))
-        .unwrap_or_else(|| "desconocido".to_string())
-}
+/// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
+/// identificar. Es deliberadamente un entero simple, sin semver ni hash: `GET /` lo devuelve tal
+/// cual y permite verificar con un curl qué release está sirviendo.
+const RELEASE: &str = "2";
 
-fn index_body(verbose: bool, commit: &str) -> String {
+fn index_body(verbose: bool, release: &str) -> String {
     const NAME: &str = "TELE - PROXY";
     if !verbose {
-        return commit.to_string();
+        return release.to_string();
     }
     let endpoints: Vec<String> = vec![
         String::new(),
-        format!("commit {commit}"),
+        format!("release {release}"),
         String::new(),
         "Endpoints del proxy (puerto HTTP_PROXY_PORT):".into(),
         "  GET  /aq/{crypt_id}/?url=<url>[&mime=<mime>]   Proxy publico multi-cliente".into(),
@@ -468,19 +462,17 @@ mod tests {
     use super::index_body;
 
     #[test]
-    fn index_en_produccion_es_solo_el_commit() {
-        let body = index_body(false, "abc123def456");
-        assert_eq!(body, "abc123def456");
+    fn index_en_produccion_es_solo_el_release() {
+        let body = index_body(false, "7");
+        assert_eq!(body, "7");
         assert!(!body.contains("/aq/"), "{body}");
-        // Sin commit disponible, el cuerpo lo dice explicitamente en vez de quedar vacio.
-        assert_eq!(index_body(false, "desconocido"), "desconocido");
     }
 
     #[test]
-    fn index_en_desarrollo_lista_el_commit_y_los_endpoints() {
-        let body = index_body(true, "abc123def456");
+    fn index_en_desarrollo_lista_el_release_y_los_endpoints() {
+        let body = index_body(true, "7");
         assert!(body.starts_with("TELE - PROXY\n"), "{body}");
-        assert!(body.contains("commit abc123def456"), "{body}");
+        assert!(body.contains("release 7"), "{body}");
         for endpoint in [
             "/aq/{crypt_id}/",
             "/api/v1/clients/config",

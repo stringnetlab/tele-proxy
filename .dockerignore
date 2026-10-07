@@ -1,6 +1,4 @@
 target/
-# .git NO se excluye: el Dockerfile lo usa para hornear el hash del commit en el binario
-# (`GET /` lo expone). El contexto crece ~90 MB, pero el layer se cachea y el costo es local.
 .github/
 .env
 *.md
