@@ -213,6 +213,12 @@ async fn index(State(service): State<Arc<ProxyService>>) -> String {
     index_body(service.verbose_errors(), RELEASE)
 }
 
+/// `GET /` en el puerto de control. Devuelve lo mismo que el [`index`] del proxy para que ambos
+/// puertos tengan un endpoint raíz consistente.
+async fn index_control(State(state): State<ControlState>) -> String {
+    index_body(state.service.verbose_errors(), RELEASE)
+}
+
 /// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
 /// identificar. Es deliberadamente un entero simple, sin semver ni hash: `GET /` lo devuelve tal
 /// cual y permite verificar con un curl qué release está sirviendo.
@@ -429,6 +435,7 @@ async fn main() {
     let control_app = control_routes()
         .merge(admin_routes())
         .merge(admin_ui_routes())
+        .merge(Router::new().route("/", axum::routing::get(index_control)))
         .merge(Router::new().route("/health", axum::routing::get(healthcheck)))
         .with_state(control_state);
 
