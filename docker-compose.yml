@@ -63,6 +63,14 @@ services:
       - ADMIN_UI_URL=${ADMIN_UI_URL:-}
       # Allowlist de orígenes EXACTOS (coma-separada). Vacío = sin capa CORS (comportamiento actual).
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      # --- Preview /mt/ y /pv/ (docs/ENVIRONMENT.md § Preview) ---
+      # BROWSERLESS_URL vacío = /pv/ responde 503 render_unavailable (fail-soft); /mt/ no depende
+      # del sidecar y sigue funcionando. El sidecar vive SOLO en red-preview (ver servicio
+      # `browserless`), así que tele-proxy necesita estar en esa red para alcanzarlo.
+      - BROWSERLESS_URL=${BROWSERLESS_URL:-http://browserless:3000}
+      - BROWSERLESS_TOKEN=${BROWSERLESS_TOKEN:-}
+      - RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS:-30000}
+      - PREVIEW_ASSET_MAX_BYTES=${PREVIEW_ASSET_MAX_BYTES:-10485760}
     restart: unless-stopped
     # Debe superar a PROXY_GRACE_PERIOD_SECONDS o Docker manda SIGKILL antes de que Pingora
     # drene las conexiones en curso (el proceso no se daemoniza nunca: sin -d/--daemon).
@@ -76,9 +84,48 @@ services:
       - default
       - dokploy-network
       - red-velone
+      # Única red compartida con el sidecar de render: tele-proxy habla con browserless por aquí.
+      - red-preview
+
+  # Sidecar de render para /pv/ (PLAN_PREVIEW.md D7). Chromium navega a la URL pedida, por lo que
+  # es un vector SSRF si alcanza la red interna: por eso se le aísla en `red-preview` y NO se le
+  # une a red-velone/dokploy-network/default, que son las que llegan a CouchDB y Valkey
+  # (velone-servicios). Con esta topología el Chromium puede salir a Internet para renderizar
+  # páginas públicas pero no tiene ruta a los almacenes internos. Limitación: un bridge de Docker
+  # sigue permitiendo egreso a Internet; el bloqueo total de destinos exigiría un firewall o
+  # enrutar el Chromium a través de tele-proxy como proxy HTTP (fuera del alcance de este compose).
+  browserless:
+    image: ghcr.io/browserless/chromium:v2.27.0
+    environment:
+      # Sin TOKEN cualquiera en red-preview podría pedir renders; se fija para que tele-proxy
+      # autentique sus llamadas (?token=) y el sidecar rechace el resto.
+      - TOKEN=${BROWSERLESS_TOKEN:-}
+      - CONCURRENT=${BROWSERLESS_CONCURRENT:-5}
+      - QUEUED=${BROWSERLESS_QUEUED:-5}
+      # Techo por sesión del sidecar; RENDER_TIMEOUT_MS de tele-proxy debe quedar por debajo para
+      # que sea el proxy quien cancele y devuelva 504 render_timeout antes que el sidecar.
+      - TIMEOUT=${BROWSERLESS_TIMEOUT:-45000}
+    # Sin `ports:` publicado: el sidecar no se expone al host ni al público, solo es alcanzable
+    # desde tele-proxy a través de red-preview.
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      # /pressure es el endpoint que también consulta `BrowserlessRenderer::healthy()`.
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/pressure || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - red-preview
 
 networks:
   dokploy-network:
     driver: bridge
   red-velone:
+    driver: bridge
+  # Red exclusiva tele-proxy ↔ browserless. `internal: false` (por omisión) para que el Chromium
+  # pueda salir a Internet a renderizar; el aislamiento de la red interna se logra NO uniendo el
+  # sidecar a red-velone/dokploy-network/default.
+  red-preview:
     driver: bridge
