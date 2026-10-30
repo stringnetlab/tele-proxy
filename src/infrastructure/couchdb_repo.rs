@@ -13,7 +13,10 @@ use crate::domain::models::{
     AdminUser, ClientConfig, ClientConfigUpdate, ErrorHandlingConfig, ErrorMode, RateLimitConfig,
     ScriptingConfig,
 };
-use crate::domain::services::{AdminRepository, ConfigFetcher};
+use crate::domain::runtime_settings::{
+    RuntimeSettings, RuntimeSettingsDocument, RuntimeSettingsPatch, RUNTIME_SETTINGS_DOC_ID,
+};
+use crate::domain::services::{AdminRepository, ConfigFetcher, SettingsRepository};
 
 /// Map functions de las vistas del design doc. Fuente única de verdad: `ensure_design_doc` crea
 /// el documento con estas vistas y **lo actualiza** cuando difieren (p. ej. tras añadir una
@@ -165,18 +168,23 @@ impl CouchDbRepository {
         };
 
         let existing: Option<ExistingDesignDoc> = {
-            let resp = fetch_existing(&self.client).await.map_err(|e| {
-                ProxyError::Internal {
+            let resp = fetch_existing(&self.client)
+                .await
+                .map_err(|e| ProxyError::Internal {
                     reason: format!("Falló la conexión a CouchDB: {}", e),
-                }
-            })?;
+                })?;
             if resp.status().is_success() {
                 let body = resp.bytes().await.map_err(|e| ProxyError::Internal {
                     reason: format!("No se pudo leer el design doc existente: {}", e),
                 })?;
-                Some(serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
-                    reason: format!("El design doc existente no tiene la forma esperada: {}", e),
-                })?)
+                Some(
+                    serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
+                        reason: format!(
+                            "El design doc existente no tiene la forma esperada: {}",
+                            e
+                        ),
+                    })?,
+                )
             } else {
                 None
             }
@@ -216,21 +224,19 @@ impl CouchDbRepository {
             // documento una única vez y se reintenta. Cualquier otro error es terminal.
             if status == 409 && attempt == 0 {
                 tracing::warn!(error = %body, "Conflicto 409 escribiendo el design doc, releyendo _rev");
-                let retry = fetch_existing(&self.client).await.map_err(|e| {
-                    ProxyError::Internal {
-                        reason: format!("Falló la reconexión a CouchDB tras el 409: {}", e),
-                    }
-                })?;
+                let retry =
+                    fetch_existing(&self.client)
+                        .await
+                        .map_err(|e| ProxyError::Internal {
+                            reason: format!("Falló la reconexión a CouchDB tras el 409: {}", e),
+                        })?;
                 if retry.status().is_success() {
                     let body = retry.bytes().await.map_err(|e| ProxyError::Internal {
                         reason: format!("No se pudo releer el design doc tras el 409: {}", e),
                     })?;
                     let doc: ExistingDesignDoc =
                         serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
-                            reason: format!(
-                                "El design doc releído tras el 409 no parsea: {}",
-                                e
-                            ),
+                            reason: format!("El design doc releído tras el 409 no parsea: {}", e),
                         })?;
                     if DesignDoc::is_satisfied_by(&doc) {
                         return Ok(());
@@ -461,7 +467,8 @@ impl CouchDbRepository {
     }
 
     /// PUT de un documento CouchDB y devolución del `_rev` asignado. Un 409 se reporta como
-    /// error de conflicto de revisión (el llamador tiene un documento obsoleto y debe releer).
+    /// `Conflict`: es un estado reintentable, no un fallo interno, y el llamador necesita poder
+    /// distinguirlo para releer el `_rev`.
     async fn write_doc<T: Serialize>(&self, doc_id: &str, doc: &T) -> Result<String, ProxyError> {
         let url = self.doc_url(doc_id);
         let resp = self
@@ -478,12 +485,18 @@ impl CouchDbRepository {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            let reason = if status == 409 {
-                format!("Conflicto de _rev en '{}': el documento cambió en CouchDB", doc_id)
-            } else {
-                format!("Error de CouchDB {} escribiendo '{}': {}", status, doc_id, body)
-            };
-            return Err(ProxyError::Internal { reason });
+            if status == 409 {
+                return Err(ProxyError::Conflict {
+                    resource: doc_id.to_string(),
+                    reason: "el documento cambió en CouchDB; releer y reintentar".to_string(),
+                });
+            }
+            return Err(ProxyError::Internal {
+                reason: format!(
+                    "Error de CouchDB {} escribiendo '{}': {}",
+                    status, doc_id, body
+                ),
+            });
         }
 
         #[derive(Deserialize)]
@@ -771,10 +784,7 @@ impl AdminRepository for CouchDbRepository {
             .client
             .get(&url)
             .basic_auth(&self.username, Some(&self.password))
-            .query(&[
-                ("limit", limit.to_string()),
-                ("skip", skip.to_string()),
-            ])
+            .query(&[("limit", limit.to_string()), ("skip", skip.to_string())])
             .send()
             .await
             .map_err(|e| ProxyError::Internal {
@@ -861,6 +871,54 @@ impl AdminRepository for CouchDbRepository {
             reason: format!("No se pudo parsear la respuesta de client_count: {}", e),
         })?;
         Ok(view_resp.total_rows.unwrap_or(0))
+    }
+}
+
+#[async_trait]
+impl SettingsRepository for CouchDbRepository {
+    async fn load_settings(&self) -> Result<Option<RuntimeSettingsDocument>, ProxyError> {
+        match self.fetch_raw_doc(RUNTIME_SETTINGS_DOC_ID).await {
+            Ok(doc) => Ok(Some(doc)),
+            // Primer arranque: todavía no hay documento y los ajustes efectivos son los del
+            // entorno. No es un error, es el estado inicial esperado.
+            Err(ProxyError::ConfigNotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn patch_settings(
+        &self,
+        patch: &RuntimeSettingsPatch,
+    ) -> Result<RuntimeSettingsDocument, ProxyError> {
+        let mut attempt = 0;
+
+        loop {
+            let (base, rev) = match self.load_settings().await? {
+                Some(doc) => (doc.resolve()?, doc.rev),
+                None => (RuntimeSettings::defaults(), None),
+            };
+
+            // Se valida contra el estado leído de CouchDB, no contra el snapshot del llamador: dos
+            // PATCH concurrentes no pueden dejar persistido un valor que ninguno de los dos validó
+            // (p. ej. uno sube `max_response_bytes` y el otro `cacheable_size_bytes` por encima).
+            let resolved = base.apply_patch(patch)?;
+            let mut doc = RuntimeSettingsDocument::new(&resolved, rev);
+
+            match self.write_doc(RUNTIME_SETTINGS_DOC_ID, &doc).await {
+                Ok(new_rev) => {
+                    doc.rev = Some(new_rev);
+                    return Ok(doc);
+                }
+                Err(ProxyError::Conflict { .. }) if attempt == 0 => {
+                    attempt += 1;
+                    tracing::warn!(
+                        doc_id = RUNTIME_SETTINGS_DOC_ID,
+                        "Conflicto de _rev escribiendo runtime_settings, releyendo una vez"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 

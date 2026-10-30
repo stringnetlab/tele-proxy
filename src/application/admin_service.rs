@@ -99,7 +99,7 @@ pub struct AdminSession {
 }
 
 /// Quién autoriza una mutación o un login, para la pista de auditoría.
-fn audit(actor: &str, action: &str, target: &str) {
+pub(crate) fn audit(actor: &str, action: &str, target: &str) {
     tracing::info!(
         event = "admin_audit",
         actor = %actor,

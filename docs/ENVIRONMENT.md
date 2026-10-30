@@ -17,7 +17,7 @@ Estado de cada variable:
 | --- | --- | --- | --- | --- |
 | `RUST_LOG` | Filtro de `tracing-subscriber` (`EnvFilter`) | `warn,tele_proxy=info` | No | **activa** — `init_tracing()` (`main.rs:88`); el default se usa solo si la variable no está |
 | `RUST_BACKTRACE` | Backtrace en pánico | `1` | No | la consume el runtime de Rust, no el código |
-| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`) y `GET /` lista los endpoints; cualquier otro valor o ausente → respuestas escuetas | escueto | No | **activa** — `AppConfig::from_env()` (main.rs); viaja a `ProxyService::with_verbose_errors` |
+| `MODO` | `desarrollo` → errores HTTP verbosos (motivo interno + `details`) y `GET /` lista los endpoints; cualquier otro valor o ausente → respuestas escuetas | escueto | No | **activa** — `AppConfig::from_env()` (main.rs) fija el *baseline* de arranque de `runtime_settings.verbose_errors`; el valor efectivo es recargable en caliente vía `PATCH /api/v1/admin/settings` |
 
 El efecto de `MODO` son dos, ambos sobre las **respuestas HTTP**: (1) la verbosidad de los
 cuerpos de error que devuelven `/aq/` y `/api/v1/` — en `desarrollo` un 5xx expone el motivo
@@ -29,6 +29,14 @@ incluye la lista de endpoints definidos, en producción solo el nombre del proye
 PROXY`). La comparación es case-insensitive (`DESARROLLO` también activa). No existe
 `RUST_ENV`: el entorno se distingue por `RUST_LOG` (logs) y `MODO` (cuerpos de respuesta), y el
 binario corre en primer plano dentro del contenedor (ver *Runtime de Pingora*).
+
+> **`MODO` es el suelo, no el techo.** Desde la migración a `runtime_settings`, `MODO=desarrollo`
+> solo fija el valor con el que el proceso **arranca**; `verbose_errors` es un ajuste recargable en
+> caliente que un `admin` puede activar o desactivar en runtime (`PATCH /api/v1/admin/settings`)
+> sin redeploy, y afecta por igual a `/aq/`, a la API de control y a la de administración. Si el
+> documento `runtime_settings` se borra de CouchDB, el valor vuelve a este baseline del entorno.
+> Activarlo revela información interna, por lo que la mutación deja entrada de auditoría
+> `settings_update` y emite un WARN explícito en el log.
 
 ## Runtime de Pingora (`ServerConf`)
 
@@ -124,10 +132,20 @@ y en el secret store de Dokploy.
 | --- | --- | --- | --- | --- |
 | `MAX_RESPONSE_SIZE_BYTES` | Tamaño máximo de respuesta del origen (100 MB) | `104857600` | No | designada — `upstream_response_body_filter`, Fase 3 |
 | `MAX_SCRIPTING_BODY_BYTES` | Cuerpo máximo que entra a Lua (5 MB) | `5242880` | No | designada como default: el bypass decide por `ClientConfig.max_scripting_body_bytes` (documento CouchDB), no por esta variable |
-| `UPSTREAM_USER_AGENT` | User-Agent por defecto para las peticiones al origen cuando el **cliente no envía el suyo**. Vacío = el de reqwest. El `User-Agent` del cliente, si llega, siempre se reenvía tal cual (lo mismo `Accept-Language`) | `""` | No | **activa** — `AppConfig::from_env()` → `ProxyService::with_upstream_user_agent` |
-| `LUA_TIMEOUT_MS` | Deadline de ejecución Lua | `200` | No | **activa** — parseada y validada por `parse_in_range` (`main.rs:57`, la función en `main.rs:75`) |
-| `LUA_MEMORY_LIMIT_MB` | Límite de memoria del sandbox | `50` | No | **activa** |
-| `WEBHOOK_TIMEOUT_MS` | Timeout de `proxy.http_request` | `5000` | No | **activa** — parseada por `parse_in_range` (`main.rs:61`); es el techo de `WebhookRequest.timeout_ms` (`application/webhook_service.rs:88`) y el deadline del puente Lua->tokio (`application/lua_engine.rs:228`) |
+| `UPSTREAM_USER_AGENT` | User-Agent por defecto para las peticiones al origen cuando el **cliente no envía el suyo**. Vacío = el de reqwest. El `User-Agent` del cliente, si llega, siempre se reenvía tal cual (lo mismo `Accept-Language`) | `""` | No | **activa** — `AppConfig::from_env()` → `runtime_settings_from_env()` (main.rs) fija el baseline de `runtime_settings.upstream_user_agent`; recargable en caliente vía `PATCH /api/v1/admin/settings` |
+| `LUA_TIMEOUT_MS` | Deadline de ejecución Lua | `200` | No | **activa** — parseada y validada por `parse_in_range` (`main.rs:57`, la función en `main.rs:75`); alimenta el baseline de `runtime_settings.lua_timeout_ms`, recargable en caliente |
+| `LUA_MEMORY_LIMIT_MB` | Límite de memoria del sandbox | `50` | No | **activa** — baseline de `runtime_settings.lua_memory_limit_mb`, recargable en caliente |
+| `WEBHOOK_TIMEOUT_MS` | Timeout de `proxy.http_request` | `5000` | No | **activa** — parseada por `parse_in_range` (`main.rs:61`); baseline de `runtime_settings.webhook_timeout_ms`, que es el techo de `WebhookRequest.timeout_ms` (`application/webhook_service.rs`) y el deadline del puente Lua->tokio (`application/lua_engine.rs`). Recargable en caliente |
+
+> **Valores congelados → `runtime_settings` recargables.** `UPSTREAM_USER_AGENT`, `LUA_TIMEOUT_MS`,
+> `LUA_MEMORY_LIMIT_MB`, `WEBHOOK_TIMEOUT_MS` y `MODO` (→ `verbose_errors`) ya no quedan fijados en
+> el arranque: ahora son el **baseline** del documento `runtime_settings` de CouchDB y su valor
+> efectivo se cambia en caliente con `PATCH /api/v1/admin/settings` (ver `api_contract.yaml`). El
+> entorno sigue validando el baseline en el arranque (`parse_in_range`); fuera de rango el proceso
+> no arranca. Los límites duros de cada campo viven en `domain/runtime_settings.rs` y se validan de
+> nuevo en cada escritura. Quedan fuera de la recarga a propósito: puertos/`HTTP_HOST`, URLs y
+> credenciales de CouchDB/Valkey, material de identidad (master token, CORS, Google OAuth) y
+> `config/dns_resolvers.json` (política anti-SSRF embebida con `include_str!`).
 
 ## Rate limiting
 

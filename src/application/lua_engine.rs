@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use mlua::{Error as LuaError, HookTriggers, Lua, Value, VmState};
 
 use crate::application::cache_key::sha256_hex;
+use crate::application::settings_store::SettingsStore;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::models::{ProxyContext, ScriptingConfig, WebhookRequest};
+use crate::domain::runtime_settings::RuntimeSettings;
 use crate::domain::services::{LuaExecutor, WebhookFetcher};
 
 const REDOS_TIMEOUT_MS: u64 = 100;
@@ -54,23 +56,18 @@ impl RunState {
 
 #[derive(Clone)]
 pub struct SandboxedLuaEngine {
-    timeout_ms: u64,
-    memory_limit_mb: u32,
-    webhook_timeout_ms: u64,
+    /// Límites del sandbox recargables en caliente (antes `LUA_TIMEOUT_MS`,
+    /// `LUA_MEMORY_LIMIT_MB` y `WEBHOOK_TIMEOUT_MS` congelados en el constructor). Se toma un
+    /// snapshot por ejecución: el VM se crea en cada `execute_sync`, así que timeout, memoria y
+    /// webhook de una misma ejecución siempre salen del mismo snapshot.
+    settings: Arc<SettingsStore>,
     webhook_fetcher: Arc<dyn WebhookFetcher>,
 }
 
 impl SandboxedLuaEngine {
-    pub fn new(
-        timeout_ms: u64,
-        memory_limit_mb: u32,
-        webhook_timeout_ms: u64,
-        webhook_fetcher: Arc<dyn WebhookFetcher>,
-    ) -> Self {
+    pub fn new(settings: Arc<SettingsStore>, webhook_fetcher: Arc<dyn WebhookFetcher>) -> Self {
         Self {
-            timeout_ms,
-            memory_limit_mb,
-            webhook_timeout_ms,
+            settings,
             webhook_fetcher,
         }
     }
@@ -311,18 +308,19 @@ impl SandboxedLuaEngine {
         script: &str,
         body: &[u8],
         context: &ProxyContext,
+        limits: &RuntimeSettings,
     ) -> Result<Vec<u8>, ProxyError> {
         let lua = Self::create_sandbox()?;
-        let state = Arc::new(RunState::new(self.timeout_ms));
+        let state = Arc::new(RunState::new(limits.lua_timeout_ms));
         Self::inject_proxy_table(
             &lua,
             context,
-            self.webhook_timeout_ms,
+            limits.webhook_timeout_ms,
             &self.webhook_fetcher,
             &state,
         )?;
 
-        lua.set_memory_limit(self.memory_limit_mb as usize * 1024 * 1024)
+        lua.set_memory_limit(limits.lua_memory_limit_mb as usize * 1024 * 1024)
             .map_err(|e| ProxyError::Internal {
                 reason: format!("No se pudo fijar el límite de memoria: {}", e),
             })?;
@@ -380,7 +378,7 @@ impl SandboxedLuaEngine {
 
         if state.deadline_hit.load(Ordering::Relaxed) {
             return Err(ProxyError::ScriptTimeout {
-                timeout_ms: self.timeout_ms,
+                timeout_ms: limits.lua_timeout_ms,
                 elapsed_ms: start.elapsed().as_millis() as u64,
             });
         }
@@ -405,8 +403,8 @@ impl SandboxedLuaEngine {
 
                 if err_msg.contains("memory") {
                     return Err(ProxyError::ScriptMemoryLimit {
-                        memory_limit_mb: self.memory_limit_mb,
-                        used_mb: self.memory_limit_mb,
+                        memory_limit_mb: limits.lua_memory_limit_mb,
+                        used_mb: limits.lua_memory_limit_mb,
                     });
                 }
 
@@ -584,12 +582,17 @@ impl LuaExecutor for SandboxedLuaEngine {
         let script = context.config.scripting.code.clone();
         let body_vec = body.to_vec();
         let context_clone = context.clone();
+        let limits = self.settings.snapshot();
 
         let start = Instant::now();
+        let limits_in_task = Arc::clone(&limits);
         let task = tokio::task::spawn_blocking(move || {
-            engine.execute_sync(&script, &body_vec, &context_clone)
+            engine.execute_sync(&script, &body_vec, &context_clone, &limits_in_task)
         });
-        let budget = Duration::from_millis(self.timeout_ms + LUA_DEADLINE_GRACE_MS);
+        // El budget externo sale del mismo snapshot que el deadline del hook de la VM: si
+        // divergieran, el `timeout` de tokio podría dispararse antes que el hook y el error
+        // reportaría un límite distinto del que la VM estaba aplicando.
+        let budget = Duration::from_millis(limits.lua_timeout_ms + LUA_DEADLINE_GRACE_MS);
 
         match tokio::time::timeout(budget, task).await {
             Ok(Ok(result)) => result,
@@ -601,7 +604,7 @@ impl LuaExecutor for SandboxedLuaEngine {
                     "La ejecución de Lua superó su deadline: el hook de la VM no la detuvo (bloqueada dentro de una llamada nativa)"
                 );
                 Err(ProxyError::ScriptTimeout {
-                    timeout_ms: self.timeout_ms,
+                    timeout_ms: limits.lua_timeout_ms,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 })
             }
@@ -724,15 +727,38 @@ mod tests {
         }
     }
 
+    /// Motor con los ajustes que cada test necesite; el store arranca con ese snapshot.
+    fn engine_with<F>(settings: RuntimeSettings, fetcher: Arc<F>) -> SandboxedLuaEngine
+    where
+        F: WebhookFetcher + 'static,
+    {
+        SandboxedLuaEngine::new(Arc::new(SettingsStore::new(settings)), fetcher)
+    }
+
+    /// Ajustes con deadlines a medida; el resto, los defaults históricos (memoria 50 MB).
+    fn limits(lua_timeout_ms: u64, webhook_timeout_ms: u64) -> RuntimeSettings {
+        RuntimeSettings {
+            lua_timeout_ms,
+            webhook_timeout_ms,
+            ..RuntimeSettings::defaults()
+        }
+    }
+
     fn engine() -> SandboxedLuaEngine {
-        SandboxedLuaEngine::new(200, 50, 5_000, Arc::new(StubFetcher::ok()))
+        engine_with(RuntimeSettings::defaults(), Arc::new(StubFetcher::ok()))
+    }
+
+    /// Ejecución síncrona con los defaults: reproduce el snapshot que `engine()` guarda en su
+    /// store, para que los tests de transformación no repitan los límites en cada llamada.
+    fn run_sync(script: &str, body: &[u8], ctx: &ProxyContext) -> Result<Vec<u8>, ProxyError> {
+        engine().execute_sync(script, body, ctx, &RuntimeSettings::defaults())
     }
 
     #[test]
     fn test_sandbox_blocks_os() {
         let ctx = test_context();
         let script = r#"function(body) return os.execute("echo hacked") end"#;
-        let result = engine().execute_sync(script, b"hello", &ctx);
+        let result = run_sync(script, b"hello", &ctx);
         assert!(matches!(
             result,
             Err(ProxyError::LuaSandboxViolation { .. })
@@ -743,7 +769,7 @@ mod tests {
     fn test_sandbox_blocks_io() {
         let ctx = test_context();
         let script = r#"function(body) local f = io.open("/etc/passwd") return "hacked" end"#;
-        let result = engine().execute_sync(script, b"hello", &ctx);
+        let result = run_sync(script, b"hello", &ctx);
         assert!(matches!(
             result,
             Err(ProxyError::LuaSandboxViolation { .. })
@@ -754,7 +780,7 @@ mod tests {
     fn test_simple_transform() {
         let ctx = test_context();
         let script = r#"function(body) return string.upper(body) end"#;
-        let result = engine().execute_sync(script, b"hello world", &ctx).unwrap();
+        let result = run_sync(script, b"hello world", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "HELLO WORLD");
     }
 
@@ -766,9 +792,7 @@ mod tests {
                 return proxy.regex_replace(body, "\\d", "X")
             end
         "#;
-        let result = engine()
-            .execute_sync(script, b"order 12345 confirmed", &ctx)
-            .unwrap();
+        let result = run_sync(script, b"order 12345 confirmed", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "order XXXXX confirmed");
     }
 
@@ -804,7 +828,7 @@ mod tests {
     fn test_error_returns_original_body() {
         let ctx = test_context();
         let script = r#"function(body) error("intentional error") end"#;
-        let result = engine().execute_sync(script, b"original", &ctx).unwrap();
+        let result = run_sync(script, b"original", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "original");
     }
 
@@ -819,7 +843,7 @@ mod tests {
                 return body
             end
         "#;
-        let result = engine().execute_sync(script, b"test", &ctx).unwrap();
+        let result = run_sync(script, b"test", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "test");
     }
 
@@ -827,7 +851,7 @@ mod tests {
     fn test_identity_passthrough() {
         let ctx = test_context();
         let script = r#"function(body) return body end"#;
-        let result = engine().execute_sync(script, b"unchanged", &ctx).unwrap();
+        let result = run_sync(script, b"unchanged", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "unchanged");
     }
 
@@ -848,7 +872,7 @@ mod tests {
         "#;
         let body = br#"{"userName":"ana","internal_id":"x9","costo_interno":0.25,"edad":30}"#;
 
-        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let result = run_sync(script, body, &ctx).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_slice(&result).expect("la salida debe ser JSON valido");
 
@@ -878,7 +902,7 @@ mod tests {
         let body =
             br#"{"items":[{"id":1,"activo":true},{"id":2,"activo":false},{"id":3,"activo":true}]}"#;
 
-        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let result = run_sync(script, body, &ctx).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["items"][0]["id"], 1);
@@ -897,7 +921,7 @@ mod tests {
         "#;
         let body = br#"{"a":1,"b":1.5,"c":true,"d":null}"#;
 
-        let result = engine().execute_sync(script, body, &ctx).unwrap();
+        let result = run_sync(script, body, &ctx).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed["a"], 1);
         assert_eq!(parsed["b"], 1.5);
@@ -918,9 +942,7 @@ mod tests {
                 return proxy.json_stringify(data)
             end
         "#;
-        let result = engine()
-            .execute_sync(script, b"esto no es json", &ctx)
-            .unwrap();
+        let result = run_sync(script, b"esto no es json", &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "esto no es json");
     }
 
@@ -938,9 +960,7 @@ mod tests {
                 return body
             end
         "#;
-        let result = engine()
-            .execute_sync(censor, b"contacto: ana.lucia@banco-pe.com fin", &ctx)
-            .unwrap();
+        let result = run_sync(censor, b"contacto: ana.lucia@banco-pe.com fin", &ctx).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&result),
             "contacto: [correo oculto] fin"
@@ -955,7 +975,7 @@ mod tests {
             end
         "#;
         let html = b"<html><head><script src=\"//tracker.com/x.js\"></script></head><body>ok<script>var a=1;\nvar b=2;</script></body></html>";
-        let result = engine().execute_sync(strip, html, &ctx).unwrap();
+        let result = run_sync(strip, html, &ctx).unwrap();
         let out = String::from_utf8_lossy(&result);
         assert!(!out.contains("tracker.com"), "{out}");
         assert!(!out.contains("var a=1"), "{out}");
@@ -973,9 +993,7 @@ mod tests {
                 return body
             end
         "#;
-        let result = engine()
-            .execute_sync(inject, b"<html><body>hi</body></html>", &ctx)
-            .unwrap();
+        let result = run_sync(inject, b"<html><body>hi</body></html>", &ctx).unwrap();
         let out = String::from_utf8_lossy(&result);
         assert!(
             out.contains(
@@ -996,13 +1014,12 @@ mod tests {
                 return body
             end
         "#;
-        let result = engine()
-            .execute_sync(
-                resize,
-                b"<img src=\"https://cdn.ejemplo.com/fotos/a.jpg\">",
-                &ctx,
-            )
-            .unwrap();
+        let result = run_sync(
+            resize,
+            b"<img src=\"https://cdn.ejemplo.com/fotos/a.jpg\">",
+            &ctx,
+        )
+        .unwrap();
         let out = String::from_utf8_lossy(&result);
         assert!(
             out.contains(
@@ -1019,9 +1036,7 @@ mod tests {
                 return body
             end
         "#;
-        let result = engine()
-            .execute_sync(front_matter, md.as_bytes(), &ctx)
-            .unwrap();
+        let result = run_sync(front_matter, md.as_bytes(), &ctx).unwrap();
         assert_eq!(String::from_utf8_lossy(&result), "# Hola\ncontenido\n");
     }
 
@@ -1030,7 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_request_bridge_llama_al_fetcher() {
         let fetcher = Arc::new(StubFetcher::ok());
-        let engine = SandboxedLuaEngine::new(2_000, 50, 5_000, Arc::clone(&fetcher) as Arc<_>);
+        let engine = engine_with(limits(2_000, 5_000), Arc::clone(&fetcher));
         let mut ctx = test_context();
         ctx.config.scripting.code = r#"
             function(body)
@@ -1059,15 +1074,13 @@ mod tests {
     /// el intento de evadir la whitelist no se puede lavar desde dentro del sandbox.
     #[tokio::test]
     async fn test_http_request_ssrf_propasa_aunque_el_script_lo_capture() {
-        let engine = SandboxedLuaEngine::new(
-            2_000,
-            50,
-            5_000,
+        let engine = engine_with(
+            limits(2_000, 5_000),
             Arc::new(StubFetcher::falla_como(ProxyError::SsrfBlocked {
                 url: "http://169.254.169.254/".to_string(),
                 resolved_ip: "169.254.169.254".to_string(),
                 reason: "private".to_string(),
-            })) as Arc<_>,
+            })),
         );
         let mut ctx = test_context();
         ctx.config.scripting.code = r#"
@@ -1117,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_request_lento_se_corta_por_webhook_timeout() {
         let fetcher = Arc::new(StubFetcher::lento(Duration::from_millis(800)));
-        let engine = SandboxedLuaEngine::new(2_000, 50, 50, Arc::clone(&fetcher) as Arc<_>);
+        let engine = engine_with(limits(2_000, 50), Arc::clone(&fetcher));
         let mut ctx = test_context();
         ctx.config.scripting.code = r#"
             function(body)
@@ -1154,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_timeout_devuelve_el_cuerpo_original() {
         let fetcher = Arc::new(StubFetcher::lento(Duration::from_millis(800)));
-        let engine = SandboxedLuaEngine::new(2_000, 50, 50, Arc::clone(&fetcher) as Arc<_>);
+        let engine = engine_with(limits(2_000, 50), Arc::clone(&fetcher));
         let mut ctx = test_context();
         ctx.config.scripting.code = r#"
             function(body)

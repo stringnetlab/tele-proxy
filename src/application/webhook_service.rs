@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::application::settings_store::SettingsStore;
 use crate::domain::errors::ProxyError;
 use crate::domain::models::{WebhookRequest, WebhookResponse};
 use crate::domain::services::{DnsResolver, WebhookFetcher};
@@ -33,20 +34,25 @@ fn unsupported_method(url: &str, method: &str) -> ProxyError {
 /// fijación de la conexión a la IP validada.
 pub struct ValidatingWebhookFetcher {
     dns_resolver: Arc<dyn DnsResolver>,
-    /// Techo del `WEBHOOK_TIMEOUT_MS` de entorno: una petición que pida más se recorta aquí.
-    timeout_ms: u64,
+    /// Ajustes recargables: de aquí sale el techo de `webhook_timeout_ms`. Se lee en cada `fetch`
+    /// (no en el constructor), así un cambio en caliente afecta a los webhooks siguientes sin
+    /// reconstruir el fetcher.
+    settings: Arc<SettingsStore>,
+    /// Techo duro del cuerpo. Sigue compilado a propósito: es un límite de seguridad (la respuesta
+    /// se reinyecta en la VM de Lua), no un ajuste de negocio, así que no entra en
+    /// `runtime_settings`.
     max_response_bytes: u64,
 }
 
 impl ValidatingWebhookFetcher {
     pub fn new(
         dns_resolver: Arc<dyn DnsResolver>,
-        timeout_ms: u64,
+        settings: Arc<SettingsStore>,
         max_response_bytes: u64,
     ) -> Self {
         Self {
             dns_resolver,
-            timeout_ms,
+            settings,
             max_response_bytes,
         }
     }
@@ -87,7 +93,10 @@ impl WebhookFetcher for ValidatingWebhookFetcher {
             Err(_) => self.dns_resolver.resolve_and_validate(hostname).await?,
         };
 
-        let timeout = Duration::from_millis(request.timeout_ms.min(self.timeout_ms));
+        // Techo leído en el momento del fetch: refleja un cambio en caliente de
+        // `webhook_timeout_ms`. El `min` respeta un timeout menor que el script haya pedido.
+        let webhook_ceiling = self.settings.snapshot().webhook_timeout_ms;
+        let timeout = Duration::from_millis(request.timeout_ms.min(webhook_ceiling));
         let client = http_client::pinned_client(hostname, resolved_ip, port, timeout)?;
 
         let mut request_builder = match request.method.as_str() {
@@ -131,6 +140,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::domain::runtime_settings::RuntimeSettings;
 
     /// Resolver de test que registra cada hostname pedido y se comporta como `SecureDnsResolver`
     /// cuando el nombre apunta a una red interna. Que `calls` quede vacío es la prueba de que la
@@ -183,7 +193,7 @@ mod tests {
     async fn fetch_with(resolver: &Arc<RecordingResolver>, req: &WebhookRequest) -> ProxyError {
         let fetcher = ValidatingWebhookFetcher::new(
             Arc::clone(resolver) as Arc<dyn DnsResolver>,
-            5_000,
+            Arc::new(SettingsStore::new(RuntimeSettings::defaults())),
             MAX_RESPONSE_BYTES,
         );
         match fetcher.fetch(req).await {

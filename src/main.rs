@@ -11,8 +11,12 @@ use tele_proxy::application::changes_feed::ChangesFeedListener;
 use tele_proxy::application::identity::{GoogleIdentityProvider, IdentityProviders};
 use tele_proxy::application::lua_engine::SandboxedLuaEngine;
 use tele_proxy::application::proxy_service::ProxyService;
+use tele_proxy::application::settings_store::{
+    install_document, run_settings_refresh, SettingsStore, SETTINGS_REFRESH_INTERVAL,
+};
 use tele_proxy::application::webhook_service::{self, ValidatingWebhookFetcher};
-use tele_proxy::domain::services::AdminRepository;
+use tele_proxy::domain::runtime_settings::{RuntimeSettings, RuntimeSettingsPatch};
+use tele_proxy::domain::services::{AdminRepository, SettingsRepository};
 use tele_proxy::domain::validators::{validate_allowed_domain_list, validate_cors_allowed_origins};
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
 use tele_proxy::infrastructure::dns_resolver::SecureDnsResolver;
@@ -98,9 +102,8 @@ fn admin_settings_from_env(control_port: u16) -> Result<AdminSettings, String> {
         Some(format!("sha256:{}", sha256_hex(master.trim())))
     };
 
-    let redirect_default = format!(
-        "http://127.0.0.1:{control_port}/api/v1/admin/auth/google/callback"
-    );
+    let redirect_default =
+        format!("http://127.0.0.1:{control_port}/api/v1/admin/auth/google/callback");
     let google_redirect_uri = env_var_or("GOOGLE_REDIRECT_URI", &redirect_default)?;
     let cookie_secure = google_redirect_uri.starts_with("https://");
 
@@ -149,7 +152,12 @@ fn admin_settings_from_env(control_port: u16) -> Result<AdminSettings, String> {
             1u64,
             3_600u64,
         )?,
-        admin_rate_limit_requests: parse_in_range("ADMIN_RATE_LIMIT_REQUESTS", "120", 1u32, 10_000u32)?,
+        admin_rate_limit_requests: parse_in_range(
+            "ADMIN_RATE_LIMIT_REQUESTS",
+            "120",
+            1u32,
+            10_000u32,
+        )?,
         admin_rate_limit_window_seconds: parse_in_range(
             "ADMIN_RATE_LIMIT_WINDOW_SECONDS",
             "60",
@@ -192,6 +200,22 @@ where
     Ok(value)
 }
 
+/// Ajustes globales recargables a partir del entorno. Es el **baseline** del `SettingsStore`: el
+/// suelo al que se vuelve si el documento `runtime_settings` se borra de CouchDB. Los campos sin
+/// variable de entorno (timeouts del origen, techos de bytes, TTLs de caché) toman los defaults de
+/// `RuntimeSettings::defaults()`, que reproducen los `const` que antes vivían congelados en el
+/// binario — así un despliegue sin documento se comporta exactamente igual que antes.
+fn runtime_settings_from_env(config: &AppConfig) -> RuntimeSettings {
+    RuntimeSettings {
+        upstream_user_agent: config.upstream_user_agent.clone(),
+        lua_timeout_ms: config.lua_timeout_ms,
+        lua_memory_limit_mb: config.lua_memory_limit_mb,
+        webhook_timeout_ms: config.webhook_timeout_ms,
+        verbose_errors: config.modo_desarrollo,
+        ..RuntimeSettings::defaults()
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,tele_proxy=info"));
@@ -210,13 +234,13 @@ fn init_tracing() {
 /// (visibilidad del release sin exponer nada más); en `MODO=desarrollo` también el nombre y la
 /// lista de endpoints, para descubrir la API a mano.
 async fn index(State(service): State<Arc<ProxyService>>) -> String {
-    index_body(service.verbose_errors(), RELEASE)
+    index_body(service.settings().verbose_errors, RELEASE)
 }
 
 /// `GET /` en el puerto de control. Devuelve lo mismo que el [`index`] del proxy para que ambos
 /// puertos tengan un endpoint raíz consistente.
 async fn index_control(State(state): State<ControlState>) -> String {
-    index_body(state.service.verbose_errors(), RELEASE)
+    index_body(state.verbose(), RELEASE)
 }
 
 /// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
@@ -249,7 +273,9 @@ fn index_body(verbose: bool, release: &str) -> String {
         "  GET  /api/v1/admin/auth/google/url             URL de login Google".into(),
         "  GET  /api/v1/admin/me                          Identidad autenticada".into(),
         "  GET/POST /api/v1/admin/clients                 Listar/crear clientes".into(),
+        "  POST /api/v1/admin/clients/{id}/purge-cache    Purga las respuestas cacheadas del cliente".into(),
         "  GET/POST /api/v1/admin/admins                  Listar/anadir administradores".into(),
+        "  GET/PATCH /api/v1/admin/settings               Ajustes globales recargables en caliente".into(),
     ];
     format!("{NAME}\n{}\n", endpoints.join("\n"))
 }
@@ -297,22 +323,68 @@ async fn main() {
         tracing::warn!(error = %e, "No se pudo crear el design doc de CouchDB (se reintentará en la primera petición)");
     }
 
-    if let Err(e) = config_fetcher.seed_demo_client_if_empty(config.modo_desarrollo).await {
+    if let Err(e) = config_fetcher
+        .seed_demo_client_if_empty(config.modo_desarrollo)
+        .await
+    {
         tracing::warn!(error = %e, "No se pudo sembrar el cliente demo");
     }
 
-    let cache_store = match ValkeyCacheStore::new(&config.valkey_url).await {
-        Ok(store) => Arc::new(store),
-        Err(e) => {
-            tracing::error!(error = %e, "No se pudo inicializar el almacén de caché de Valkey");
-            std::process::exit(1);
+    // --- Ajustes globales recargables (`runtime_settings`) ---
+    // El baseline sale del entorno. Si CouchDB ya tiene el documento, gana sobre el entorno: es la
+    // fuente de verdad editable en caliente por un admin. Si no existe, se siembra con el baseline
+    // para que el panel muestre y edite los valores efectivos desde el primer arranque (y para que
+    // el primer PATCH no pierda los campos derivados del entorno al partir de los defaults). Un
+    // CouchDB caído en el boot no es fatal: se arranca con el entorno y el refresh periódico
+    // reconcilia en cuanto vuelve.
+    let env_settings = runtime_settings_from_env(&config);
+    if let Err(e) = env_settings.validate() {
+        tracing::error!(error = %e, "Los ajustes del entorno no son válidos, abortando el arranque");
+        std::process::exit(1);
+    }
+    let settings_store = Arc::new(SettingsStore::new(env_settings.clone()));
+    let settings_repo: Arc<dyn SettingsRepository> = config_fetcher.clone();
+
+    match settings_repo.load_settings().await {
+        Ok(Some(doc)) => {
+            install_document(&settings_store, &doc);
         }
-    };
+        Ok(None) => match settings_repo
+            .patch_settings(&RuntimeSettingsPatch::full(&env_settings))
+            .await
+        {
+            Ok(doc) => {
+                install_document(&settings_store, &doc);
+                tracing::info!("Documento runtime_settings sembrado con los valores del entorno");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "No se pudo sembrar runtime_settings en CouchDB; se arranca con los valores del entorno"
+            ),
+        },
+        Err(e) => tracing::warn!(
+            error = %e,
+            "No se pudo leer runtime_settings de CouchDB en el arranque; se usan los valores del entorno"
+        ),
+    }
+
+    // El flag lo comparten el almacén de Valkey y `ProxyService`: Valkey puede caerse después del
+    // arranque o no estar cuando se levanta el proceso, y `X-Degraded-Mode` tiene que reflejar el
+    // estado vivo, no el veredicto de un solo intento en el boot.
+    let cache_degraded = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cache_store =
+        match ValkeyCacheStore::new(&config.valkey_url, Arc::clone(&cache_degraded)).await {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                tracing::error!(error = %e, "No se pudo inicializar el almacén de caché de Valkey");
+                std::process::exit(1);
+            }
+        };
 
     let valkey_degraded = !cache_store.is_connected();
     if valkey_degraded {
         tracing::warn!(
-            "Valkey no disponible en el arranque — caché y rate limiting deshabilitados"
+            "Valkey no disponible en el arranque — caché y rate limiting desactivados hasta que vuelva"
         );
     }
 
@@ -325,14 +397,12 @@ async fn main() {
     // Pipeline anti-SSRF compartido prohíbe que una segunda ruta de salida resuelva por su cuenta.
     let webhook_fetcher = Arc::new(ValidatingWebhookFetcher::new(
         Arc::clone(&dns_resolver) as Arc<_>,
-        config.webhook_timeout_ms,
+        Arc::clone(&settings_store),
         webhook_service::MAX_RESPONSE_BYTES,
     ));
 
     let lua_executor = Arc::new(SandboxedLuaEngine::new(
-        config.lua_timeout_ms,
-        config.lua_memory_limit_mb,
-        config.webhook_timeout_ms,
+        Arc::clone(&settings_store),
         webhook_fetcher,
     ));
 
@@ -342,10 +412,9 @@ async fn main() {
             Arc::clone(&cache_store) as Arc<dyn tele_proxy::domain::services::CacheStore>,
             Arc::clone(&dns_resolver) as Arc<_>,
             lua_executor,
+            Arc::clone(&settings_store),
         )
-        .with_degraded_mode(valkey_degraded)
-        .with_verbose_errors(config.modo_desarrollo)
-        .with_upstream_user_agent(config.upstream_user_agent),
+        .with_degraded_flag(cache_degraded),
     );
 
     // --- Administración global (panel /api/v1/admin + /admin/) ---
@@ -397,7 +466,7 @@ async fn main() {
     }
 
     let admin_repo: Arc<dyn AdminRepository> = config_fetcher.clone();
-    let session_store = Arc::new(ValkeySessionStore::new(cache_store.connection_manager()));
+    let session_store = Arc::new(ValkeySessionStore::new(Arc::clone(&cache_store)));
     let admin_service = Arc::new(AdminService::new(
         admin_repo,
         session_store,
@@ -411,11 +480,21 @@ async fn main() {
         config.couchdb_user,
         config.couchdb_password,
         Arc::clone(&config_fetcher) as Arc<_>,
+        Arc::clone(&settings_store),
+        Arc::clone(&settings_repo),
     );
 
     let changes_task = tokio::spawn(async move {
         changes_listener.run().await;
     });
+
+    // Re-read periódico de `runtime_settings`: red de seguridad del feed `_changes`. Si el feed
+    // muere o CouchDB reinicia con `since=now`, este bucle reconcilia los ajustes de todos modos.
+    let settings_task = tokio::spawn(run_settings_refresh(
+        Arc::clone(&settings_store),
+        Arc::clone(&settings_repo),
+        SETTINGS_REFRESH_INTERVAL,
+    ));
 
     let proxy_app = Router::new()
         .route("/aq/{crypt_id}/", axum::routing::get(proxy_handler))
@@ -426,10 +505,10 @@ async fn main() {
     let control_state = ControlState {
         service: Arc::clone(&proxy_service),
         admin: admin_service,
+        settings_repo,
         login_limiter: Arc::new(LocalRateLimiter::new()),
         admin_limiter: Arc::new(LocalRateLimiter::new()),
         control_limiter: Arc::new(LocalRateLimiter::new()),
-        modo_desarrollo: config.modo_desarrollo,
     };
 
     let control_app = control_routes()
@@ -488,6 +567,7 @@ async fn main() {
         _ = proxy_server => tracing::error!("El servidor del proxy terminó inesperadamente"),
         _ = control_server => tracing::error!("El servidor de la API de control terminó inesperadamente"),
         _ = changes_task => tracing::error!("El listener del feed de cambios terminó inesperadamente"),
+        _ = settings_task => tracing::error!("El refresh periódico de runtime_settings terminó inesperadamente"),
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Señal de apagado recibida");
         }

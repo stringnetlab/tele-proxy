@@ -10,8 +10,10 @@ use crate::application::admin_service::AdminClientUpdate;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::header_rules::HeaderRule;
 use crate::domain::models::{
-    ClientConfig, ClientKind, ErrorHandlingConfig, RateLimitConfig, RotateIdResponse,
+    ClientConfig, ClientKind, ErrorHandlingConfig, PurgeCacheResponse, RateLimitConfig,
+    RotateIdResponse,
 };
+use crate::domain::runtime_settings::{RuntimeSettings, RuntimeSettingsPatch};
 use crate::domain::validators::validate_config_update;
 use crate::interfaces::control_api::{
     check_ip_rate_limit, ensure_client_kind, ApiError, ClientIp, ControlState,
@@ -23,7 +25,10 @@ use crate::interfaces::control_api::{
 pub fn admin_routes() -> Router<ControlState> {
     Router::new()
         .route("/api/v1/admin/auth/google/url", get(auth_google_url))
-        .route("/api/v1/admin/auth/google/callback", get(auth_google_callback))
+        .route(
+            "/api/v1/admin/auth/google/callback",
+            get(auth_google_callback),
+        )
         // Body cap en las rutas de auth: rate limit + techo de 8 KB es el "bandwidth limit" del
         // login (mitiga abuso de ancho de banda en endpoints públicos).
         .route_layer(DefaultBodyLimit::max(8192))
@@ -34,13 +39,30 @@ pub fn admin_routes() -> Router<ControlState> {
             "/api/v1/admin/admins/{email}",
             patch(set_admin_active).delete(delete_admin),
         )
-        .route("/api/v1/admin/clients", get(list_clients).post(create_client))
+        .route(
+            "/api/v1/admin/clients",
+            get(list_clients).post(create_client),
+        )
         .route(
             "/api/v1/admin/clients/{id}",
             get(get_client).put(update_client).delete(delete_client),
         )
-        .route("/api/v1/admin/clients/{id}/rotate-token", post(rotate_client_token))
-        .route("/api/v1/admin/clients/{id}/rotate-id", post(rotate_client_id))
+        .route(
+            "/api/v1/admin/clients/{id}/rotate-token",
+            post(rotate_client_token),
+        )
+        .route(
+            "/api/v1/admin/clients/{id}/rotate-id",
+            post(rotate_client_id),
+        )
+        .route(
+            "/api/v1/admin/clients/{id}/purge-cache",
+            post(purge_client_cache),
+        )
+        .route(
+            "/api/v1/admin/settings",
+            get(get_settings).patch(update_settings),
+        )
 }
 
 /// Identidad autenticada del panel: sesión (`via: "session"`) o master token (`via: "master"`).
@@ -67,7 +89,7 @@ impl axum::extract::FromRequestParts<ControlState> for AdminIdentity {
         parts: &mut axum::http::request::Parts,
         state: &ControlState,
     ) -> Result<Self, Self::Rejection> {
-        let verbose = state.modo_desarrollo;
+        let verbose = state.verbose();
 
         // CSRF por header: cuando CORS está activo (UI externa configurada), las mutaciones del
         // router admin exigen `X-Admin-UI`. SameSite=None hace que la cookie viaje en
@@ -152,8 +174,7 @@ fn session_cookie_header(
 }
 
 fn expired_cookie_header(secure: bool, same_site: &str) -> String {
-    let mut cookie =
-        format!("teleproxy_admin=; HttpOnly; SameSite={same_site}; Path=/; Max-Age=0");
+    let mut cookie = format!("teleproxy_admin=; HttpOnly; SameSite={same_site}; Path=/; Max-Age=0");
     if secure {
         cookie.push_str("; Secure");
     }
@@ -194,7 +215,7 @@ fn check_admin_rate(state: &ControlState, ip: &ClientIp) -> Result<(), ProxyErro
 }
 
 fn api_error(state: &ControlState, error: ProxyError) -> ApiError {
-    ApiError::detailed(error, state.modo_desarrollo)
+    ApiError::detailed(error, state.verbose())
 }
 
 // --- Auth ---
@@ -241,9 +262,8 @@ async fn auth_google_callback(
                 StatusCode::FOUND,
                 [(
                     axum::http::header::LOCATION,
-                    HeaderValue::from_str(&location).unwrap_or_else(|_| {
-                        HeaderValue::from_static("/admin/")
-                    }),
+                    HeaderValue::from_str(&location)
+                        .unwrap_or_else(|_| HeaderValue::from_static("/admin/")),
                 )],
             )
                 .into_response();
@@ -305,7 +325,7 @@ async fn me(
 fn html_error_page(state: &ControlState, error: ProxyError) -> Response {
     let status =
         StatusCode::from_u16(error.to_http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let message = if state.modo_desarrollo || !status.is_server_error() {
+    let message = if state.verbose() || !status.is_server_error() {
         error.to_string()
     } else {
         error.escueto_message().to_string()
@@ -347,7 +367,11 @@ async fn list_admins(
     ip: ClientIp,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_admin_rate(&state, &ip).map_err(|e| api_error(&state, e))?;
-    let admins = state.admin.list_admins().await.map_err(|e| api_error(&state, e))?;
+    let admins = state
+        .admin
+        .list_admins()
+        .await
+        .map_err(|e| api_error(&state, e))?;
     Ok(Json(serde_json::json!({ "admins": admins })))
 }
 
@@ -496,7 +520,9 @@ async fn list_clients(
         .filter(|config| ensure_client_kind(config).is_ok())
         .map(|config| AdminClientView::new(config, false))
         .collect();
-    Ok(Json(serde_json::json!({ "clients": clients, "total": total })))
+    Ok(Json(
+        serde_json::json!({ "clients": clients, "total": total }),
+    ))
 }
 
 async fn create_client(
@@ -532,7 +558,11 @@ async fn get_client(
     Path(id): Path<String>,
 ) -> Result<Json<AdminClientView>, ApiError> {
     check_admin_rate(&state, &ip).map_err(|e| api_error(&state, e))?;
-    let config = state.admin.get_client(&id).await.map_err(|e| api_error(&state, e))?;
+    let config = state
+        .admin
+        .get_client(&id)
+        .await
+        .map_err(|e| api_error(&state, e))?;
     Ok(Json(AdminClientView::new(&config, true)))
 }
 
@@ -607,6 +637,44 @@ async fn rotate_client_id(
     }))
 }
 
+/// Fuerza el re-fetch del contenido de un cliente: borra `px:{internal_id}:*` (respuestas en
+/// caché y copias `:stale` del fallback) sin subir `config_version`, que sería la única otra
+/// forma de invalidar y descartaría también lo que sí seguía sirviendo.
+async fn purge_client_cache(
+    State(state): State<ControlState>,
+    identity: AdminIdentity,
+    ip: ClientIp,
+    Path(id): Path<String>,
+) -> Result<Json<PurgeCacheResponse>, ApiError> {
+    check_admin_rate(&state, &ip).map_err(|e| api_error(&state, e))?;
+
+    // El alcance del barrido es el internal_id del cliente: si el cliente no existe, no hay nada
+    // que purgar y no se lanza el SCAN.
+    let config = state
+        .admin
+        .get_client(&id)
+        .await
+        .map_err(|e| api_error(&state, e))?;
+
+    let purged_keys = state
+        .service
+        .purge_client_responses(&config.internal_id)
+        .await
+        .map_err(|e| api_error(&state, e))?;
+
+    crate::application::admin_service::audit(
+        identity.actor(),
+        "client_purge_cache",
+        &config.internal_id,
+    );
+
+    Ok(Json(PurgeCacheResponse {
+        purged_keys,
+        pattern: format!("px:{}:*", config.internal_id),
+        purged_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
 async fn delete_client(
     State(state): State<ControlState>,
     identity: AdminIdentity,
@@ -621,6 +689,119 @@ async fn delete_client(
         .await
         .map_err(|e| api_error(&state, e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Ajustes globales (runtime_settings) ---
+
+/// Ajustes efectivos en curso: lo que el proxy está usando ahora mismo, no el documento crudo de
+/// CouchDB. Un campo ausente en el documento aparece aquí con su valor por defecto resuelto.
+async fn get_settings(
+    State(state): State<ControlState>,
+    _identity: AdminIdentity,
+    ip: ClientIp,
+) -> Result<Json<RuntimeSettings>, ApiError> {
+    check_admin_rate(&state, &ip).map_err(|e| api_error(&state, e))?;
+    Ok(Json(state.service.settings().as_ref().clone()))
+}
+
+/// Actualización parcial de los ajustes globales. Persiste en CouchDB e instala el resultado en el
+/// store local, de modo que el cambio es efectivo sin esperar al feed `_changes`. Solo rol `admin`
+/// (el extractor `AdminIdentity` ya es la puerta) y con entrada de auditoría: `verbose_errors`
+/// revela información interna, así que activarlo emite además un WARN explícito.
+async fn update_settings(
+    State(state): State<ControlState>,
+    identity: AdminIdentity,
+    ip: ClientIp,
+    body: Result<Json<RuntimeSettingsPatch>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<RuntimeSettings>, ApiError> {
+    check_admin_rate(&state, &ip).map_err(|e| api_error(&state, e))?;
+    let Json(patch) = body.map_err(|rejection| {
+        api_error(
+            &state,
+            ProxyError::InvalidConfig {
+                field: "body".to_string(),
+                reason: rejection.body_text(),
+            },
+        )
+    })?;
+
+    // Un PATCH vacío no es un error de red ni de validación, es una petición que no cambia nada:
+    // se rechaza antes de escribir para no inflar el histórico de revisiones de CouchDB.
+    if patch.is_empty() {
+        return Err(api_error(
+            &state,
+            ProxyError::InvalidConfig {
+                field: "body".to_string(),
+                reason: "el patch está vacío, no hay ningún campo que actualizar".to_string(),
+            },
+        ));
+    }
+
+    if patch.verbose_errors == Some(true) {
+        tracing::warn!(
+            actor = %identity.actor(),
+            "Se está activando verbose_errors: los errores HTTP expondrán el motivo interno"
+        );
+    }
+
+    let updated = crate::application::settings_store::apply_settings_patch(
+        state.service.settings_store(),
+        state.settings_repo.as_ref(),
+        &patch,
+    )
+    .await
+    .map_err(|e| api_error(&state, e))?;
+
+    crate::application::admin_service::audit(
+        identity.actor(),
+        "settings_update",
+        &describe_patch(&patch),
+    );
+
+    Ok(Json(updated))
+}
+
+/// Resumen del patch para la pista de auditoría: los nombres de los campos tocados, sin valores
+/// (acota el tamaño del evento y no vuelca al log datos que puedan cambiar entre releases).
+fn describe_patch(patch: &RuntimeSettingsPatch) -> String {
+    let mut fields = Vec::new();
+    if patch.upstream_user_agent.is_some() {
+        fields.push("upstream_user_agent");
+    }
+    if patch.upstream_timeout_secs.is_some() {
+        fields.push("upstream_timeout_secs");
+    }
+    if patch.max_response_bytes.is_some() {
+        fields.push("max_response_bytes");
+    }
+    if patch.cacheable_size_bytes.is_some() {
+        fields.push("cacheable_size_bytes");
+    }
+    if patch.stale_cache_ttl_secs.is_some() {
+        fields.push("stale_cache_ttl_secs");
+    }
+    if patch.cache_ttl_images_secs.is_some() {
+        fields.push("cache_ttl_images_secs");
+    }
+    if patch.cache_ttl_assets_secs.is_some() {
+        fields.push("cache_ttl_assets_secs");
+    }
+    if patch.cache_ttl_default_secs.is_some() {
+        fields.push("cache_ttl_default_secs");
+    }
+    if patch.lua_timeout_ms.is_some() {
+        fields.push("lua_timeout_ms");
+    }
+    if patch.lua_memory_limit_mb.is_some() {
+        fields.push("lua_memory_limit_mb");
+    }
+    if patch.webhook_timeout_ms.is_some() {
+        fields.push("webhook_timeout_ms");
+    }
+    if patch.verbose_errors.is_some() {
+        fields.push("verbose_errors");
+    }
+    fields.join(",")
 }
 
 // --- Tests ---
@@ -715,9 +896,8 @@ mod tests {
     use crate::application::admin_service::AdminService;
     use crate::application::identity::VerifiedIdentity;
     use crate::application::proxy_service::ProxyService;
-    use crate::domain::services::{AdminRepository, CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+    use crate::domain::services::{CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
     use axum::extract::FromRequestParts;
-    use axum::http::Request;
     use std::sync::Arc;
 
     /// Stubs mínimos para construir un `ProxyService` real: el extractor `AdminIdentity` y el
@@ -764,12 +944,7 @@ mod tests {
         async fn get_ip(&self, _: &str) -> Result<Option<std::net::IpAddr>, ProxyError> {
             unimplemented!("stub de test")
         }
-        async fn set_ip(
-            &self,
-            _: &str,
-            _: &std::net::IpAddr,
-            _: u64,
-        ) -> Result<(), ProxyError> {
+        async fn set_ip(&self, _: &str, _: &std::net::IpAddr, _: u64) -> Result<(), ProxyError> {
             unimplemented!("stub de test")
         }
         async fn check_rate_limit(
@@ -778,6 +953,9 @@ mod tests {
             _: u32,
             _: u64,
         ) -> crate::domain::models::RateLimitDecision {
+            unimplemented!("stub de test")
+        }
+        async fn purge_client_responses(&self, _: &str) -> Result<u64, ProxyError> {
             unimplemented!("stub de test")
         }
     }
@@ -803,7 +981,26 @@ mod tests {
         }
     }
 
-    fn test_control_state(mut settings: crate::application::admin_service::AdminSettings) -> ControlState {
+    struct StubSettingsRepo;
+    #[async_trait::async_trait]
+    impl crate::domain::services::SettingsRepository for StubSettingsRepo {
+        async fn load_settings(
+            &self,
+        ) -> Result<Option<crate::domain::runtime_settings::RuntimeSettingsDocument>, ProxyError>
+        {
+            unimplemented!("stub de test")
+        }
+        async fn patch_settings(
+            &self,
+            _: &crate::domain::runtime_settings::RuntimeSettingsPatch,
+        ) -> Result<crate::domain::runtime_settings::RuntimeSettingsDocument, ProxyError> {
+            unimplemented!("stub de test")
+        }
+    }
+
+    fn test_control_state(
+        mut settings: crate::application::admin_service::AdminSettings,
+    ) -> ControlState {
         let repo = Arc::new(fakes::FakeRepo::default());
         repo.admins
             .lock()
@@ -826,12 +1023,21 @@ mod tests {
                 Arc::new(StubCache),
                 Arc::new(StubDns),
                 Arc::new(StubLua),
+                Arc::new(crate::application::settings_store::SettingsStore::new(
+                    crate::domain::runtime_settings::RuntimeSettings::defaults(),
+                )),
             )),
             admin,
-            login_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
-            admin_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
-            control_limiter: Arc::new(crate::infrastructure::local_rate_limiter::LocalRateLimiter::new()),
-            modo_desarrollo: false,
+            settings_repo: Arc::new(StubSettingsRepo),
+            login_limiter: Arc::new(
+                crate::infrastructure::local_rate_limiter::LocalRateLimiter::new(),
+            ),
+            admin_limiter: Arc::new(
+                crate::infrastructure::local_rate_limiter::LocalRateLimiter::new(),
+            ),
+            control_limiter: Arc::new(
+                crate::infrastructure::local_rate_limiter::LocalRateLimiter::new(),
+            ),
         }
     }
 
@@ -848,11 +1054,13 @@ mod tests {
 
     /// El callback devuelve `Result<Response, ApiError>`; ApiError no es Debug (lleva Span), así
     /// que se desempaqueta a mano para poder hacer assertions sobre el error.
-    async fn callback_response(
-        state: ControlState,
-    ) -> Response {
+    async fn callback_response(state: ControlState) -> Response {
         let url = state.admin.google_login_url().await.expect("url de login");
-        let oauth_state = url.split("state=").nth(1).expect("state en la url").to_string();
+        let oauth_state = url
+            .split("state=")
+            .nth(1)
+            .expect("state en la url")
+            .to_string();
         match auth_google_callback(
             State(state),
             ClientIp("10.0.0.1".to_string()),
@@ -882,7 +1090,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FOUND);
         // Redirect a la UI externa (sin slash final) y cookie SameSite=None + Secure.
         assert_eq!(
-            response.headers().get(axum::http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
             Some("https://admteleproxy.velone.ai")
         );
         let cookie = response
@@ -900,7 +1111,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FOUND);
         assert_eq!(
-            response.headers().get(axum::http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
             Some("/admin/")
         );
         let cookie = response
@@ -938,11 +1152,15 @@ mod tests {
 
         // GET no es mutación: no aplica (las rutas de auth de navegador siguen funcionando).
         let mut parts = master_parts("GET", &[]);
-        assert!(AdminIdentity::from_request_parts(&mut parts, &state).await.is_ok());
+        assert!(AdminIdentity::from_request_parts(&mut parts, &state)
+            .await
+            .is_ok());
 
         // Sin CORS activo (modo embebido) no se exige el header: comportamiento actual.
         let state = test_control_state(fakes::settings(Some("supersecret")));
         let mut parts = master_parts("POST", &[]);
-        assert!(AdminIdentity::from_request_parts(&mut parts, &state).await.is_ok());
+        assert!(AdminIdentity::from_request_parts(&mut parts, &state)
+            .await
+            .is_ok());
     }
 }

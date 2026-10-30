@@ -668,6 +668,55 @@ paths:
                   new_crypt_id: { type: string }
                   rotated_at: { type: string, format: date-time }
 
+  /api/v1/admin/settings:
+    get:
+      summary: Ajustes globales efectivos del proxy
+      description: |
+        Devuelve los `runtime_settings` **efectivos** en curso (no el documento crudo de CouchDB):
+        un campo ausente en el documento aparece aquí resuelto a su valor por defecto. Son los
+        valores recargables en caliente que antes vivían congelados en el arranque o como `const`
+        del compilador. Quedan fuera a propósito los puertos/`HTTP_HOST`, las URLs y credenciales
+        de CouchDB/Valkey, el material de identidad (master token, CORS, Google OAuth) y
+        `config/dns_resolvers.json` (política anti-SSRF embebida en el binario).
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      responses:
+        "200":
+          description: Ajustes efectivos
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeSettings"
+        "429": { description: Rate limit de admin excedido }
+    patch:
+      summary: Actualización parcial de los ajustes globales
+      description: |
+        Body con solo los campos a cambiar (`RuntimeSettingsPatch`); un campo ausente no se toca.
+        Se valida el resultado **completo** contra los rangos de `RuntimeSettings` (incluye el
+        invariante entre campos `cacheable_size_bytes <= max_response_bytes`), se persiste en
+        CouchDB con concurrencia optimista (`_rev`) y se instala en el store en memoria, de modo
+        que el cambio es efectivo sin esperar al feed `_changes`. La mutación exige el header
+        `X-Admin-UI` cuando CORS está activo (misma regla CSRF que el resto del router admin) y
+        deja una entrada de auditoría `settings_update`. Un patch vacío es `400 invalid_config`.
+        `verbose_errors: true` revela el motivo interno en los cuerpos de error: activarlo emite
+        además un WARN explícito en el log.
+      security: [{ AdminSessionCookie: [] }, { MasterBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RuntimeSettingsPatch"
+      responses:
+        "200":
+          description: Ajustes efectivos tras aplicar el patch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuntimeSettings"
+        "400": { description: "Patch vacío o valor fuera de rango (invalid_config, cita el campo)" }
+        "409": { description: Conflicto de `_rev` con otra escritura concurrente }
+        "429": { description: Rate limit de admin excedido }
+
   # ========================================
   # SALUD (sin autenticación, en ambos puertos)
   # ========================================
@@ -959,3 +1008,101 @@ components:
                     description: |
                       Obligatorio para `set`/`add`; ignorado en `remove`. Admite placeholders
                       `${campo}` que se expanden contra el contexto de la petición.
+
+    RuntimeSettings:
+      type: object
+      description: |
+        Ajustes globales del proxy recargables en caliente. Los rangos reflejan **exactamente**
+        `RuntimeSettings::validate()` (`domain/runtime_settings.rs`); fuera de rango se rechaza la
+        escritura entera con `400 invalid_config` citando el campo culpable (sin clamp silencioso,
+        para que panel y proxy no discrepen sobre el valor efectivo). Los `default` reproducen los
+        valores históricos congelados, de modo que un despliegue sin documento en CouchDB se
+        comporta igual que antes.
+      properties:
+        upstream_user_agent:
+          type: string
+          maxLength: 256
+          default: ""
+          description: |
+            User-Agent por defecto para el origen; vacío = el de reqwest. Nunca pisa el que envíe
+            el cliente. Se rechazan los caracteres de control ASCII (anti inyección de cabeceras).
+        upstream_timeout_secs:
+          type: integer
+          minimum: 1
+          maximum: 300
+          default: 30
+        max_response_bytes:
+          type: integer
+          minimum: 1048576
+          maximum: 536870912
+          default: 104857600
+          description: Techo de lectura del cuerpo del origen (1 MiB .. 512 MiB; default 100 MiB).
+        cacheable_size_bytes:
+          type: integer
+          minimum: 1024
+          maximum: 536870912
+          default: 5242880
+          description: |
+            Por encima de este tamaño la respuesta no se cachea en Valkey (1 KiB .. 512 MiB;
+            default 5 MiB). Invariante: no puede superar `max_response_bytes`.
+        stale_cache_ttl_secs:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          default: 86400
+        cache_ttl_images_secs:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          default: 3600
+        cache_ttl_assets_secs:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          default: 1800
+        cache_ttl_default_secs:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          default: 300
+        lua_timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 200
+        lua_memory_limit_mb:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          default: 50
+        webhook_timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 5000
+        verbose_errors:
+          type: boolean
+          default: false
+          description: |
+            `MODO=desarrollo` en caliente: los errores HTTP exponen el motivo interno y `details`.
+            Editable solo por rol `admin` con auditoría; activarlo revela información interna.
+
+    RuntimeSettingsPatch:
+      type: object
+      description: |
+        Cuerpo del `PATCH /api/v1/admin/settings`: los mismos campos que `RuntimeSettings` pero
+        opcionales (ausente = no se toca). Un patch vacío (`{}`) se rechaza con `400`. Cada campo
+        presente se valida contra el rango de `RuntimeSettings`.
+      properties:
+        upstream_user_agent: { type: string, maxLength: 256 }
+        upstream_timeout_secs: { type: integer, minimum: 1, maximum: 300 }
+        max_response_bytes: { type: integer, minimum: 1048576, maximum: 536870912 }
+        cacheable_size_bytes: { type: integer, minimum: 1024, maximum: 536870912 }
+        stale_cache_ttl_secs: { type: integer, minimum: 60, maximum: 604800 }
+        cache_ttl_images_secs: { type: integer, minimum: 1, maximum: 604800 }
+        cache_ttl_assets_secs: { type: integer, minimum: 1, maximum: 604800 }
+        cache_ttl_default_secs: { type: integer, minimum: 1, maximum: 604800 }
+        lua_timeout_ms: { type: integer, minimum: 1, maximum: 60000 }
+        lua_memory_limit_mb: { type: integer, minimum: 1, maximum: 1024 }
+        webhook_timeout_ms: { type: integer, minimum: 1, maximum: 60000 }
+        verbose_errors: { type: boolean }

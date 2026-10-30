@@ -234,6 +234,15 @@ pub struct RotateIdResponse {
     pub rotated_at: String,
 }
 
+/// Resultado de la purga de respuestas cacheadas de un cliente: cuántas claves se borraron y
+/// desde qué prefijo, para que el operador pueda verificar el alcance real de la operación.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeCacheResponse {
+    pub purged_keys: u64,
+    pub pattern: String,
+    pub purged_at: String,
+}
+
 /// Operador autorizado del panel de administración. Documento CouchDB independiente de los
 /// `client_config` (`type: "admin_user"`, `_id = admin_user:{email}`): los admins no usan el
 /// proxy y los clientes no pueden ser admins; el modelo solo describe, la separación se fuerza

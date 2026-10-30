@@ -30,6 +30,12 @@ pub enum ProxyError {
     #[error("Configuración inválida: {field} {reason}")]
     InvalidConfig { field: String, reason: String },
 
+    /// `_rev` obsoleta: otro escritor modificó el documento entre la lectura y el PUT (409 de
+    /// CouchDB). Antes se aplanaba a `Internal` y el panel recibía un 500 "Error interno del
+    /// servidor" por lo que en realidad es un conflicto reintentable.
+    #[error("Conflicto de revisión en {resource}: {reason}")]
+    Conflict { resource: String, reason: String },
+
     #[error("Falló la resolución DNS de {hostname}: {reason}")]
     DnsResolutionFailed { hostname: String, reason: String },
 
@@ -114,6 +120,7 @@ impl ProxyError {
             Self::SsrfBlocked { .. } => 403,
             Self::InvalidUrlFormat { .. } => 400,
             Self::InvalidConfig { .. } => 400,
+            Self::Conflict { .. } => 409,
             Self::DnsResolutionFailed { .. } => 502,
             Self::LuaSandboxViolation { .. } => 500,
             Self::ReDosBlocked { .. } => 500,
@@ -141,6 +148,7 @@ impl ProxyError {
             Self::SsrfBlocked { .. } => "ssrf_blocked",
             Self::InvalidUrlFormat { .. } => "invalid_url_format",
             Self::InvalidConfig { .. } => "invalid_config",
+            Self::Conflict { .. } => "conflict",
             Self::DnsResolutionFailed { .. } => "dns_resolution_failed",
             Self::LuaSandboxViolation { .. } => "lua_sandbox_violation",
             Self::ReDosBlocked { .. } => "redos_blocked",
@@ -168,6 +176,7 @@ impl ProxyError {
             | Self::RateLimitExceeded { .. }
             | Self::InvalidUrlFormat { .. }
             | Self::InvalidConfig { .. }
+            | Self::Conflict { .. }
             | Self::PayloadTooLarge { .. }
             | Self::ScriptTimeout { .. }
             | Self::ScriptMemoryLimit { .. }
@@ -244,6 +253,9 @@ impl ProxyError {
             }
             Self::InvalidConfig { field, reason } => {
                 vec![("field", field.clone()), ("reason", reason.clone())]
+            }
+            Self::Conflict { resource, reason } => {
+                vec![("resource", resource.clone()), ("reason", reason.clone())]
             }
             Self::DnsResolutionFailed { hostname, reason } => {
                 vec![("hostname", hostname.clone()), ("reason", reason.clone())]

@@ -13,14 +13,10 @@ use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::header_rules::{self, RuleContext};
 use crate::domain::models::{CachedResponse, ClientConfig, ProxyContext};
+use crate::domain::runtime_settings::RuntimeSettings;
 use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
 use crate::infrastructure::http_client;
 use crate::interfaces::control_api::ApiError;
-
-const MAX_RESPONSE_SIZE: u64 = 100 * 1024 * 1024;
-const CACHEABLE_SIZE_LIMIT: usize = 5 * 1024 * 1024;
-const UPSTREAM_TIMEOUT_SECS: u64 = 30;
-const STALE_CACHE_TTL: u64 = 86400;
 
 #[derive(Deserialize)]
 pub struct ProxyQuery {
@@ -34,8 +30,13 @@ pub async fn proxy_handler(
     Query(query): Query<ProxyQuery>,
     request_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    // `MODO=desarrollo`: los errores de este handler llevan motivo interno y `details`.
-    let verbose = service.verbose_errors();
+    // Snapshot único de los ajustes globales para toda la petición: eran `const` del compilador y
+    // ahora viven en CouchDB, pero se leen una sola vez aquí para que un cambio a mitad del request
+    // no mezcle dos configuraciones (p. ej. dos techos de lectura distintos en los dos caminos).
+    let settings = service.settings();
+    // `MODO=desarrollo` o `verbose_errors` activado por un admin: los errores de este handler
+    // llevan motivo interno y `details`.
+    let verbose = settings.verbose_errors;
     let api_err = |e: ProxyError| ApiError::detailed(e, verbose);
 
     if !validate_crypt_id(&crypt_id) {
@@ -121,13 +122,8 @@ pub async fn proxy_handler(
         .as_deref()
         .or_else(|| infer_mime_from_url(&query.url));
 
-    let upstream_result = make_upstream_request(
-        &url,
-        resolved_ip,
-        &request_headers,
-        service.upstream_user_agent(),
-    )
-    .await;
+    let upstream_result =
+        make_upstream_request(&url, resolved_ip, &request_headers, &settings).await;
 
     let upstream_response = match upstream_result {
         Ok(resp) => resp,
@@ -153,9 +149,13 @@ pub async fn proxy_handler(
         // cual — status, headers y cuerpo — no un 502 genérico que esconde qué pasó.
         if config.error_handling.mode == crate::domain::models::ErrorMode::Transparent {
             tracing::warn!(status = status, url = %query.url, "El upstream devolvió error, pasándolo tal cual (modo transparente)");
-            return passthrough_upstream_error(upstream_response, degraded)
-                .await
-                .map_err(&api_err);
+            return passthrough_upstream_error(
+                upstream_response,
+                degraded,
+                settings.max_response_bytes,
+            )
+            .await
+            .map_err(&api_err);
         }
         tracing::warn!(status = status, url = %query.url, "El upstream devolvió error, probando fallbacks");
         return try_fallback_or_error(
@@ -177,7 +177,7 @@ pub async fn proxy_handler(
     let headers = upstream_response.headers().clone();
     // El tope se aplica durante el stream, no sobre el cuerpo ya bufferizado: un origen puede
     // anunciar un Content-Length pequeño y enviar mucho más.
-    let body_bytes = http_client::read_body_capped(upstream_response, MAX_RESPONSE_SIZE)
+    let body_bytes = http_client::read_body_capped(upstream_response, settings.max_response_bytes)
         .await
         .map_err(&api_err)?;
 
@@ -218,7 +218,7 @@ pub async fn proxy_handler(
     // Solo los 200 se cachean: un anti-bot que responde 202/403 con cuerpo vacío (Amazon/IMDB
     // lo hace) quedaría servido desde la caché en blanco durante todo su TTL. Los 3xx ya
     // quedaban fuera (su Location reescrito depende del Host de cada petición).
-    let cacheable = body_bytes.len() <= CACHEABLE_SIZE_LIMIT && status == 200;
+    let cacheable = (body_bytes.len() as u64) <= settings.cacheable_size_bytes && status == 200;
     if cacheable {
         let cached = CachedResponse {
             status,
@@ -230,7 +230,7 @@ pub async fn proxy_handler(
             body: body_bytes.clone(),
         };
 
-        let ttl = determine_cache_ttl(content_type);
+        let ttl = settings.cache_ttl_secs(content_type);
         if let Err(e) = service
             .cache_store()
             .set_response(&cache_key, &cached, ttl)
@@ -245,7 +245,7 @@ pub async fn proxy_handler(
             config.config_version,
             &query.url,
             &cached,
-            STALE_CACHE_TTL,
+            settings.stale_cache_ttl_secs,
         )
         .await
         {
@@ -559,7 +559,7 @@ async fn make_upstream_request(
     url: &url::Url,
     resolved_ip: std::net::IpAddr,
     request_headers: &HeaderMap,
-    default_user_agent: &str,
+    settings: &RuntimeSettings,
 ) -> Result<reqwest::Response, ProxyError> {
     let hostname = url.host_str().ok_or_else(|| ProxyError::Internal {
         reason: "La URL del upstream no tiene host".to_string(),
@@ -574,11 +574,11 @@ async fn make_upstream_request(
         hostname,
         resolved_ip,
         port,
-        std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
+        std::time::Duration::from_secs(settings.upstream_timeout_secs),
     )?;
 
     let mut request = client.get(url.as_str());
-    for (name, value) in upstream_client_headers(request_headers, default_user_agent) {
+    for (name, value) in upstream_client_headers(request_headers, &settings.upstream_user_agent) {
         request = request.header(name, value);
     }
 
@@ -595,11 +595,13 @@ async fn make_upstream_request(
             "Falló la conexión al upstream"
         );
         // El timeout del origen es un 504, no un 502: el cliente puede distinguir "el origen
-        // no respondió a tiempo" de "el origen rechazó la conexión".
+        // no respondió a tiempo" de "el origen rechazó la conexión". El `timeout_ms` sale del
+        // mismo ajuste que construyó el cliente: antes eran dos derivaciones de una constante
+        // que podían divergir.
         if e.is_timeout() {
             ProxyError::UpstreamTimeout {
                 url: url.to_string(),
-                timeout_ms: UPSTREAM_TIMEOUT_SECS * 1000,
+                timeout_ms: settings.upstream_timeout_secs * 1000,
             }
         } else {
             ProxyError::UpstreamError {
@@ -619,10 +621,11 @@ async fn make_upstream_request(
 async fn passthrough_upstream_error(
     upstream_response: reqwest::Response,
     degraded: bool,
+    max_response_bytes: u64,
 ) -> Result<Response, ProxyError> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let body = http_client::read_body_capped(upstream_response, MAX_RESPONSE_SIZE).await?;
+    let body = http_client::read_body_capped(upstream_response, max_response_bytes).await?;
 
     let mut response_headers = pairs_to_header_map(
         headers
@@ -779,18 +782,6 @@ fn infer_mime_from_url(raw_url: &str) -> Option<&'static str> {
     }
 }
 
-fn determine_cache_ttl(content_type: &str) -> u64 {
-    if content_type.starts_with("image/") {
-        3600
-    } else if content_type.starts_with("text/css")
-        || content_type.starts_with("application/javascript")
-    {
-        1800
-    } else {
-        300
-    }
-}
-
 fn build_response(
     status: StatusCode,
     headers: HeaderMap,
@@ -842,14 +833,18 @@ mod tests {
         ] {
             let result = validate_url_strict(url);
             assert!(
-                matches!(result, Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })),
+                matches!(
+                    result,
+                    Err(crate::domain::errors::ProxyError::SsrfBlocked { .. })
+                ),
                 "{url:?} debería seguir bloqueado aunque el cliente sea wildcard"
             );
         }
     }
 
     #[test]
-    fn strips_framing_and_encoding_headers() {        for name in [
+    fn strips_framing_and_encoding_headers() {
+        for name in [
             "transfer-encoding",
             "Transfer-Encoding",
             "content-length",

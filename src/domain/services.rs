@@ -6,6 +6,7 @@ use super::models::{
     AdminUser, CachedResponse, ClientConfig, ClientConfigUpdate, RateLimitDecision, WebhookRequest,
     WebhookResponse,
 };
+use super::runtime_settings::{RuntimeSettingsDocument, RuntimeSettingsPatch};
 
 #[async_trait]
 pub trait ConfigFetcher: Send + Sync {
@@ -18,6 +19,23 @@ pub trait ConfigFetcher: Send + Sync {
     ) -> Result<ClientConfig, ProxyError>;
     async fn rotate_crypt_id(&self, internal_id: &str) -> Result<String, ProxyError>;
     async fn invalidate_cache(&self, internal_id: &str);
+}
+
+/// Persistencia del documento global `runtime_settings`. Dos métodos bastan porque el seed del
+/// primer arranque es un patch completo sobre los valores por defecto: no hace falta un camino de
+/// escritura aparte.
+#[async_trait]
+pub trait SettingsRepository: Send + Sync {
+    /// `Ok(None)` cuando el documento todavía no existe (primer arranque).
+    async fn load_settings(&self) -> Result<Option<RuntimeSettingsDocument>, ProxyError>;
+    /// Lee el documento, aplica el patch validándolo **contra el estado actual** y escribe con el
+    /// `_rev` leído; un 409 se resuelve releyendo una vez, igual que `ensure_design_doc`. Validar
+    /// contra el estado actual y no contra el snapshot del llamador es lo que evita que dos PATCH
+    /// concurrentes dejen persistido un valor que ninguno de los dos validó.
+    async fn patch_settings(
+        &self,
+        patch: &RuntimeSettingsPatch,
+    ) -> Result<RuntimeSettingsDocument, ProxyError>;
 }
 
 #[async_trait]
@@ -41,6 +59,11 @@ pub trait CacheStore: Send + Sync {
         max_requests: u32,
         window_seconds: u64,
     ) -> RateLimitDecision;
+    /// Borra las respuestas cacheadas de un cliente (`px:{internal_id}:*`, incluidas las copias
+    /// `:stale` usadas por el fallback) y devuelve cuántas claves eliminó. Existe porque subir
+    /// `config_version` invalida *toda* la caché del cliente como efecto secundario: sin esto, no
+    /// hay forma de forzar un re-fetch sin tocar la configuración.
+    async fn purge_client_responses(&self, internal_id: &str) -> Result<u64, ProxyError>;
 }
 
 #[async_trait]

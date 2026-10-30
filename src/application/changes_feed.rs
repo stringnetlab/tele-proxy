@@ -4,7 +4,10 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::domain::services::ConfigFetcher;
+use crate::domain::runtime_settings::RUNTIME_SETTINGS_DOC_ID;
+use crate::domain::services::{ConfigFetcher, SettingsRepository};
+
+use super::settings_store::{sync_from_repository, SettingsStore};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -35,12 +38,53 @@ struct ChangeDoc {
     config_version: u64,
 }
 
+/// Qué hay que hacer con un evento del feed.
+#[derive(Debug, PartialEq)]
+enum ChangeAction {
+    /// Invalidar la caché de configs bajo este `internal_id`.
+    InvalidateConfig(String),
+    /// Releer `runtime_settings` desde CouchDB (o volver al baseline si se borró).
+    ReloadSettings,
+    Ignore,
+}
+
+/// Decisión pura sobre un evento del feed, separada del bucle para poder probarse sin red.
+///
+/// Los documentos borrados no traen cuerpo ni con `include_docs`, así que un cliente revocado se
+/// invalida por `_id`: los docs de cliente se crean con `_id` igual a `internal_id` y, sin esa
+/// rama, seguiría sirviendo `/aq/` hasta expirar el TTL de Moka. `runtime_settings` se reconoce
+/// por su `_id` fijo, que es constante, así que el borrado también cae en la misma rama.
+fn action_for(change: &ChangeEntry) -> ChangeAction {
+    if change.id == RUNTIME_SETTINGS_DOC_ID {
+        return ChangeAction::ReloadSettings;
+    }
+
+    if change.deleted {
+        return ChangeAction::InvalidateConfig(change.id.clone());
+    }
+
+    let Some(doc) = change.doc.as_ref() else {
+        return ChangeAction::Ignore;
+    };
+    if doc.r#type != "client_config" {
+        return ChangeAction::Ignore;
+    }
+
+    ChangeAction::InvalidateConfig(if doc.internal_id.is_empty() {
+        change.id.clone()
+    } else {
+        doc.internal_id.clone()
+    })
+}
+
 pub struct ChangesFeedListener {
     couchdb_url: String,
     db_name: String,
     username: String,
     password: String,
     config_fetcher: Arc<dyn ConfigFetcher>,
+    settings_store: Arc<SettingsStore>,
+    settings_repo: Arc<dyn SettingsRepository>,
 }
 
 impl ChangesFeedListener {
@@ -50,6 +94,8 @@ impl ChangesFeedListener {
         username: String,
         password: String,
         config_fetcher: Arc<dyn ConfigFetcher>,
+        settings_store: Arc<SettingsStore>,
+        settings_repo: Arc<dyn SettingsRepository>,
     ) -> Self {
         Self {
             couchdb_url,
@@ -57,6 +103,8 @@ impl ChangesFeedListener {
             username,
             password,
             config_fetcher,
+            settings_store,
+            settings_repo,
         }
     }
 
@@ -78,25 +126,48 @@ impl ChangesFeedListener {
                     backoff = POLL_INTERVAL;
 
                     for change in &response.results {
-                        if change.deleted {
-                            continue;
-                        }
+                        match action_for(change) {
+                            ChangeAction::Ignore => {}
 
-                        if let Some(doc) = &change.doc {
-                            if doc.r#type == "client_config" {
-                                let internal_id = if doc.internal_id.is_empty() {
-                                    change.id.as_str()
+                            ChangeAction::ReloadSettings => {
+                                if change.deleted {
+                                    tracing::info!(
+                                        doc_id = %change.id,
+                                        "runtime_settings borrado vía feed _changes, volviendo a los valores del entorno"
+                                    );
                                 } else {
-                                    doc.internal_id.as_str()
-                                };
+                                    tracing::info!(
+                                        doc_id = %change.id,
+                                        "Cambio de runtime_settings detectado vía feed _changes"
+                                    );
+                                }
+                                sync_from_repository(
+                                    &self.settings_store,
+                                    self.settings_repo.as_ref(),
+                                )
+                                .await;
+                            }
 
-                                tracing::info!(
-                                    doc_id = %change.id,
-                                    internal_id = %internal_id,
-                                    config_version = doc.config_version,
-                                    "Cambio de config detectado vía feed _changes"
-                                );
-                                self.config_fetcher.invalidate_cache(internal_id).await;
+                            ChangeAction::InvalidateConfig(internal_id) => {
+                                if change.deleted {
+                                    tracing::info!(
+                                        doc_id = %change.id,
+                                        "Documento borrado vía feed _changes, invalidando caché"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        doc_id = %change.id,
+                                        internal_id = %internal_id,
+                                        config_version = change
+                                            .doc
+                                            .as_ref()
+                                            .map(|doc| doc.config_version)
+                                            .unwrap_or_default(),
+                                        "Cambio de config detectado vía feed _changes"
+                                    );
+                                }
+
+                                self.config_fetcher.invalidate_cache(&internal_id).await;
                             }
                         }
                     }
@@ -141,5 +212,81 @@ impl ChangesFeedListener {
         resp.json::<ChangesResponse>()
             .await
             .map_err(|e| format!("No se pudo parsear la respuesta _changes: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(id: &str, deleted: bool, doc: Option<(&str, &str, u64)>) -> ChangeEntry {
+        ChangeEntry {
+            id: id.to_string(),
+            deleted,
+            doc: doc.map(|(r#type, internal_id, config_version)| ChangeDoc {
+                r#type: r#type.to_string(),
+                internal_id: internal_id.to_string(),
+                config_version,
+            }),
+        }
+    }
+
+    #[test]
+    fn un_borrado_invalida_por_id_aunque_no_traiga_cuerpo() {
+        // Es la rama que faltaba: sin ella, revocar un cliente desde otra instancia no se aplicaba
+        // hasta que expiraba el TTL de la caché local.
+        assert_eq!(
+            action_for(&change("cliente-1", true, None)),
+            ChangeAction::InvalidateConfig("cliente-1".to_string())
+        );
+    }
+
+    #[test]
+    fn una_modificacion_invalida_por_internal_id() {
+        assert_eq!(
+            action_for(&change(
+                "cliente-1",
+                false,
+                Some(("client_config", "int-1", 4))
+            )),
+            ChangeAction::InvalidateConfig("int-1".to_string())
+        );
+    }
+
+    #[test]
+    fn sin_internal_id_en_el_doc_se_usa_el_id_del_camino() {
+        assert_eq!(
+            action_for(&change("cliente-1", false, Some(("client_config", "", 2)))),
+            ChangeAction::InvalidateConfig("cliente-1".to_string())
+        );
+    }
+
+    #[test]
+    fn los_docs_que_no_son_de_cliente_no_invalidan_nada() {
+        assert_eq!(
+            action_for(&change(
+                "admin_user:a@b.c",
+                false,
+                Some(("admin_user", "x", 1))
+            )),
+            ChangeAction::Ignore
+        );
+        assert_eq!(
+            action_for(&change("cliente-1", false, None)),
+            ChangeAction::Ignore
+        );
+    }
+
+    #[test]
+    fn el_documento_de_ajustes_recarga_settings_tambien_si_se_borra() {
+        // Se reconoce por el `_id` fijo, no por el `type`: un borrado no trae cuerpo.
+        assert_eq!(
+            action_for(&change(RUNTIME_SETTINGS_DOC_ID, false, None)),
+            ChangeAction::ReloadSettings
+        );
+        assert_eq!(
+            action_for(&change(RUNTIME_SETTINGS_DOC_ID, true, None)),
+            ChangeAction::ReloadSettings
+        );
     }
 }

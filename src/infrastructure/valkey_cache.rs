@@ -1,5 +1,7 @@
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -20,44 +22,130 @@ end
 return {count, redis.call('PTTL', KEYS[1])}
 "#;
 
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// El intento de reconexión corre en la ruta de petición, así que va acotado: `ConnectionManager`
+/// por defecto no pone timeout de conexión y reintentaría la política interna antes de devolver.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Claves por iteración del `SCAN` de purga: suficientemente grande para no alargar el barrido en
+/// clientes con mucha caché, suficientemente pequeño para no bloquear el servidor.
+const PURGE_SCAN_COUNT: u32 = 500;
+
+/// Estado del reintento de conexión. `next_attempt` es el instante a partir del cual se permite
+/// un nuevo intento; `reconnect` serializa los intentos para que N peticiones concurrentes no
+/// abran N conexiones.
+struct ReconnectState {
+    next_attempt: Instant,
+    backoff: Duration,
+}
+
 pub struct ValkeyCacheStore {
-    conn: Option<redis::aio::ConnectionManager>,
+    client: redis::Client,
+    conn: RwLock<Option<redis::aio::ConnectionManager>>,
+    reconnect: tokio::sync::Mutex<ReconnectState>,
+    /// El mismo flag que lee `ProxyService` para `X-Degraded-Mode`: se limpia al reconectar y se
+    /// vuelve a activar si el intento falla, para que el degradado no sea un veredicto de arranque.
+    degraded: Arc<AtomicBool>,
     local: LocalRateLimiter,
 }
 
 impl ValkeyCacheStore {
-    pub async fn new(url: &str) -> Result<Self, ProxyError> {
+    pub async fn new(url: &str, degraded: Arc<AtomicBool>) -> Result<Self, ProxyError> {
         let client = redis::Client::open(url).map_err(|e| ProxyError::Internal {
             reason: format!("URL de Valkey inválida: {}", e),
         })?;
 
-        let conn = match redis::aio::ConnectionManager::new(client).await {
-            Ok(conn) => Some(conn),
+        let store = Self {
+            client,
+            conn: RwLock::new(None),
+            reconnect: tokio::sync::Mutex::new(ReconnectState {
+                next_attempt: Instant::now(),
+                backoff: RECONNECT_BACKOFF_MIN,
+            }),
+            degraded,
+            local: LocalRateLimiter::new(),
+        };
+
+        match store.attempt_connect().await {
+            Ok(()) => store.degraded.store(false, Ordering::Relaxed),
             Err(e) => {
                 tracing::warn!(error = %e, "Falló la conexión a Valkey en el arranque, entrando en modo de caché degradado");
+                store.degraded.store(true, Ordering::Relaxed);
+                let mut state = store.reconnect.lock().await;
+                state.next_attempt = Instant::now() + state.backoff;
+            }
+        }
+
+        Ok(store)
+    }
+
+    /// Manager vivo, o `None` si Valkey no responde. La ruta rápida es un `clone` del manager sin
+    /// lock asincrónico; si no hay conexión, se reintenta con backoff — un fallo en el arranque ya
+    /// no condena al proceso a vivir sin caché ni rate limiting distribuido para siempre.
+    async fn connection(&self) -> Option<redis::aio::ConnectionManager> {
+        if let Some(conn) = self.conn.read().ok().and_then(|guard| guard.clone()) {
+            return Some(conn);
+        }
+
+        let mut state = self.reconnect.lock().await;
+
+        // Doble chequeo: otra petición pudo reconectar mientras esperábamos este lock.
+        if let Some(conn) = self.conn.read().ok().and_then(|guard| guard.clone()) {
+            return Some(conn);
+        }
+
+        if Instant::now() < state.next_attempt {
+            return None;
+        }
+
+        match self.attempt_connect().await {
+            Ok(()) => {
+                tracing::info!("Valkey recuperado, reactivando caché y rate limiting distribuido");
+                state.backoff = RECONNECT_BACKOFF_MIN;
+                state.next_attempt = Instant::now();
+                self.degraded.store(false, Ordering::Relaxed);
+                self.conn.read().ok().and_then(|guard| guard.clone())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, backoff_secs = state.backoff.as_secs(), "Sigue la caída de Valkey, reintentando más tarde");
+                state.next_attempt = Instant::now() + state.backoff;
+                state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                self.degraded.store(true, Ordering::Relaxed);
                 None
             }
-        };
-        Ok(Self {
-            conn,
-            local: LocalRateLimiter::new(),
-        })
+        }
+    }
+
+    async fn attempt_connect(&self) -> Result<(), redis::RedisError> {
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(1)
+            .set_connection_timeout(Some(CONNECT_TIMEOUT));
+        let manager =
+            redis::aio::ConnectionManager::new_with_config(self.client.clone(), config).await?;
+        let mut guard = self
+            .conn
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(manager);
+        Ok(())
     }
 
     pub fn is_connected(&self) -> bool {
-        self.conn.is_some()
+        self.conn
+            .read()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 
-    /// Conexión compartida para otros almacenes (p. ej. sesiones de admin): la misma instancia
-    /// de `ConnectionManager` auto-reconecta, así que sesiones y caché no abren pools distintos.
-    pub fn connection_manager(&self) -> Option<redis::aio::ConnectionManager> {
-        self.conn.clone()
+    /// El flag compartido de degradación, para el listener de control y los tests.
+    pub fn degraded_flag(&self) -> &Arc<AtomicBool> {
+        &self.degraded
     }
 
     /// `None` significa "Valkey no decidió": sin conexión, el `EVAL` falló o la respuesta no
     /// tiene la forma esperada. El llamador cae al limiter local; nunca se permite por omitir.
     async fn distributed_count(&self, key: &str, window_seconds: u64) -> Option<(u32, i64)> {
-        let Some(conn) = &self.conn else {
+        let Some(mut conn) = self.connection().await else {
             tracing::warn!(
                 event = "rate_limit_degraded",
                 "Valkey no disponible, decidiendo localmente"
@@ -65,7 +153,6 @@ impl ValkeyCacheStore {
             return None;
         };
 
-        let mut conn = conn.clone();
         let window_ms = window_seconds.saturating_mul(1000);
 
         let reply: Vec<i64> = match redis::cmd("EVAL")
@@ -113,14 +200,30 @@ fn retry_after_secs(ttl_ms: i64, window_seconds: u64) -> u32 {
     secs as u32
 }
 
+/// Prefijo `glob` de la purga de un cliente. El `internal_id` acaba en el `MATCH` de un `SCAN`:
+/// con metacaracteres la purga barrería claves de otros clientes, así que se rechaza antes de
+/// tocar Valkey.
+fn purge_pattern(internal_id: &str) -> Result<String, ProxyError> {
+    if internal_id.is_empty()
+        || !internal_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+    {
+        return Err(ProxyError::InvalidConfig {
+            field: "internal_id".to_string(),
+            reason: "El id de cliente no puede usarse como patrón de purga".to_string(),
+        });
+    }
+
+    Ok(format!("px:{}:*", internal_id))
+}
+
 #[async_trait]
 impl CacheStore for ValkeyCacheStore {
     async fn get_response(&self, key: &str) -> Result<Option<CachedResponse>, ProxyError> {
-        let Some(conn) = &self.conn else {
+        let Some(mut conn) = self.connection().await else {
             return Ok(None);
         };
-
-        let mut conn = conn.clone();
 
         let data: Option<Vec<u8>> = match conn.get(key).await {
             Ok(data) => data,
@@ -152,11 +255,9 @@ impl CacheStore for ValkeyCacheStore {
         response: &CachedResponse,
         ttl_seconds: u64,
     ) -> Result<(), ProxyError> {
-        let Some(conn) = &self.conn else {
+        let Some(mut conn) = self.connection().await else {
             return Ok(());
         };
-
-        let mut conn = conn.clone();
 
         let bytes = postcard::to_allocvec(response).map_err(|e| ProxyError::Internal {
             reason: format!("No se pudo serializar la respuesta para la caché: {}", e),
@@ -176,11 +277,9 @@ impl CacheStore for ValkeyCacheStore {
     }
 
     async fn get_ip(&self, hostname: &str) -> Result<Option<IpAddr>, ProxyError> {
-        let Some(conn) = &self.conn else {
+        let Some(mut conn) = self.connection().await else {
             return Ok(None);
         };
-
-        let mut conn = conn.clone();
         let key = format!("ip_cache:{}", hostname);
 
         let data: Option<String> = match conn.get(&key).await {
@@ -208,11 +307,9 @@ impl CacheStore for ValkeyCacheStore {
         ip: &IpAddr,
         ttl_seconds: u64,
     ) -> Result<(), ProxyError> {
-        let Some(conn) = &self.conn else {
+        let Some(mut conn) = self.connection().await else {
             return Ok(());
         };
-
-        let mut conn = conn.clone();
         let key = format!("ip_cache:{}", hostname);
 
         if let Err(e) = conn
@@ -242,24 +339,67 @@ impl CacheStore for ValkeyCacheStore {
             None => self.local.check(crypt_id, max_requests, window_seconds),
         }
     }
+
+    async fn purge_client_responses(&self, internal_id: &str) -> Result<u64, ProxyError> {
+        let pattern = purge_pattern(internal_id)?;
+
+        let Some(mut conn) = self.connection().await else {
+            return Err(ProxyError::ServiceUnavailable {
+                reason: "Valkey no disponible para purgar la caché".to_string(),
+            });
+        };
+
+        // SCAN en vez de KEYS: KEYS bloquea el servidor el tiempo que tarde el barrido completo.
+        let mut cursor: u64 = 0;
+        let mut removed: u64 = 0;
+
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(PURGE_SCAN_COUNT)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| ProxyError::Internal {
+                    reason: format!("SCAN de purga en Valkey falló: {}", e),
+                })?;
+
+            if !keys.is_empty() {
+                let deleted: u64 = conn.del(&keys).await.map_err(|e| ProxyError::Internal {
+                    reason: format!("DEL de purga en Valkey falló: {}", e),
+                })?;
+                removed = removed.saturating_add(deleted);
+            }
+
+            cursor = next;
+            if cursor == 0 {
+                return Ok(removed);
+            }
+        }
+    }
 }
 
-/// Almacén de sesiones y estados OAuth de la API admin sobre la **misma** conexión de Valkey que
-/// la caché (`ValkeyCacheStore::connection_manager`). `None` = Valkey no disponible en el
-/// arranque: las operaciones devuelven error en vez de fingir persistencia (un login que no
-/// persiste la sesión es peor que uno que falla en claro).
+/// Almacén de sesiones y estados OAuth de la API admin sobre la **misma** conexión viva de Valkey
+/// que la caché (`ValkeyCacheStore::connection`), así que se recupera con ella: un Valkey caído en
+/// el arranque ya no deja el login admin inutilizable para siempre. Sigue devolviendo error en vez
+/// de fingir persistencia (un login que no persiste la sesión es peor que uno que falla en claro).
 pub struct ValkeySessionStore {
-    conn: Option<redis::aio::ConnectionManager>,
+    cache: Arc<ValkeyCacheStore>,
 }
 
 impl ValkeySessionStore {
-    pub fn new(conn: Option<redis::aio::ConnectionManager>) -> Self {
-        Self { conn }
+    pub fn new(cache: Arc<ValkeyCacheStore>) -> Self {
+        Self { cache }
     }
 
-    fn require_conn(&self) -> Result<redis::aio::ConnectionManager, ProxyError> {
-        self.conn.clone().ok_or_else(|| {
-            tracing::warn!(event = "session_store_degraded", "Valkey no disponible para el almacén de sesiones");
+    async fn require_conn(&self) -> Result<redis::aio::ConnectionManager, ProxyError> {
+        self.cache.connection().await.ok_or_else(|| {
+            tracing::warn!(
+                event = "session_store_degraded",
+                "Valkey no disponible para el almacén de sesiones"
+            );
             ProxyError::ServiceUnavailable {
                 reason: "Valkey no disponible".to_string(),
             }
@@ -270,7 +410,7 @@ impl ValkeySessionStore {
 #[async_trait]
 impl crate::application::admin_service::SessionStore for ValkeySessionStore {
     async fn setex(&self, key: &str, value: &str, ttl_seconds: u64) -> Result<(), ProxyError> {
-        let mut conn = self.require_conn()?;
+        let mut conn = self.require_conn().await?;
         conn.set_ex::<_, _, ()>(key, value, ttl_seconds)
             .await
             .map_err(|e| ProxyError::Internal {
@@ -279,14 +419,14 @@ impl crate::application::admin_service::SessionStore for ValkeySessionStore {
     }
 
     async fn get(&self, key: &str) -> Result<Option<String>, ProxyError> {
-        let mut conn = self.require_conn()?;
+        let mut conn = self.require_conn().await?;
         conn.get(key).await.map_err(|e| ProxyError::Internal {
             reason: format!("GET de sesión en Valkey falló: {}", e),
         })
     }
 
     async fn getdel(&self, key: &str) -> Result<Option<String>, ProxyError> {
-        let mut conn = self.require_conn()?;
+        let mut conn = self.require_conn().await?;
         redis::cmd("GETDEL")
             .arg(key)
             .query_async(&mut conn)
@@ -297,9 +437,67 @@ impl crate::application::admin_service::SessionStore for ValkeySessionStore {
     }
 
     async fn del(&self, key: &str) -> Result<(), ProxyError> {
-        let mut conn = self.require_conn()?;
-        conn.del::<_, ()>(key).await.map_err(|e| ProxyError::Internal {
-            reason: format!("DEL en Valkey falló: {}", e),
-        })
+        let mut conn = self.require_conn().await?;
+        conn.del::<_, ()>(key)
+            .await
+            .map_err(|e| ProxyError::Internal {
+                reason: format!("DEL en Valkey falló: {}", e),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un `internal_id` con metacaracteres de glob ensancharía el `SCAN` y borraría claves de otros
+    /// clientes: se rechaza antes de construir el patrón.
+    #[test]
+    fn el_patron_de_purga_rechaza_ids_con_metacaracteres() {
+        assert_eq!(
+            purge_pattern("cliente-1").expect("id válido"),
+            "px:cliente-1:*"
+        );
+
+        for hostile in ["", "*", "a?b", "a[bc]", "a b", "a\\b"] {
+            let err = purge_pattern(hostile).expect_err("id hostil para el glob");
+            assert!(
+                matches!(err, ProxyError::InvalidConfig { .. }),
+                "id {hostile:?} debería rechazar el patrón"
+            );
+        }
+    }
+
+    /// Un Valkey inalcanzable en el arranque no puede condenar al proceso: el almacén se construye
+    /// igual, marca degradado, y la reconexión se reintenta bajo demanda en cada operación.
+    #[tokio::test]
+    async fn arranca_degradado_cuando_valkey_no_responde() {
+        let degraded = Arc::new(AtomicBool::new(false));
+        let store = ValkeyCacheStore::new("redis://127.0.0.1:1", Arc::clone(&degraded))
+            .await
+            .expect("el almacén se construye aunque Valkey no responda");
+
+        assert!(!store.is_connected());
+        assert!(degraded.load(Ordering::Relaxed));
+        assert!(store.connection().await.is_none());
+    }
+
+    /// La caída sigue siendo tolerante en el request path: la caché reporta miss y el limiter local
+    /// decide, avisando de que la cuota es por instancia.
+    #[tokio::test]
+    async fn sirve_miss_y_cuota_local_sin_valkey() {
+        let store = ValkeyCacheStore::new("redis://127.0.0.1:1", Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("el almacén se construye aunque Valkey no responda");
+
+        assert!(store
+            .get_response("px:interno:1:deadbeef")
+            .await
+            .unwrap()
+            .is_none());
+
+        let decision = store.check_rate_limit("crypt12345678", 5, 60).await;
+        assert!(decision.allowed);
+        assert!(decision.degraded);
     }
 }

@@ -13,7 +13,10 @@ use tracing::Span;
 use crate::application::admin_service::AdminService;
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ErrorResponse, ProxyError};
-use crate::domain::models::{ClientConfig, ClientConfigResponse, ClientConfigUpdate, RotateIdResponse};
+use crate::domain::models::{
+    ClientConfig, ClientConfigResponse, ClientConfigUpdate, RotateIdResponse,
+};
+use crate::domain::services::SettingsRepository;
 use crate::domain::validators::validate_config_update;
 use crate::infrastructure::local_rate_limiter::LocalRateLimiter;
 
@@ -24,11 +27,22 @@ use crate::infrastructure::local_rate_limiter::LocalRateLimiter;
 pub struct ControlState {
     pub service: Arc<ProxyService>,
     pub admin: Arc<AdminService>,
+    /// Repositorio de `runtime_settings` para la API admin de ajustes. El store en memoria vive en
+    /// `service.settings_store()`; aquí hace falta el otro extremo, el que persiste en CouchDB.
+    pub settings_repo: Arc<dyn SettingsRepository>,
     pub login_limiter: Arc<LocalRateLimiter>,
     pub admin_limiter: Arc<LocalRateLimiter>,
     pub control_limiter: Arc<LocalRateLimiter>,
-    /// `MODO=desarrollo`: cuerpos de error verbosos (se propaga a `ApiError::detailed`).
-    pub modo_desarrollo: bool,
+}
+
+impl ControlState {
+    /// Verbosidad de los cuerpos de error del plano de control/admin. Sale del mismo ajuste
+    /// recargable que el proxy (`runtime_settings.verbose_errors`), no del `MODO` de arranque: un
+    /// admin puede activarla en caliente y afecta por igual a `/aq/`, a la API de control y a la
+    /// de administración.
+    pub fn verbose(&self) -> bool {
+        self.service.settings().verbose_errors
+    }
 }
 
 /// IP del cliente para el rate limit por IP de las APIs de control/admin. `axum::serve` sin
@@ -124,7 +138,8 @@ impl ApiError {
         }
     }
 
-    /// Conversión con el flag de verbosidad del servicio (`ProxyService::verbose_errors`).
+    /// Conversión con el flag de verbosidad en curso (`runtime_settings.verbose_errors`, vía
+    /// `ControlState::verbose`).
     pub fn detailed(error: ProxyError, verbose: bool) -> Self {
         Self::with_span_verbose(error, Span::current(), verbose)
     }
@@ -205,7 +220,7 @@ async fn get_config(
     headers: HeaderMap,
     ip: ClientIp,
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
-    let verbose = state.modo_desarrollo;
+    let verbose = state.verbose();
     check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     let token = extract_bearer_token(&headers)?;
     let token_hash = hash_token(&token);
@@ -225,7 +240,7 @@ async fn update_config(
     ip: ClientIp,
     body: Result<Json<ClientConfigUpdate>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let verbose = state.modo_desarrollo;
+    let verbose = state.verbose();
     check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     // Un cuerpo que no deserializa (p. ej. `error_handling.mode = "aggressive"`) es 400
     // `invalid_config`, no el 422 en texto plano que devuelve Axum por defecto.
@@ -272,7 +287,7 @@ async fn rotate_id(
     headers: HeaderMap,
     ip: ClientIp,
 ) -> Result<Json<RotateIdResponse>, ApiError> {
-    let verbose = state.modo_desarrollo;
+    let verbose = state.verbose();
     check_control_rate(&state, &ip).map_err(|e| ApiError::detailed(e, verbose))?;
     let token = extract_bearer_token(&headers)?;
     let token_hash = hash_token(&token);

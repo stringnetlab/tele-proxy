@@ -1,7 +1,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::domain::errors::ProxyError;
+use crate::domain::runtime_settings::RuntimeSettings;
 use crate::domain::services::{CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+
+use super::settings_store::SettingsStore;
 
 pub struct ProxyService {
     config_fetcher: Arc<dyn ConfigFetcher>,
@@ -9,10 +13,7 @@ pub struct ProxyService {
     dns_resolver: Arc<dyn DnsResolver>,
     lua_executor: Arc<dyn LuaExecutor>,
     degraded_mode: Arc<AtomicBool>,
-    verbose_errors: bool,
-    /// User-Agent por defecto para las peticiones al origen (env `UPSTREAM_USER_AGENT`).
-    /// Se usa solo cuando el cliente de la petición no envía su propio `User-Agent`.
-    upstream_user_agent: String,
+    settings: Arc<SettingsStore>,
 }
 
 impl ProxyService {
@@ -21,6 +22,7 @@ impl ProxyService {
         cache_store: Arc<dyn CacheStore>,
         dns_resolver: Arc<dyn DnsResolver>,
         lua_executor: Arc<dyn LuaExecutor>,
+        settings: Arc<SettingsStore>,
     ) -> Self {
         Self {
             config_fetcher,
@@ -28,36 +30,27 @@ impl ProxyService {
             dns_resolver,
             lua_executor,
             degraded_mode: Arc::new(AtomicBool::new(false)),
-            verbose_errors: false,
-            upstream_user_agent: String::new(),
+            settings,
         }
     }
 
-    pub fn with_degraded_mode(self, degraded: bool) -> Self {
-        self.degraded_mode.store(degraded, Ordering::Relaxed);
+    /// Flag de degradación compartido con el almacén de caché: Valkey puede caerse y volver sin
+    /// reiniciar el proceso, y `X-Degraded-Mode` tiene que decir la verdad en ambos sentidos.
+    pub fn with_degraded_flag(mut self, degraded: Arc<AtomicBool>) -> Self {
+        self.degraded_mode = degraded;
         self
     }
 
-    /// `MODO=desarrollo`: los errores HTTP (`ApiError`) exponen el motivo interno completo y
-    /// los campos estructurados en `details`. Cualquier otro modo mantiene los errores escuetos.
-    pub fn with_verbose_errors(mut self, verbose: bool) -> Self {
-        self.verbose_errors = verbose;
-        self
+    /// Snapshot de los ajustes globales (`MODO` verboso, User-Agent del origen, timeouts y límites
+    /// que antes eran `const`). **Se llama una vez por petición** y el resultado se pasa hacia
+    /// abajo: leer el store en cada punto de uso permitiría que un cambio a mitad del request
+    /// mezclara dos configuraciones dentro de la misma petición.
+    pub fn settings(&self) -> Arc<RuntimeSettings> {
+        self.settings.snapshot()
     }
 
-    pub fn verbose_errors(&self) -> bool {
-        self.verbose_errors
-    }
-
-    /// User-Agent por defecto para el origen (vacío = el de reqwest). Nunca pisa el
-    /// `User-Agent` que el cliente envíe: ese se reenvía tal cual.
-    pub fn with_upstream_user_agent(mut self, user_agent: String) -> Self {
-        self.upstream_user_agent = user_agent;
-        self
-    }
-
-    pub fn upstream_user_agent(&self) -> &str {
-        &self.upstream_user_agent
+    pub fn settings_store(&self) -> &Arc<SettingsStore> {
+        &self.settings
     }
 
     pub fn config_fetcher(&self) -> &Arc<dyn ConfigFetcher> {
@@ -78,5 +71,18 @@ impl ProxyService {
 
     pub fn is_degraded(&self) -> bool {
         self.degraded_mode.load(Ordering::Relaxed)
+    }
+
+    /// Purga las respuestas cacheadas de un cliente sin tocar su configuración: la vía para forzar
+    /// un re-fetch cuando hace falta, sin el efecto colateral de subir `config_version`.
+    pub async fn purge_client_responses(&self, internal_id: &str) -> Result<u64, ProxyError> {
+        let purged = self.cache_store.purge_client_responses(internal_id).await?;
+        tracing::info!(
+            event = "cache_purged",
+            internal_id = %internal_id,
+            purged_keys = purged,
+            "Caché de respuestas purgada"
+        );
+        Ok(purged)
     }
 }
