@@ -447,7 +447,7 @@ impl AdminService {
                 max_requests: 50,
                 window_seconds: 60,
             },
-            max_scripting_body_bytes: 5_242_880,
+            max_scripting_body_bytes: crate::domain::models::DEFAULT_MAX_SCRIPTING_BODY_BYTES,
             scripting: crate::domain::models::ScriptingConfig {
                 enabled: false,
                 code: String::new(),

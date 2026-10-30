@@ -375,7 +375,13 @@ impl CouchDbRepository {
     }
 
     async fn fetch_doc_by_id(&self, doc_id: &str) -> Result<ClientConfig, ProxyError> {
-        self.fetch_raw_doc(doc_id).await
+        let mut config: ClientConfig = self.fetch_raw_doc(doc_id).await?;
+        // Documentos importados a mano pueden no traer `internal_id`; se adopta el `_id` (único)
+        // para que dos clientes sin él no compartan claves de caché.
+        if config.internal_id.is_empty() {
+            config.internal_id = config.id.clone();
+        }
+        Ok(config)
     }
 
     /// GET de un documento CouchDB deserializado a `T`. El 404 se normaliza a

@@ -16,7 +16,12 @@ pub enum ClientKind {
     Admin,
 }
 
+/// `#[serde(default)]` a nivel de contenedor: los documentos de CouchDB escritos fuera de la API
+/// (importaciones manuales, migraciones) pueden venir sin cualquier clave —incluido `_rev`— y aun
+/// así deben parsearse con el default de cada campo. Sin esto, una sola clave ausente tumbaba el
+/// cliente entero con un 500 en `/aq/`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClientConfig {
     #[serde(rename = "_id")]
     pub id: String,
@@ -27,35 +32,70 @@ pub struct ClientConfig {
     pub crypt_id: String,
     pub bearer_token_hash: String,
     pub config_version: u64,
-    #[serde(default)]
     pub kind: ClientKind,
     /// Cliente especial de confianza: salta la capa de whitelist de dominios y puede salir a
     /// CUALQUIER dominio. El anti-SSRF de IP (IP privadas, pinning DNS, resolución validada)
     /// **sigue aplicando igual** — wildcard solo salta la whitelist. Solo la API admin puede
-    /// fijarlo/modificarlo; el `PUT` de cliente ni lo recibe. `serde(default)`: los documentos
-    /// de CouchDB anteriores al campo parsean como `false`.
-    #[serde(default)]
+    /// fijarlo/modificarlo; el `PUT` de cliente ni lo recibe. Por defecto `false`.
     pub wildcard: bool,
     pub whitelist: Vec<String>,
     pub rate_limit: RateLimitConfig,
+    /// Tope del cuerpo que puede inspeccionar el sandbox Lua. Por defecto, el de `create_client`.
     pub max_scripting_body_bytes: u64,
+    /// Por defecto desactivado: un documento sin `scripting` nunca ejecuta código.
     pub scripting: ScriptingConfig,
     pub error_handling: ErrorHandlingConfig,
     /// Reglas de modificación de headers de respuesta (Cloudflare Ruleset Engine-like).
-    /// `serde(default)` mantiene compatibles los documentos de CouchDB anteriores al campo.
-    #[serde(default)]
     pub header_rules: Vec<HeaderRule>,
-    /// Sección de preview (`/mt/` y `/pv/`). `#[serde(default)]`: los documentos anteriores a la
-    /// feature parsean con `enabled=false` (fail-safe) y el preview queda desactivado.
-    #[serde(default)]
+    /// Sección de preview (`/mt/` y `/pv/`). Por defecto `enabled=false` (fail-safe).
     pub preview: PreviewConfig,
 }
 
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            rev: None,
+            // Mismo `type` que emite la vista `by_crypt_id`; un doc sin él queda presentable.
+            r#type: "client_config".to_string(),
+            internal_id: String::new(),
+            crypt_id: String::new(),
+            bearer_token_hash: String::new(),
+            config_version: 0,
+            kind: ClientKind::Client,
+            wildcard: false,
+            whitelist: Vec::new(),
+            rate_limit: RateLimitConfig::default(),
+            max_scripting_body_bytes: DEFAULT_MAX_SCRIPTING_BODY_BYTES,
+            scripting: ScriptingConfig::default(),
+            error_handling: ErrorHandlingConfig::default(),
+            header_rules: Vec::new(),
+            preview: PreviewConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct RateLimitConfig {
     pub max_requests: u32,
     pub window_seconds: u64,
 }
+
+impl Default for RateLimitConfig {
+    /// Mismo límite que asigna `create_client` a un cliente nuevo. Con `max_requests: 0` el
+    /// cliente quedaría bloqueado por completo, así que el default no puede ser el de `derive`.
+    fn default() -> Self {
+        Self {
+            max_requests: 50,
+            window_seconds: 60,
+        }
+    }
+}
+
+/// Tope de cuerpo del sandbox Lua que se asigna a los clientes nuevos y a los documentos que no
+/// declaran el campo. Está dentro de `MIN_SCRIPTING_BODY_BYTES..=MAX_SCRIPTING_BODY_BYTES`.
+pub const DEFAULT_MAX_SCRIPTING_BODY_BYTES: u64 = 5_242_880;
 
 /// Resultado de aplicar el rate limit. `current_count` y `retry_after_secs` salen del
 /// contador real (no de `max_requests + 1`) para que `Retry-After` y el log digan la verdad.
@@ -69,29 +109,28 @@ pub struct RateLimitDecision {
     pub degraded: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ScriptingConfig {
     pub enabled: bool,
-    #[serde(default)]
     pub code: String,
-    #[serde(default)]
     pub code_hash: String,
     /// Expresión del motor de reglas (`header_rules`): el script solo se ejecuta cuando la
     /// respuesta la cumple. Vacía = siempre (compatibilidad con configs anteriores).
-    #[serde(default)]
     pub expression: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ErrorHandlingConfig {
     pub mode: ErrorMode,
-    #[serde(default)]
     pub fallback_urls: HashMap<String, FallbackResource>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ErrorMode {
+    #[default]
     Transparent,
     Wrapped,
 }
@@ -364,6 +403,70 @@ mod tests {
         let config: ClientConfig =
             serde_json::from_str(&json_wildcard).expect("documento wildcard");
         assert!(config.wildcard);
+    }
+
+    #[test]
+    fn documento_sin_campos_de_scripting_parsea_con_defaults() {
+        // Documento real de CouchDB creado fuera de la API (`_id` con forma de UUID, no nanoid):
+        // no trae `max_scripting_body_bytes`, `scripting` ni `error_handling`. Antes daba 500 en
+        // `/aq/` con "missing field `max_scripting_body_bytes`".
+        let json = r#"{
+            "_id": "b116a9228725658d0d14f328c70350c1",
+            "_rev": "6-01dc86b3e2806b9918c7c1e6890249ed",
+            "type": "client_config",
+            "internal_id": "pixelphone",
+            "crypt_id": "pHnNeVj8fR83",
+            "bearer_token_hash": "sha256:ba0...9c1",
+            "config_version": 1,
+            "kind": "client",
+            "wildcard": true,
+            "whitelist": ["celebmafia.com", "example.com", "*"],
+            "rate_limit": {"max_requests": 1000, "window_seconds": 60},
+            "header_rules": [{
+                "expression": "true eq true",
+                "action": "set",
+                "action_parameters": {
+                    "headers": [{"name": "server", "operation": "remove"}]
+                }
+            }]
+        }"#;
+        let config: ClientConfig = serde_json::from_str(json).expect("documento importado a mano");
+        assert_eq!(config.internal_id, "pixelphone");
+        assert!(config.wildcard);
+        assert_eq!(
+            config.max_scripting_body_bytes,
+            DEFAULT_MAX_SCRIPTING_BODY_BYTES
+        );
+        assert!(!config.scripting.enabled);
+        assert_eq!(config.error_handling.mode, ErrorMode::Transparent);
+        assert_eq!(config.header_rules.len(), 1);
+        // `preview` tampoco viene: queda desactivado (fail-safe).
+        assert!(!config.preview.enabled);
+    }
+
+    #[test]
+    fn documento_con_solo_id_y_crypt_id_parsea_con_todos_los_defaults() {
+        let config: ClientConfig =
+            serde_json::from_str(r#"{"_id": "solo_id", "crypt_id": "abcdefghijkl"}"#)
+                .expect("cualquier clave ausente cae a su default");
+        assert_eq!(config.id, "solo_id");
+        assert_eq!(config.crypt_id, "abcdefghijkl");
+        assert_eq!(config.rev, None);
+        assert_eq!(config.r#type, "client_config");
+        assert_eq!(config.config_version, 0);
+        assert_eq!(config.kind, ClientKind::Client);
+        assert!(!config.wildcard);
+        assert!(config.whitelist.is_empty());
+        assert_eq!(config.rate_limit.max_requests, 50);
+        assert_eq!(config.rate_limit.window_seconds, 60);
+        assert_eq!(
+            config.max_scripting_body_bytes,
+            DEFAULT_MAX_SCRIPTING_BODY_BYTES
+        );
+        assert!(!config.scripting.enabled);
+        assert_eq!(config.error_handling.mode, ErrorMode::Transparent);
+        assert!(config.header_rules.is_empty());
+        assert!(!config.preview.enabled);
     }
 
     #[test]
