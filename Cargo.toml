@@ -106,6 +106,19 @@ regex = "1.13"
 # Backend `ring` (mismo que hickory-resolver): verificación RS256 del id_token contra JWKS.
 jsonwebtoken = "9"
 
+# --- Preview (/mt/ y /pv/) ---
+# `scraper`: parseo HTML (html5ever) + selectores CSS para la cascada de detectores de
+# metadatos. `encoding_rs`: decodifica el charset real declarado (UTF-16, windows-1252, ...)
+# en vez de asumir UTF-8 — link-preview-js solo lo reporta, aquí se aplica. `readability`:
+# extracción del texto principal (port de arc90) para la capacidad `content`. `htmd`: convierte
+# el HTML extraído a Markdown (port de Turndown). `mime`: routing por content-type.
+# Todo pure-Rust: compila en Windows con default features (sin el sidecar de render).
+scraper = "0.29"
+encoding_rs = "0.8"
+readability = "0.3"
+htmd = "0.5"
+mime = "0.3"
+
 # --- Misc ---
 bytes = "1.12"
 futures = "0.3"
