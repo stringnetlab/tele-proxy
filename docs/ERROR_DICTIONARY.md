@@ -24,7 +24,7 @@ Cabeceras obligatorias:
 | Cabecera        | Cuándo                                        | Valor                                             |
 | --------------- | --------------------------------------------- | ------------------------------------------------- |
 | `Content-Type`  | siempre                                       | `application/json`                                 |
-| `Retry-After`   | `rate_limit_exceeded` (429)                    | segundos restantes de la ventana                   |
+| `Retry-After`   | `rate_limit_exceeded` (429) y `render_unavailable` (503) | segundos restantes de la ventana / `RENDER_RETRY_AFTER_SECS` (30) |
 | `X-Cache`       | siempre que la respuesta sea del camino proxy  | `MISS` / `HIT` / `BYPASS` / `FALLBACK`             |
 
 `ErrorResponse` (en `domain/errors.rs`) es el cuerpo serializable de ese contrato.
@@ -34,7 +34,10 @@ Cabeceras obligatorias:
 Camino de respuesta: **short-circuit** = el filtro escribe la respuesta y devuelve `Ok(true)`;
 **degradación** = el request termina **200** con el cuerpo original o el fallback, y el error solo
 vive en el log; **5xx** = el callback devuelve `Err(BError)` y `fail_to_proxy` responde;
-**API** = lo produce Axum en `/api/v1/`.
+**API** = lo produce Axum en `/api/v1/`; **API (handler preview)** = lo produce Axum en los handlers
+de `/mt/` y `/pv/` del puerto del proxy (`interfaces/preview_handler.rs`), materializado por
+`ApiError::into_response` dentro de un span `preview{crypt_id}` (único punto de registro: el handler
+**no** llama a `log_domain_error`, que duplicaría el evento).
 
 | Código de Error          | Variante Rust          | Causa Raíz                                                | HTTP Status | Nivel de Log | Campos Estructurados                                        | Camino        |
 | ------------------------ | ---------------------- | --------------------------------------------------------- | ----------- | ------------ | ----------------------------------------------------------- | ------------- |
@@ -57,6 +60,11 @@ vive en el log; **5xx** = el callback devuelve `Err(BError)` y `fail_to_proxy` r
 | `unauthorized`           | `Unauthorized`         | Token Bearer inválido o ausente en `/api/v1/`              | 401         | WARN         | `ip_address`†, `reason`                                     | API           |
 | `forbidden`              | `Forbidden`            | Identidad válida sin permiso: admin en rutas de cliente/proxy, dominio de admin no permitido, autodesactivación o último admin activo | 403 | WARN | `reason`                        | API           |
 | `service_unavailable`    | `ServiceUnavailable`   | Función deshabilitada en el despliegue (p. ej. login Google sin credenciales, Valkey caído para sesiones) | 503 | WARN | `reason`             | API           |
+| `preview_disabled`       | `PreviewDisabled`      | `preview.enabled` falso (default fail-safe) o la capacidad pedida (`meta`/`content`/`screenshot`/`pdf`) no está activa para el cliente | 403 | WARN | `crypt_id`†, `reason` | API (handler preview) |
+| `invalid_preview_params` | `InvalidPreviewParams` | Parámetro de preview ausente, desconocido o fuera de rango (schema cerrada, D1): falta `url`, `format` distinto de `screenshot`/`pdf` | 400 | WARN | `crypt_id`†, `reason` | API (handler preview) |
+| `preview_payload_too_large` | `PreviewPayloadTooLarge` | El cuerpo a parsear en `/mt/` supera `preview.max_body_bytes`, o el binario renderizado supera `PREVIEW_ASSET_MAX_BYTES` | 413 | WARN | `crypt_id`†, `content_length`, `max_allowed` | API (handler preview) |
+| `render_unavailable`     | `RenderUnavailable`    | Sidecar browserless ausente, no configurado (`BROWSERLESS_URL` vacío) o no sano; `/pv/` degrada fail-soft (nunca 500) y lleva `Retry-After` | 503 | WARN | `crypt_id`†, `reason` | API (handler preview) |
+| `render_timeout`         | `RenderTimeout`        | El render de `/pv/` superó el deadline (`RENDER_TIMEOUT_MS` acotado por `preview.max_render_timeout_ms`) | 504 | WARN | `crypt_id`†, `url`, `timeout_ms` | API (handler preview) |
 | `config_not_found`       | `ConfigNotFound`       | La configuración del cliente no existe en CouchDB          | 404         | ERROR        | `internal_id`                                               | 5xx           |
 | `internal_error`         | `Internal`             | Fallo no clasificado del proxy o de la API de control      | 500         | ERROR        | `crypt_id`†, `reason`                                       | 5xx / API     |
 
@@ -80,7 +88,10 @@ Nivel de log, criterio aplicado: los intentos de escape o abuso (`ssrf_blocked`,
 (`domain_not_whitelisted`, `invalid_url_format`, `unauthorized`), los límites de recursos del propio
 cliente (`rate_limit_exceeded`, `payload_too_large`) y las degradaciones del sandbox (`script_timeout`,
 `script_memory_limit`, `webhook_timeout`, `webhook_failed`) son **WARN**, porque el servicio sigue
-prestando respuesta. De los dos últimos el cliente nunca ve un 502: `application/lua_engine.rs:384`
+prestando respuesta. Los rechazos de preview (`preview_disabled`, `invalid_preview_params`,
+`preview_payload_too_large`) y los fallos fail-soft del render (`render_unavailable`, `render_timeout`)
+también son **WARN**: o son política esperable por configuración del cliente, o degradación del sidecar
+— nunca un fallo del núcleo del proxy, que sigue sirviendo `/aq/` con normalidad. De los dos últimos el cliente nunca ve un 502: `application/lua_engine.rs:384`
 registra el fallo y devuelve al script la cadena `webhook failed: <error_code>`; el 502 del diccionario
 es el `to_http_status()` de la variante, y solo se convertiría en respuesta si el script propagara el
 error. Lo que sí aborta la petición son `ssrf_blocked` y `domain_not_whitelisted` surgidos de un

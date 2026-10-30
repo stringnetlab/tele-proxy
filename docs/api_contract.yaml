@@ -206,6 +206,259 @@ paths:
                     error: "dns_resolution_failed"
                     message: "Falló la resolución DNS de unknown.example: nxdomain"
 
+  /mt/{crypt_id}:
+    get:
+      summary: Metadata de una URL (preview enriquecido)
+      description: |
+        Endpoint público del puerto del proxy. Obtiene la URL, la decodifica respetando el charset
+        (BOM → `Content-Type` → `<meta charset>`) y extrae una cascada de detectores: Open Graph y
+        Twitter Card primero, luego JSON-LD, `<meta>` genéricos y DOM. Para HTML también puede
+        extraer el contenido principal (`content=1`) vía readability + Markdown, y siempre reporta
+        si la respuesta parecía una pantalla antibot.
+
+        Reutiliza la cadena anti-SSRF de `/aq/` (validación estricta, whitelist del cliente,
+        resolución DNS segura y pinning de la IP). Responde en formato JSend: `{ status, statusCode,
+        data }`. Las respuestas se cachean (`X-Cache`) según el `ttl` y `force` pedidos y el
+        `preview.ttl_max_seconds` del cliente.
+
+        También se acepta la forma con barra final `/mt/{crypt_id}/`.
+      parameters:
+        - name: crypt_id
+          in: path
+          required: true
+          description: ID público del cliente (nanoid de 12 caracteres URL-safe).
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]{12}$"
+            example: "V1StGXR8_Z5j"
+        - name: url
+          in: query
+          required: true
+          description: URL a inspeccionar, URL-encoded. Solo `http`/`https`, sin credenciales ni fragmento.
+          schema:
+            type: string
+            format: uri
+            example: "https%3A%2F%2Fexample.com%2Farticulo"
+        - name: content
+          in: query
+          required: false
+          description: |
+            `1`/`true`/`yes`/`on` activa la extracción de contenido principal (texto + Markdown).
+            Solo aplica si el cliente tiene `preview.capabilities.content` y la respuesta es HTML.
+          schema:
+            type: string
+            example: "1"
+        - name: ttl
+          in: query
+          required: false
+          description: TTL de caché pedido en segundos; se limita a `preview.ttl_max_seconds` del cliente.
+          schema:
+            type: integer
+            minimum: 1
+            example: 3600
+        - name: force
+          in: query
+          required: false
+          description: "`1`/`true`/`yes`/`on` fuerza la reobtención ignorando la caché."
+          schema:
+            type: string
+            example: "0"
+      responses:
+        "200":
+          description: Metadata extraída (JSend success)
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+            X-Degraded-Mode:
+              description: Presente cuando el cliente opera en modo degradado (CouchDB/Valkey caídos).
+              schema:
+                type: string
+                example: "true"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreviewResponse"
+        "400":
+          description: Parámetros inválidos (URL ausente, malformada o con esquema prohibido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missing_url:
+                  value: { error: "invalid_preview_params", message: "Parámetros de preview inválidos: falta el parámetro obligatorio `url`" }
+                invalid_url:
+                  value: { error: "invalid_url_format", message: "Formato de URL inválido: URL contains credentials" }
+        "403":
+          description: Preview deshabilitado para el cliente, dominio fuera de whitelist o SSRF bloqueado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                preview_disabled:
+                  value: { error: "preview_disabled", message: "Preview desactivado: el cliente no tiene `preview.enabled`" }
+                capability_off:
+                  value: { error: "preview_disabled", message: "Preview desactivado: la capacidad `content` no está activa para este cliente" }
+                domain_not_whitelisted:
+                  value: { error: "domain_not_whitelisted", message: "Dominio no permitido: malicious.com" }
+                ssrf_blocked:
+                  value: { error: "ssrf_blocked", message: "Bloqueo anti-SSRF: resolves to private IP" }
+        "404":
+          description: crypt_id inválido o sin configuración
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "invalid_crypt_id", message: "crypt_id inválido: not found" }
+        "413":
+          description: La respuesta del origen supera `preview.max_body_bytes`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "preview_payload_too_large", message: "Cuerpo de preview demasiado grande: 3145728 bytes (máx: 2097152)" }
+        "429":
+          description: Rate limit de preview excedido
+          headers:
+            Retry-After:
+              schema: { type: integer, example: 60 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "rate_limit_exceeded", message: "Límite de peticiones excedido" }
+        "502":
+          description: El origen falló o no resolvió DNS
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "upstream_error", message: "Error del origen: status=503" }
+
+  /pv/{crypt_id}:
+    get:
+      summary: Preview renderizado (screenshot PNG o PDF)
+      description: |
+        Endpoint público del puerto del proxy. Delega el render en el sidecar browserless (Chromium)
+        y devuelve los bytes del binario directamente (`image/png` o `application/pdf`), sin envoltura
+        JSend. Antes de renderizar aplica la misma validación anti-SSRF que `/aq/` y `/mt/` sobre la
+        URL destino.
+
+        Es fail-soft: si el sidecar no está configurado (`BROWSERLESS_URL` vacío), no está sano o
+        falla, responde 503 `render_unavailable` con `Retry-After`; si excede el timeout, 504
+        `render_timeout`. Nunca devuelve 500 por ausencia del sidecar.
+
+        También se acepta la forma con barra final `/pv/{crypt_id}/`.
+      parameters:
+        - name: crypt_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]{12}$"
+            example: "V1StGXR8_Z5j"
+        - name: url
+          in: query
+          required: true
+          description: URL a renderizar, URL-encoded. Solo `http`/`https`, sin credenciales ni fragmento.
+          schema:
+            type: string
+            format: uri
+            example: "https%3A%2F%2Fexample.com%2F"
+        - name: format
+          in: query
+          required: false
+          description: "`screenshot` (por omisión) o `pdf`."
+          schema:
+            type: string
+            enum: [screenshot, pdf]
+            example: "screenshot"
+        - name: fullPage
+          in: query
+          required: false
+          description: |
+            `1`/`true`/`yes`/`on` captura la página completa; por omisión usa `preview.screenshot.max_full_page`.
+            Solo aplica a `format=screenshot`.
+          schema:
+            type: string
+            example: "1"
+        - name: timeout
+          in: query
+          required: false
+          description: Timeout de render pedido en ms; se limita a `RENDER_TIMEOUT_MS` y `preview.max_render_timeout_ms`.
+          schema:
+            type: integer
+            minimum: 1
+            example: 20000
+      responses:
+        "200":
+          description: Binario renderizado
+          headers:
+            X-Cache:
+              $ref: "#/components/headers/X-Cache"
+          content:
+            image/png:
+              schema: { type: string, format: binary, description: Screenshot PNG }
+            application/pdf:
+              schema: { type: string, format: binary, description: PDF }
+        "400":
+          description: Parámetros inválidos (URL ausente/malformada o `format` desconocido)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                bad_format:
+                  value: { error: "invalid_preview_params", message: "Parámetros de preview inválidos: formato desconocido: gif (usa screenshot|pdf)" }
+                missing_url:
+                  value: { error: "invalid_preview_params", message: "Parámetros de preview inválidos: falta el parámetro obligatorio `url`" }
+        "403":
+          description: Preview o la capacidad de render deshabilitada, whitelist o SSRF
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                preview_disabled:
+                  value: { error: "preview_disabled", message: "Preview desactivado: el cliente no tiene `preview.enabled`" }
+                capability_off:
+                  value: { error: "preview_disabled", message: "Preview desactivado: la capacidad `screenshot` no está activa para este cliente" }
+        "404":
+          description: crypt_id inválido o sin configuración
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "invalid_crypt_id", message: "crypt_id inválido: not found" }
+        "429":
+          description: Rate limit de preview excedido
+          headers:
+            Retry-After:
+              schema: { type: integer, example: 60 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "rate_limit_exceeded", message: "Límite de peticiones excedido" }
+        "503":
+          description: Sidecar de render ausente, no configurado o no sano (fail-soft)
+          headers:
+            Retry-After:
+              schema: { type: integer, example: 30 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "render_unavailable", message: "Render no disponible: sidecar de render no configurado" }
+        "504":
+          description: El render superó el timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example: { error: "render_timeout", message: "Timeout del render: 20000ms (url=https://example.com/)" }
+
   # ========================================
   # ENDPOINTS DE CONTROL (Bearer Token)
   # ========================================
@@ -803,6 +1056,185 @@ components:
           description: Display del `ProxyError` (dominio/errors.rs); no un texto libre
           example: "Dominio no permitido: malicious.com"
 
+    PreviewConfig:
+      type: object
+      description: |
+        Sección `preview` de la configuración del cliente (D6). `enabled` es fail-safe: si el
+        documento no la trae, nace `false` y `/mt/` y `/pv/` responden 403 `preview_disabled`.
+        Los topes duros (`max_body_bytes`, `max_render_timeout_ms`, ...) se validan contra los
+        `MAX_PREVIEW_*` de `domain/validators.rs`; fuera de rango → 400 `invalid_config`.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+          description: Interruptor maestro de `/mt/` y `/pv/` para el cliente.
+        capabilities:
+          type: object
+          description: Capacidades finas. Cada una se comprueba en su endpoint antes de trabajar.
+          properties:
+            meta:
+              type: boolean
+              default: true
+            content:
+              type: boolean
+              default: true
+              description: Extracción de contenido principal (`content=1` en `/mt/`).
+            screenshot:
+              type: boolean
+              default: false
+            pdf:
+              type: boolean
+              default: false
+        rate_limit:
+          type: object
+          description: Límite propio de preview (independiente del de `/aq/`).
+          properties:
+            max_requests:
+              type: integer
+              minimum: 1
+              example: 60
+            window_seconds:
+              type: integer
+              minimum: 1
+              example: 60
+        ttl_default_seconds:
+          type: integer
+          example: 86400
+          description: TTL de caché por omisión cuando la petición no pide `ttl`.
+        ttl_max_seconds:
+          type: integer
+          example: 2678400
+          description: Techo del `ttl` pedido por query; debe ser ≥ `ttl_default_seconds`.
+        max_render_timeout_ms:
+          type: integer
+          example: 45000
+          description: Techo del timeout de render por cliente (≤ `MAX_PREVIEW_RENDER_TIMEOUT_MS`).
+        max_body_bytes:
+          type: integer
+          example: 2097152
+          description: Tope del cuerpo a parsear en `/mt/` (≤ `MAX_PREVIEW_BODY_BYTES`).
+        screenshot:
+          type: object
+          properties:
+            max_full_page:
+              type: boolean
+              default: true
+              description: Valor por omisión de `fullPage` cuando la query no lo fija.
+            default_viewport:
+              type: array
+              items: { type: integer }
+              minItems: 2
+              maxItems: 2
+              example: [1920, 1080]
+              description: "`[ancho, alto]`; cada lado ≤ `MAX_PREVIEW_VIEWPORT_SIDE`."
+
+    PreviewResponse:
+      type: object
+      description: Envolvente JSend de `/mt/`. En éxito `status="success"` y `data` relleno.
+      required: [status, statusCode]
+      properties:
+        status:
+          type: string
+          enum: [success, fail, error]
+          example: "success"
+        statusCode:
+          type: integer
+          example: 200
+        data:
+          $ref: "#/components/schemas/PreviewData"
+
+    PreviewData:
+      type: object
+      description: |
+        Resultado de la cascada de detectores (OG/Twitter → JSON-LD → `<meta>` → DOM → content-type).
+        Todo campo salvo `antibot` se omite cuando no se encontró nada (`skip_serializing_if`).
+      properties:
+        url:
+          type: string
+          format: uri
+          description: URL final tras los redirects revalidados.
+        title: { type: string }
+        description: { type: string }
+        author: { type: string }
+        date: { type: string }
+        lang: { type: string }
+        publisher: { type: string }
+        siteName: { type: string }
+        image:
+          $ref: "#/components/schemas/MediaInfo"
+        logo:
+          $ref: "#/components/schemas/MediaInfo"
+        video:
+          $ref: "#/components/schemas/MediaInfo"
+        audio:
+          $ref: "#/components/schemas/MediaInfo"
+        favicons:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaInfo"
+        openGraph:
+          type: object
+          additionalProperties: { type: string }
+          description: Metadatos `og:*` con el prefijo retirado.
+          example: { title: "Ejemplo", image: "https://example.com/og.png" }
+        twitter:
+          type: object
+          additionalProperties: { type: string }
+          description: Metadatos `twitter:*` con el prefijo retirado.
+        jsonLd:
+          type: array
+          description: Objetos JSON-LD tal cual se extrajeron del `<script type="application/ld+json">`.
+          items:
+            type: object
+        content:
+          $ref: "#/components/schemas/ContentInfo"
+        antibot:
+          $ref: "#/components/schemas/AntibotInfo"
+
+    MediaInfo:
+      type: object
+      description: Objeto de media reutilizable (imagen/logo/video/audio/favicon).
+      properties:
+        url: { type: string, format: uri }
+        type:
+          type: string
+          description: MIME resuelto (content-type del origen o inferido del sufijo).
+          example: "image/png"
+        size: { type: integer, description: Bytes }
+        sizePretty:
+          type: string
+          description: "`size` formateado, base 1000, una cifra decimal."
+          example: "84.1 KB"
+        width: { type: integer }
+        height: { type: integer }
+        duration: { type: number, description: "Segundos (video/audio)" }
+
+    ContentInfo:
+      type: object
+      description: Contenido principal extraído (solo con `content=1` y capacidad `content`).
+      properties:
+        text: { type: string, description: Texto plano del artículo }
+        markdown: { type: string, description: "`text`/HTML del artículo convertido a Markdown (htmd)" }
+
+    AntibotInfo:
+      type: object
+      description: |
+        Siempre presente en `PreviewData` (D3): `detected=false` es información útil. La detección
+        es declarativa (`domain/preview/antibot.rs`): cabeceras/cookies/HTML de proveedores conocidos.
+      required: [detected]
+      properties:
+        detected:
+          type: boolean
+          example: false
+        provider:
+          type: string
+          description: Nombre del proveedor detectado (p. ej. `cloudflare`, `datadome`).
+          example: "datadome"
+        technique:
+          type: string
+          enum: [javascript, captcha, waf, cookie]
+          example: "captcha"
+
     ClientConfigResponse:
       type: object
       properties:
@@ -880,6 +1312,8 @@ components:
           description: |
             Reglas de modificación de headers de respuesta. El lenguaje de expresiones y los
             límites completos viven en `docs/HEADER_RULES.md` (sintaxis Cloudflare Rules Engine).
+        preview:
+          $ref: "#/components/schemas/PreviewConfig"
 
     ClientConfigUpdate:
       type: object
@@ -887,7 +1321,6 @@ components:
         Actualización parcial de la API de cliente (`PUT /api/v1/clients/config`). No incluye
         ni acepta `wildcard` (salida libre) ni `kind`: esos campos son solo-admin y ni siquiera
         deserializan en este payload; activarlos desde el cliente es imposible por construcción.
-      type: object
       properties:
         whitelist:
           type: array
@@ -949,6 +1382,8 @@ components:
             Máximo 50 reglas. Cada expresión se valida (sintaxis, tipos, regex de `matches`)
             antes de escribir: un error devuelve 400 `invalid_config` con el campo concreto,
             p. ej. `header_rules[0].expression`.
+        preview:
+          $ref: "#/components/schemas/PreviewConfig"
 
     HeaderRule:
       type: object

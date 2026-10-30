@@ -212,6 +212,60 @@ Operadores: `eq`/`ne` (o `==`/`!=`), `in { ... }`, `and`/`or`/`not`, paréntesis
 
 ---
 
+## Preview (`/mt/` y `/pv/`)
+
+La sección `preview` habilita los endpoints públicos de preview del puerto del proxy:
+`GET /mt/{crypt_id}?url=...` (metadatos enriquecidos, JSend) y `GET /pv/{crypt_id}?url=...`
+(render de screenshot PNG o PDF vía el sidecar browserless). Ambos reutilizan la cadena anti-SSRF
+de `/aq/` (validación estricta, whitelist del cliente, resolución DNS segura y pinning de IP) y
+respetan la whitelist y el `wildcard` del cliente. Contrato completo en `docs/api_contract.yaml`;
+variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
+
+```json
+"preview": {
+  "enabled": true,
+  "capabilities": { "meta": true, "content": true, "screenshot": false, "pdf": false },
+  "rate_limit": { "max_requests": 60, "window_seconds": 60 },
+  "ttl_default_seconds": 86400,
+  "ttl_max_seconds": 2678400,
+  "max_render_timeout_ms": 45000,
+  "max_body_bytes": 2097152,
+  "screenshot": { "max_full_page": true, "default_viewport": [1920, 1080] }
+}
+```
+
+| Campo | Tipo | Default | Descripción |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Interruptor maestro. **Fail-safe**: si el documento no trae la sección, nace deshabilitada y `/mt/` y `/pv/` responden `403 preview_disabled`. |
+| `capabilities.meta` | `bool` | `true` | Permite `/mt/`. Se comprueba antes de obtener la URL. |
+| `capabilities.content` | `bool` | `true` | Permite la extracción de contenido principal (`content=1` en `/mt/`); solo aplica a respuestas HTML. |
+| `capabilities.screenshot` | `bool` | `false` | Permite `/pv/?format=screenshot`. |
+| `capabilities.pdf` | `bool` | `false` | Permite `/pv/?format=pdf`. |
+| `rate_limit` | objeto | `60 / 60` | Límite propio de preview, independiente del de `/aq/`. Contador distribuido en Valkey por `crypt_id` + capacidad. |
+| `ttl_default_seconds` | `int` | `86400` | TTL de caché cuando la petición no pide `ttl`. |
+| `ttl_max_seconds` | `int` | `2678400` | Techo del `ttl` pedido por query; debe ser ≥ `ttl_default_seconds`. |
+| `max_render_timeout_ms` | `int` | `45000` | Techo del timeout de render por cliente; gana el menor frente a `RENDER_TIMEOUT_MS` y al `timeout` de la query. |
+| `max_body_bytes` | `int` | `2097152` | Tope del cuerpo HTML a **parsear** en `/mt/`. Si el origen lo supera → `413 preview_payload_too_large`. |
+| `screenshot.max_full_page` | `bool` | `true` | Valor por omisión de `fullPage` cuando la query no lo fija. |
+| `screenshot.default_viewport` | `[int; 2]` | `[1920, 1080]` | `[ancho, alto]` del viewport. |
+
+**Comportamiento**:
+
+- `PUT /config` con `preview` sustituye la sección completa y la valida contra las cotas
+  `MAX_PREVIEW_*` de `domain/validators.rs` (`ttl_max_seconds ≤ 2678400`,
+  `max_render_timeout_ms ≤ 120000`, `max_body_bytes ≤ 10485760`, cada lado del viewport
+  `≤ 4096`, `ttl_default ≤ ttl_max`, rate limit dentro de `1..=10000` / `1..=3600`). Fuera de
+  cota → `400 invalid_config` con el campo concreto (p. ej. `preview.ttl_max_seconds`).
+- El campo es opcional: los documentos anteriores a él se cargan con `PreviewConfig::default()`
+  (deshabilitada), gracias a `#[serde(default)]`.
+- `/pv/` es **fail-soft**: si el sidecar no está configurado (`BROWSERLESS_URL` vacío), no está
+  sano o falla, responde `503 render_unavailable` con `Retry-After: 30`; si supera el deadline,
+  `504 render_timeout`. Nunca devuelve 500 por ausencia del sidecar, y `/mt/` no depende de él.
+- Las respuestas de `/mt/` se cachean en Valkey (`X-Cache: HIT/MISS`); `force=1` fuerza la
+  reobtención y `ttl` acota la vida de la entrada contra `ttl_max_seconds`.
+
+---
+
 ## Configuración del Cliente Demo (Seed)
 
 Cuando la base de datos CouchDB está vacía (primer despliegue), el proxy crea automáticamente un
@@ -228,9 +282,12 @@ cliente demo con permisos mínimos para pruebas:
 | `max_scripting_body_bytes` | 0 |
 | `error_handling.mode` | `transparent` |
 | `fallback_urls` | Vacío |
+| `preview` | `enabled: true`, capacidades `meta`+`content` activas (`screenshot`/`pdf` off), rate limit y topes por default |
 
 **Propósito**: permitir pruebas inmediatas tras el despliegue sin configuración manual. Los permisos
-son intencionalmente restrictivos: solo un dominio, rate limit bajo, sin scripting.
+son intencionalmente restrictivos: solo un dominio, rate limit bajo, sin scripting. El preview nace
+habilitado en sus capacidades sin sidecar (`meta`/`content`) para que `/mt/` se pueda probar de
+inmediato; `/pv/` exige además el sidecar browserless (ver `docs/ENVIRONMENT.md` § Preview).
 
 > **Solo en `MODO=desarrollo`**: en cualquier otro modo el seed no se ejecuta (un cliente con
 > token conocido en producción sería una puerta trasera). El log de seed solo imprime el
@@ -297,6 +354,7 @@ degraded con permisos ultra-restrictivos:
 | `rate_limit` | 3 requests / 60 segundos |
 | `scripting` | Deshabilitado |
 | `error_handling.mode` | `transparent` |
+| `preview` | Deshabilitado (`PreviewConfig::default()`, `enabled: false`) → `/mt/` y `/pv/` responden `403 preview_disabled` |
 
 Esto garantiza que un fallo de CouchDB no convierta el proxy en un open relay, sino que bloquee
 todo el tráfico de forma segura.

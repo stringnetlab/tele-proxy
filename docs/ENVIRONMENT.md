@@ -220,6 +220,26 @@ internos/loopback, así que la cuota por instancia es suficiente y no hace falta
 distribuido de Valkey (ese sigue reservado al límite por `crypt_id` del proxy público). Las
 rutas de auth además llevan body cap de 8 KB (`DefaultBodyLimit`).
 
+## Preview
+
+Variables de los endpoints públicos de preview `/mt/{crypt_id}` (metadata) y `/pv/{crypt_id}`
+(render). Ambas viven en el puerto del proxy y reutilizan su cadena anti-SSRF. La habilitación es
+**por cliente** (`preview.enabled` + `preview.capabilities.*` en el documento CouchDB, ver
+`docs/CLIENT_CONFIG.md`); estas variables solo configuran el sidecar de render y sus topes.
+
+| Variable | Descripción | Default | Req | Dónde |
+| --- | --- | --- | --- | --- |
+| `BROWSERLESS_URL` | URL base del sidecar browserless (Chromium) para `/pv/`. **Vacío = `/pv/` degradado**: responde 503 `render_unavailable` con `Retry-After` (fail-soft, nunca 500). `/mt/` no depende del sidecar y sigue funcionando. En compose: `http://browserless:3000` | vacío (`/pv/` deshabilitado) | No | **activa** — `env_var_or`; `BrowserlessRenderer::new` la filtra a `None` si está en blanco |
+| `BROWSERLESS_TOKEN` | Token que autentica las llamadas al sidecar (se añade como `?token=`). Debe coincidir con el `TOKEN` del servicio `browserless` del compose. Vacío = sin autenticación (solo aceptable si el sidecar no es alcanzable fuera de `red-preview`) | vacío | No | **activa** — `env_var_or`; `BrowserlessRenderer::with_token` |
+| `RENDER_TIMEOUT_MS` | Techo del deadline de render del cliente HTTP hacia el sidecar. La petición lo acota además contra `preview.max_render_timeout_ms` del cliente (gana el menor). Fuera de `1..=120000` el arranque **falla**. Debe quedar **por debajo** del `TIMEOUT` del sidecar para que sea el proxy quien cancele y devuelva 504 `render_timeout` | `30000` | No | **activa** — `parse_in_range`; `BrowserlessRenderer::new` |
+| `PREVIEW_ASSET_MAX_BYTES` | Tope del binario renderizado (PNG/PDF) que el sidecar puede devolver. Si la salida lo supera → 413 `preview_payload_too_large`. Fuera de `1..=52428800` el arranque **falla**. No confundir con `preview.max_body_bytes` (por cliente), que es el tope del HTML a **parsear** en `/mt/` | `10485760` | No | **activa** — `parse_in_range`; `BrowserlessRenderer::render` |
+
+> El sidecar se aísla en la red `red-preview` del compose y **no** se une a `red-velone`/
+> `dokploy-network`/`default`, que son las que alcanzan CouchDB y Valkey: así el Chromium puede
+> salir a Internet a renderizar páginas públicas pero no tiene ruta a los almacenes internos
+> (`docs/PLAN_PREVIEW.md` D7). Un bridge de Docker sigue permitiendo egreso a Internet; el bloqueo
+> total de destinos exigiría un firewall o enrutar el Chromium a través de tele-proxy como proxy HTTP.
+
 ## Validaciones
 
 Rangos aceptados; fuera de ellos el arranque **falla** (no se degrada al default):
@@ -227,6 +247,8 @@ Rangos aceptados; fuera de ellos el arranque **falla** (no se degrada al default
 | Regla | Rango | Quién la aplica | Estado |
 | --- | --- | --- | --- |
 | Timeouts en ms (`*_TIMEOUT_MS`) | `1..=60000` | `parse_in_range` (`main.rs:75`), invocado desde `AppConfig::from_env` | **activa** para `LUA_TIMEOUT_MS` y `WEBHOOK_TIMEOUT_MS`; las demás (`COUCHDB_`, `VALKEY_`, `DNS_`) están designadas |
+| `RENDER_TIMEOUT_MS` | `1..=120000` | `parse_in_range` en `AppConfig::from_env` | **activa** — fuera de rango aborta el arranque (rango propio, no el de `*_TIMEOUT_MS`) |
+| `PREVIEW_ASSET_MAX_BYTES` | `1..=52428800` | idem | **activa** — tope del binario renderizado |
 | `ADMIN_SESSION_TTL_SECONDS` | `300..=86400` | `parse_in_range` en `admin_settings_from_env` | **activa** |
 | `ADMIN_OAUTH_STATE_TTL_SECONDS` | `60..=3600` | idem | **activa** |
 | `ADMIN_LOGIN_RATE_LIMIT_REQUESTS` | `1..=100` | idem | **activa** |
@@ -287,6 +309,10 @@ services:
       - LUA_TIMEOUT_MS=${LUA_TIMEOUT_MS:-200}
       - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
       - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
+      - BROWSERLESS_URL=${BROWSERLESS_URL:-http://browserless:3000}
+      - BROWSERLESS_TOKEN=${BROWSERLESS_TOKEN:-}
+      - RENDER_TIMEOUT_MS=${RENDER_TIMEOUT_MS:-30000}
+      - PREVIEW_ASSET_MAX_BYTES=${PREVIEW_ASSET_MAX_BYTES:-10485760}
     stop_grace_period: 15s
 ```
 

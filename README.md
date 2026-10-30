@@ -718,6 +718,8 @@ degradan al body original en lugar de romper la respuesta.
 | `docs/BDD.md` + `specs/*.feature` | Escenarios de comportamiento (Gherkin) |
 | `docs/RUST_STYLE_GUIDE.md` | Convenciones de código Rust del proyecto |
 | `docs/api_contract.yaml` | Contrato OpenAPI de la API de control |
+| `docs/PLAN_MICROLINK.md` | Plan de mejoras derivado del análisis de html-get, browserless, metascraper y skills |
+| `docs/PLAN_PREVIEW.md` | Plan de la API de preview (`/pv/`): metadatos, OpenGraph, oEmbed, contenido, screenshot y PDF |
 | `config/dns_resolvers.json` | Cadena de resolvedores DoT compilada en el binario |
 
 ---
