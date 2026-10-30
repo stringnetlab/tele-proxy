@@ -96,9 +96,9 @@ pub enum ProxyError {
     #[error("Servicio no disponible: {reason}")]
     ServiceUnavailable { reason: String },
 
-    /// Preview desactivado para el cliente: la sección `preview.enabled` es `false` (o el
-    /// documento no la trae, que es el default fail-safe). 403, no 404: el endpoint existe, el
-    /// cliente no tiene la capacidad.
+    /// Endpoint de preview desactivado para el cliente: `preview.meta_enabled` en `/mt/`,
+    /// `preview.enabled` en `/pv/`, o la capacidad concreta apagada. 403, no 404: el endpoint
+    /// existe, el cliente no tiene la capacidad.
     #[error("Preview desactivado: {reason}")]
     PreviewDisabled { reason: String },
 

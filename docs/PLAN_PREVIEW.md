@@ -167,8 +167,9 @@ convierte a Markdown; si la extracción sale vacía se omite `content`.
 - **Tope de cuerpo a parsear**: `preview.max_body_bytes` (default **2 MB**); `read_body_capped`
   corta y el error se traduce a `preview_payload_too_large` (413). Los binarios (imagen/video/audio
   servidos directos) no se parsean: se reportan como `MediaInfo` con URL y MIME.
-- **Modo degradado**: CouchDB caído → `preview.enabled=false` implícito (`#[serde(default)]`) → 403
-  `preview_disabled`. Valkey caído → preview funciona sin caché (`X-Degraded-Mode: true`,
+- **Modo degradado**: CouchDB caído → config degradada (`ClientConfig::default_degraded`) → `/pv/`
+  responde 403 `preview_disabled` (`enabled=false`) y `/mt/` sigue sirviendo si el proceso tiene
+  config. Valkey caído → preview funciona sin caché (`X-Degraded-Mode: true`,
   `X-Cache` según corresponda); `set_preview` ya es no-op si Valkey no responde.
 - **Rate limit**: bucket propio por capacidad `rlp:{crypt_id}:{capability}` (más estricto que `/aq/`;
   el render es caro). Default `60 req / 60 s` por capacidad.
@@ -180,6 +181,7 @@ convierte a Markdown; si la extracción sale vacía se omite `content`.
 ```json
 "preview": {
   "enabled": true,
+  "meta_enabled": true,
   "capabilities": { "meta": true, "content": true, "screenshot": false, "pdf": false },
   "rate_limit": { "max_requests": 60, "window_seconds": 60 },
   "ttl_default_seconds": 86400,
@@ -191,7 +193,9 @@ convierte a Markdown; si la extracción sale vacía se omite `content`.
 ```
 
 - `#[serde(default)]` a nivel de struct y campos: documentos antiguos de CouchDB parsean con
-  `enabled=false` (fail-safe) y no cambian de comportamiento.
+  `enabled=false` (fail-safe para `/pv/`) y `meta_enabled=true` (`/mt/` disponible).
+- Interruptores separados: `meta_enabled` gobierna `/mt/` (metadatos) y `enabled` gobierna
+  `/pv/` (render). Apagar el render no apaga los metadatos.
 - Defaults por capacidad: `meta` y `content` **activas** (baratas, fetch + parseo); `screenshot` y
   `pdf` **apagadas** hasta que el operador las encienda.
 - Cotas en `validators.rs` (`validate_preview`): `ttl_default ≤ ttl_max ≤ 31 d`,
@@ -291,7 +295,7 @@ Dependencias añadidas (`Cargo.toml`), todas 100 % Rust puro (compilan en Window
 
 | Variante | HTTP | Código | Disparador |
 |---|---|---|---|
-| `PreviewDisabled` | 403 | `preview_disabled` | `preview.enabled=false` o capacidad concreta apagada |
+| `PreviewDisabled` | 403 | `preview_disabled` | `preview.meta_enabled=false` (`/mt/`), `preview.enabled=false` (`/pv/`) o capacidad concreta apagada |
 | `InvalidPreviewParams` | 400 | `invalid_preview_params` | falta `url`, `format` desconocido, etc. |
 | `PreviewPayloadTooLarge` | 413 | `preview_payload_too_large` | cuerpo del origen supera `max_body_bytes` |
 | `RenderUnavailable` | 503 | `render_unavailable` | sidecar no configurado/caído |

@@ -18,9 +18,13 @@ pub const DEFAULT_PREVIEW_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PreviewConfig {
-    /// Interruptor maestro. `false` (default) → cualquier `/mt/` o `/pv/` devuelve 403
-    /// `preview_disabled`.
+    /// Interruptor de `/pv/` (render screenshot/PDF). `false` (default) → `/pv/` responde 403
+    /// `preview_disabled`. No afecta a `/mt/`, que tiene su propio interruptor.
     pub enabled: bool,
+    /// Interruptor de `/mt/` (metadatos). Separado de `enabled` a propósito: los metadatos son un
+    /// fetch + parseo barato y no dependen del sidecar, así que apagar el render no debe apagarlos.
+    /// `true` (default) → `/mt/` disponible si además `capabilities.meta` está activa.
+    pub meta_enabled: bool,
     pub capabilities: PreviewCapabilities,
     /// Bucket propio, más estricto que el de `/aq/` porque el fetch y sobre todo el render son
     /// caros. Se aplica por capacidad (`rlp:{crypt_id}:{cap}`).
@@ -38,6 +42,7 @@ impl Default for PreviewConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            meta_enabled: true,
             capabilities: PreviewCapabilities::default(),
             rate_limit: RateLimitConfig {
                 max_requests: DEFAULT_PREVIEW_RATE_LIMIT_REQUESTS,
@@ -100,6 +105,10 @@ mod tests {
     fn preview_desactivado_por_defecto() {
         let config = PreviewConfig::default();
         assert!(!config.enabled, "fail-safe: enabled debe nacer en false");
+        assert!(
+            config.meta_enabled,
+            "los metadatos de `/mt/` no dependen del render"
+        );
         assert!(config.capabilities.meta);
         assert!(!config.capabilities.screenshot);
     }

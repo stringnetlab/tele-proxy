@@ -216,7 +216,8 @@ Operadores: `eq`/`ne` (o `==`/`!=`), `in { ... }`, `and`/`or`/`not`, paréntesis
 
 La sección `preview` habilita los endpoints públicos de preview del puerto del proxy:
 `GET /mt/{crypt_id}?url=...` (metadatos enriquecidos, JSend) y `GET /pv/{crypt_id}?url=...`
-(render de screenshot PNG o PDF vía el sidecar browserless). Ambos reutilizan la cadena anti-SSRF
+(render de screenshot PNG o PDF vía el sidecar browserless). Cada endpoint tiene su interruptor:
+`meta_enabled` para `/mt/` y `enabled` para `/pv/`. Ambos reutilizan la cadena anti-SSRF
 de `/aq/` (validación estricta, whitelist del cliente, resolución DNS segura y pinning de IP) y
 respetan la whitelist y el `wildcard` del cliente. Contrato completo en `docs/api_contract.yaml`;
 variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
@@ -224,6 +225,7 @@ variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
 ```json
 "preview": {
   "enabled": true,
+  "meta_enabled": true,
   "capabilities": { "meta": true, "content": true, "screenshot": false, "pdf": false },
   "rate_limit": { "max_requests": 60, "window_seconds": 60 },
   "ttl_default_seconds": 86400,
@@ -236,8 +238,9 @@ variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
 
 | Campo | Tipo | Default | Descripción |
 |---|---|---|---|
-| `enabled` | `bool` | `false` | Interruptor maestro. **Fail-safe**: si el documento no trae la sección, nace deshabilitada y `/mt/` y `/pv/` responden `403 preview_disabled`. |
-| `capabilities.meta` | `bool` | `true` | Permite `/mt/`. Se comprueba antes de obtener la URL. |
+| `enabled` | `bool` | `false` | Interruptor de `/pv/` (render). **Fail-safe**: si el documento no trae la sección, nace deshabilitado y `/pv/` responde `403 preview_disabled`. No afecta a `/mt/`. |
+| `meta_enabled` | `bool` | `true` | Interruptor de `/mt/` (metadatos). Separado de `enabled`: los metadatos son fetch + parseo barato y no dependen del sidecar, así que apagar el render no los apaga. |
+| `capabilities.meta` | `bool` | `true` | Segunda comprobación de `/mt/`, junto a `meta_enabled`. |
 | `capabilities.content` | `bool` | `true` | Permite la extracción de contenido principal (`content=1` en `/mt/`); solo aplica a respuestas HTML. |
 | `capabilities.screenshot` | `bool` | `false` | Permite `/pv/?format=screenshot`. |
 | `capabilities.pdf` | `bool` | `false` | Permite `/pv/?format=pdf`. |
@@ -257,7 +260,7 @@ variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
   `≤ 4096`, `ttl_default ≤ ttl_max`, rate limit dentro de `1..=10000` / `1..=3600`). Fuera de
   cota → `400 invalid_config` con el campo concreto (p. ej. `preview.ttl_max_seconds`).
 - El campo es opcional: los documentos anteriores a él se cargan con `PreviewConfig::default()`
-  (deshabilitada), gracias a `#[serde(default)]`.
+  (`/pv/` deshabilitado, `/mt/` disponible).
 - `/pv/` es **fail-soft**: si el sidecar no está configurado (`BROWSERLESS_URL` vacío), no está
   sano o falla, responde `503 render_unavailable` con `Retry-After: 30`; si supera el deadline,
   `504 render_timeout`. Nunca devuelve 500 por ausencia del sidecar, y `/mt/` no depende de él.
@@ -282,7 +285,7 @@ cliente demo con permisos mínimos para pruebas:
 | `max_scripting_body_bytes` | 0 |
 | `error_handling.mode` | `transparent` |
 | `fallback_urls` | Vacío |
-| `preview` | `enabled: true`, capacidades `meta`+`content` activas (`screenshot`/`pdf` off), rate limit y topes por default |
+| `preview` | `enabled: true`, `meta_enabled: true`, capacidades `meta`+`content` activas (`screenshot`/`pdf` off), rate limit y topes por default |
 
 **Propósito**: permitir pruebas inmediatas tras el despliegue sin configuración manual. Los permisos
 son intencionalmente restrictivos: solo un dominio, rate limit bajo, sin scripting. El preview nace

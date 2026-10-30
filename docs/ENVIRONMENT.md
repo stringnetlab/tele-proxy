@@ -224,8 +224,9 @@ rutas de auth además llevan body cap de 8 KB (`DefaultBodyLimit`).
 
 Variables de los endpoints públicos de preview `/mt/{crypt_id}` (metadata) y `/pv/{crypt_id}`
 (render). Ambas viven en el puerto del proxy y reutilizan su cadena anti-SSRF. La habilitación es
-**por cliente** (`preview.enabled` + `preview.capabilities.*` en el documento CouchDB, ver
-`docs/CLIENT_CONFIG.md`); estas variables solo configuran el sidecar de render y sus topes.
+**por cliente** (`preview.meta_enabled` para `/mt/`, `preview.enabled` para `/pv/`, más
+`preview.capabilities.*` en el documento CouchDB; ver `docs/CLIENT_CONFIG.md`); estas variables
+solo configuran el sidecar de render y sus topes.
 
 | Variable | Descripción | Default | Req | Dónde |
 | --- | --- | --- | --- | --- |

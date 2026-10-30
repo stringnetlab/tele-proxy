@@ -290,14 +290,14 @@ paths:
                 invalid_url:
                   value: { error: "invalid_url_format", message: "Formato de URL inválido: URL contains credentials" }
         "403":
-          description: Preview deshabilitado para el cliente, dominio fuera de whitelist o SSRF bloqueado
+          description: Metadatos deshabilitados (`preview.meta_enabled`), capacidad apagada, dominio fuera de whitelist o SSRF bloqueado
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               examples:
                 preview_disabled:
-                  value: { error: "preview_disabled", message: "Preview desactivado: el cliente no tiene `preview.enabled`" }
+                  value: { error: "preview_disabled", message: "Preview desactivado: el cliente no tiene `preview.meta_enabled`" }
                 capability_off:
                   value: { error: "preview_disabled", message: "Preview desactivado: la capacidad `content` no está activa para este cliente" }
                 domain_not_whitelisted:
@@ -1059,15 +1059,21 @@ components:
     PreviewConfig:
       type: object
       description: |
-        Sección `preview` de la configuración del cliente (D6). `enabled` es fail-safe: si el
-        documento no la trae, nace `false` y `/mt/` y `/pv/` responden 403 `preview_disabled`.
+        Sección `preview` de la configuración del cliente (D6). `/mt/` (metadatos) y `/pv/`
+        (render) tienen interruptores separados: `meta_enabled` y `enabled`. `enabled` es
+        fail-safe: si el documento no trae la sección, nace `false` y `/pv/` responde 403
+        `preview_disabled`; `/mt/` nace disponible porque `meta_enabled` es `true`.
         Los topes duros (`max_body_bytes`, `max_render_timeout_ms`, ...) se validan contra los
         `MAX_PREVIEW_*` de `domain/validators.rs`; fuera de rango → 400 `invalid_config`.
       properties:
         enabled:
           type: boolean
           default: false
-          description: Interruptor maestro de `/mt/` y `/pv/` para el cliente.
+          description: Interruptor de `/pv/` (screenshot/PDF). No afecta a `/mt/`.
+        meta_enabled:
+          type: boolean
+          default: true
+          description: Interruptor de `/mt/` (metadatos). Independiente del render.
         capabilities:
           type: object
           description: Capacidades finas. Cada una se comprueba en su endpoint antes de trabajar.

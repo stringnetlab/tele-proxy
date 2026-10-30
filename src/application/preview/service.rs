@@ -8,6 +8,7 @@ use crate::application::preview::extract::{build_preview, ContentKind};
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::ProxyError;
 use crate::domain::models::{ClientConfig, ClientKind};
+use crate::domain::preview::config::PreviewConfig;
 use crate::domain::preview::result::PreviewData;
 use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
 use crate::infrastructure::preview::fetch::PreviewFetcher;
@@ -32,14 +33,34 @@ pub struct PreviewOutcome {
     pub cache_hit: bool,
 }
 
+/// Interruptor que decide si un endpoint de preview está habilitado. `/mt/` (metadatos) y `/pv/`
+/// (render) llevan flags separados a propósito: apagar el render no debe apagar los metadatos.
+#[derive(Clone, Copy)]
+enum PreviewGate {
+    Meta,
+    Render,
+}
+
+impl PreviewGate {
+    /// `(habilitado, nombre del campo)` — el nombre viaja en el mensaje del 403 para que el
+    /// operador sepa qué clave del documento tiene que activar.
+    fn of(preview: &PreviewConfig, gate: PreviewGate) -> (bool, &'static str) {
+        match gate {
+            PreviewGate::Meta => (preview.meta_enabled, "meta_enabled"),
+            PreviewGate::Render => (preview.enabled, "enabled"),
+        }
+    }
+}
+
 impl ProxyService {
-    /// Preamble compartido de preview: crypt_id→config, rechazo de admins, interruptor maestro y
-    /// rate limit por capacidad. Devuelve la config para que cada endpoint aplique su propia
-    /// comprobación de capacidad y sus límites.
+    /// Preamble compartido de preview: crypt_id→config, rechazo de admins, interruptor del
+    /// endpoint y rate limit por capacidad. Devuelve la config para que cada endpoint aplique su
+    /// propia comprobación de capacidad y sus límites.
     async fn preview_preamble(
         &self,
         crypt_id: &str,
         capability_key: &str,
+        gate: PreviewGate,
     ) -> Result<ClientConfig, ProxyError> {
         let config = self.config_fetcher().get_by_crypt_id(crypt_id).await?;
 
@@ -50,9 +71,10 @@ impl ProxyService {
             });
         }
 
-        if !config.preview.enabled {
+        let (enabled, flag) = PreviewGate::of(&config.preview, gate);
+        if !enabled {
             return Err(ProxyError::PreviewDisabled {
-                reason: "el cliente no tiene `preview.enabled`".to_string(),
+                reason: format!("el cliente no tiene `preview.{flag}`"),
             });
         }
 
@@ -88,7 +110,9 @@ impl ProxyService {
         url: &str,
         opts: &PreviewOptions,
     ) -> Result<PreviewOutcome, ProxyError> {
-        let config = self.preview_preamble(crypt_id, "meta").await?;
+        let config = self
+            .preview_preamble(crypt_id, "meta", PreviewGate::Meta)
+            .await?;
 
         if !config.preview.capabilities.meta {
             return Err(ProxyError::PreviewDisabled {
@@ -167,7 +191,9 @@ impl ProxyService {
             RenderFormat::Screenshot => "screenshot",
             RenderFormat::Pdf => "pdf",
         };
-        let config = self.preview_preamble(crypt_id, capability_key).await?;
+        let config = self
+            .preview_preamble(crypt_id, capability_key, PreviewGate::Render)
+            .await?;
 
         let capability_on = match format {
             RenderFormat::Screenshot => config.preview.capabilities.screenshot,
@@ -244,6 +270,42 @@ mod tests {
         assert_eq!(
             ProxyService::content_kind_of(Some("text/html")),
             ContentKind::Html
+        );
+    }
+
+    #[test]
+    fn los_interruptores_de_mt_y_pv_son_independientes() {
+        let por_defecto = PreviewConfig::default();
+        assert_eq!(
+            PreviewGate::of(&por_defecto, PreviewGate::Meta),
+            (true, "meta_enabled")
+        );
+        assert_eq!(
+            PreviewGate::of(&por_defecto, PreviewGate::Render),
+            (false, "enabled")
+        );
+
+        let con_render = PreviewConfig {
+            enabled: true,
+            ..PreviewConfig::default()
+        };
+        assert_eq!(
+            PreviewGate::of(&con_render, PreviewGate::Render),
+            (true, "enabled")
+        );
+
+        let sin_meta = PreviewConfig {
+            meta_enabled: false,
+            enabled: true,
+            ..PreviewConfig::default()
+        };
+        assert_eq!(
+            PreviewGate::of(&sin_meta, PreviewGate::Meta),
+            (false, "meta_enabled")
+        );
+        assert_eq!(
+            PreviewGate::of(&sin_meta, PreviewGate::Render),
+            (true, "enabled")
         );
     }
 }
