@@ -166,7 +166,9 @@ convierte a Markdown; si la extracción sale vacía se omite `content`.
   acota al techo. `force=1` salta la lectura de caché.
 - **Tope de cuerpo a parsear**: `preview.max_body_bytes` (default **2 MB**); `read_body_capped`
   corta y el error se traduce a `preview_payload_too_large` (413). Los binarios (imagen/video/audio
-  servidos directos) no se parsean: se reportan como `MediaInfo` con URL y MIME.
+  servidos directos) no se parsean: se reportan como `MediaInfo` con URL y MIME. Para `image/*` se
+  añaden `width`/`height` leyendo solo la cabecera del fichero (PNG, GIF, JPEG y WebP: VP8/VP8L/VP8X);
+  sin decodificar la imagen y sin fallar si la cabecera es desconocida o está truncada (se omiten).
 - **Modo degradado**: CouchDB caído → config degradada (`ClientConfig::default_degraded`) → `/pv/`
   responde 403 `preview_disabled` (`enabled=false`) y `/mt/` sigue sirviendo si el proceso tiene
   config. Valkey caído → preview funciona sin caché (`X-Degraded-Mode: true`,

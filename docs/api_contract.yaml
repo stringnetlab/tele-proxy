@@ -1211,8 +1211,15 @@ components:
           type: string
           description: "`size` formateado, base 1000, una cifra decimal."
           example: "84.1 KB"
-        width: { type: integer }
-        height: { type: integer }
+        width:
+          type: integer
+          description: |
+            Ancho en píxeles. En HTML sale de `og:image:width` o del sniffing de cabecera del
+            recurso directo; en `image/*` servido directo se lee de la cabecera (PNG, GIF, JPEG,
+            WebP). Se omite si no hay dato o la cabecera no es reconocible.
+        height:
+          type: integer
+          description: Alto en píxeles, con las mismas fuentes que `width`.
         duration: { type: number, description: "Segundos (video/audio)" }
 
     ContentInfo:

@@ -98,8 +98,9 @@ fn build_from_html(fetched: &FetchedResponse, base_url: &Url, want_content: bool
     data
 }
 
-/// Un recurso binario (imagen/video/audio servido directo) no tiene metadatos embebidos que se
-/// puedan leer sin decodificar el contenedor: se reporta la URL y el MIME, y nada más.
+/// Un recurso binario (imagen/video/audio servido directo) no expone metadatos embebidos sin
+/// decodificar el contenedor: se reporta la URL, el MIME y el tamaño. Para imágenes se añaden las
+/// dimensiones leyendo la cabecera del fichero (sin decodificar nada).
 fn direct_media(fetched: &FetchedResponse) -> MediaInfo {
     let mut media = MediaInfo::with_url(fetched.final_url.clone());
     media.mime = fetched
@@ -107,7 +108,141 @@ fn direct_media(fetched: &FetchedResponse) -> MediaInfo {
         .as_ref()
         .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string());
     media.size = Some(fetched.body.len() as u64);
+    if matches!(media.mime.as_deref(), Some(mime) if mime.starts_with("image/")) {
+        if let Some((width, height)) = sniff_dimensions(&fetched.body) {
+            media.width = Some(width);
+            media.height = Some(height);
+        }
+    }
     media.with_derived_size_pretty()
+}
+
+/// Dimensiones `(ancho, alto)` de PNG, GIF, JPEG y WebP leídas de los primeros bytes del fichero.
+/// No decodifica la imagen: es O(1) y un fichero truncado o de otro formato devuelve `None` en
+/// lugar de fallar. SVG (dimensiones en atributos XML) queda fuera: se reporta sin medidas.
+fn sniff_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return png_dimensions(bytes);
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return gif_dimensions(bytes);
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return jpeg_dimensions(bytes);
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return webp_dimensions(bytes);
+    }
+    None
+}
+
+/// Firma (8) + longitud (4) + `IHDR` (4) + ancho (4 BE) + alto (4 BE).
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    nonzero(be_u32(bytes, 16)?, be_u32(bytes, 20)?)
+}
+
+/// Cabecera (6) + ancho (2 LE) + alto (2 LE).
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    nonzero(le_u16(bytes, 6)? as u32, le_u16(bytes, 8)? as u32)
+}
+
+/// Recorre los segmentos JPEG hasta el `SOFn`, que es donde viven las dimensiones. Se detiene en
+/// `SOS`: a partir de ahí el flujo entrópico puede contener bytes `0xFF` y ya no hay cabeceras.
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2; // tras el SOI
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return None;
+        }
+        let mut marker = bytes[i + 1];
+        i += 2;
+        // Bytes de relleno 0xFF entre segmentos.
+        while marker == 0xFF {
+            marker = *bytes.get(i)?;
+            i += 1;
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        let segment_len = be_u16(bytes, i)? as usize;
+        if segment_len < 2 {
+            return None;
+        }
+        if is_sof(marker) {
+            // Precisión (1) + alto (2 BE) + ancho (2 BE).
+            let height = be_u16(bytes, i + 3)?;
+            let width = be_u16(bytes, i + 5)?;
+            return nonzero(width as u32, height as u32);
+        }
+        i += segment_len;
+    }
+    None
+}
+
+fn is_sof(marker: u8) -> bool {
+    matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
+}
+
+/// Primer chunk WebP: `VP8 ` (con pérdida), `VP8L` (sin pérdida) o `VP8X` (extendido).
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    match bytes.get(12..16)? {
+        b"VP8 " => {
+            if bytes.get(23..26)? != [0x9D, 0x01, 0x2A] {
+                return None;
+            }
+            nonzero(
+                le_u16(bytes, 26)? as u32 & 0x3FFF,
+                le_u16(bytes, 28)? as u32 & 0x3FFF,
+            )
+        }
+        b"VP8L" => {
+            if *bytes.get(20)? != 0x2F {
+                return None;
+            }
+            let b = bytes.get(21..25)?;
+            let width = (b[0] as u32 | ((b[1] as u32 & 0x3F) << 8)) + 1;
+            let height = ((b[1] as u32 >> 6) | (b[2] as u32) << 2 | (b[3] as u32 & 0x0F) << 10) + 1;
+            nonzero(width, height)
+        }
+        b"VP8X" => {
+            // Banderas (4) + ancho-1 (3 LE) + alto-1 (3 LE).
+            nonzero(le_u24(bytes, 24)? + 1, le_u24(bytes, 27)? + 1)
+        }
+        _ => None,
+    }
+}
+
+fn nonzero(width: u32, height: u32) -> Option<(u32, u32)> {
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn be_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn le_u24(bytes: &[u8], at: usize) -> Option<u32> {
+    let b = bytes.get(at..at.checked_add(3)?)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], 0]))
 }
 
 /// Señales para la detección antibot. `has_open_graph` sale del `PreviewData` ya construido: si hay
@@ -191,6 +326,131 @@ mod tests {
             data.content.is_none(),
             "una imagen no tiene contenido de artículo"
         );
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        b.extend_from_slice(&width.to_be_bytes());
+        b.extend_from_slice(&height.to_be_bytes());
+        b.extend_from_slice(&[0x08, 0x06, 0x00, 0x00, 0x00]);
+        b
+    }
+
+    fn gif_bytes(width: u16, height: u16) -> Vec<u8> {
+        let mut b = b"GIF89a".to_vec();
+        b.extend_from_slice(&width.to_le_bytes());
+        b.extend_from_slice(&height.to_le_bytes());
+        b.extend_from_slice(&[0x00, 0x00, 0x00]);
+        b
+    }
+
+    fn jpeg_bytes(width: u16, height: u16) -> Vec<u8> {
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        b.extend_from_slice(&[0u8; 14]); // payload APP0
+        b.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+        b.extend_from_slice(&height.to_be_bytes());
+        b.extend_from_slice(&width.to_be_bytes());
+        b.extend_from_slice(&[0x03, 0x01, 0x11, 0x00]);
+        b
+    }
+
+    fn webp_vp8x_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut b = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        for v in [width - 1, height - 1] {
+            b.extend_from_slice(&v.to_le_bytes()[..3]);
+        }
+        b
+    }
+
+    fn webp_vp8l_bytes(width: u32, height: u32) -> Vec<u8> {
+        let (w, h) = (width - 1, height - 1);
+        let mut b = b"RIFF\x00\x00\x00\x00WEBPVP8L\x00\x00\x00\x00\x2f".to_vec();
+        b.push((w & 0xFF) as u8);
+        b.push((((w >> 8) & 0x3F) | ((h & 0x03) << 6)) as u8);
+        b.push(((h >> 2) & 0xFF) as u8);
+        b.push(((h >> 10) & 0x0F) as u8);
+        b
+    }
+
+    fn webp_vp8_bytes(width: u16, height: u16) -> Vec<u8> {
+        let mut b = b"RIFF\x00\x00\x00\x00WEBPVP8 \x00\x00\x00\x00".to_vec();
+        b.extend_from_slice(&[0x00, 0x00, 0x00]); // frame tag
+        b.extend_from_slice(&[0x9D, 0x01, 0x2A]); // start code
+        b.extend_from_slice(&(width & 0x3FFF).to_le_bytes());
+        b.extend_from_slice(&(height & 0x3FFF).to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn sniff_dimensiones_png() {
+        assert_eq!(sniff_dimensions(&png_bytes(1200, 630)), Some((1200, 630)));
+    }
+
+    #[test]
+    fn sniff_dimensiones_gif() {
+        assert_eq!(sniff_dimensions(&gif_bytes(320, 240)), Some((320, 240)));
+    }
+
+    #[test]
+    fn sniff_dimensiones_jpeg_tras_segmento_app() {
+        assert_eq!(sniff_dimensions(&jpeg_bytes(800, 600)), Some((800, 600)));
+    }
+
+    #[test]
+    fn sniff_dimensiones_webp_en_sus_tres_variantes() {
+        assert_eq!(
+            sniff_dimensions(&webp_vp8_bytes(640, 480)),
+            Some((640, 480))
+        );
+        assert_eq!(
+            sniff_dimensions(&webp_vp8l_bytes(300, 200)),
+            Some((300, 200))
+        );
+        assert_eq!(
+            sniff_dimensions(&webp_vp8x_bytes(1920, 1080)),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn sniff_dimensiones_de_bytes_cortos_o_desconocidos_es_none() {
+        for body in [
+            &b""[..],
+            b"\x89PNG\r\n\x1a\n",
+            b"GIF89a\x40",
+            b"\xFF\xD8\xFF\xE0",
+            b"RIFF\x00\x00\x00\x00WEBP",
+            b"no es una imagen",
+        ] {
+            assert_eq!(sniff_dimensions(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn imagen_directa_rellena_width_y_height() {
+        let f = fetched(200, Some("image/png"), &png_bytes(1200, 630));
+        let data = build_preview(&f, &PreviewConfig::default(), false);
+        let image = data.image.expect("media directa");
+        assert_eq!(image.width, Some(1200));
+        assert_eq!(image.height, Some(630));
+    }
+
+    #[test]
+    fn imagen_directa_sin_cabecera_reconocible_no_inventa_dimensiones() {
+        let f = fetched(200, Some("image/png"), &[0u8; 2048]);
+        let data = build_preview(&f, &PreviewConfig::default(), false);
+        let image = data.image.expect("media directa");
+        assert_eq!(image.width, None);
+        assert_eq!(image.height, None);
+    }
+
+    #[test]
+    fn video_directo_no_intenta_sniffing() {
+        let f = fetched(200, Some("video/mp4"), &png_bytes(1200, 630));
+        let data = build_preview(&f, &PreviewConfig::default(), false);
+        let video = data.video.expect("media directa");
+        assert_eq!(video.width, None);
+        assert_eq!(video.height, None);
     }
 
     #[test]
