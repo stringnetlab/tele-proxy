@@ -64,6 +64,37 @@ pub trait CacheStore: Send + Sync {
     /// `config_version` invalida *toda* la caché del cliente como efecto secundario: sin esto, no
     /// hay forma de forzar un re-fetch sin tocar la configuración.
     async fn purge_client_responses(&self, internal_id: &str) -> Result<u64, ProxyError>;
+
+    /// Cuerpo de preview cacheado (JSON ya serializado de `PreviewData`). Los defaults son
+    /// no-op/miss para que los stubs de test no tengan que implementarlos; el almacén real
+    /// (`ValkeyCacheStore`) los sobrescribe. Un fallo de Valkey degrada a miss, nunca a error.
+    async fn get_preview(&self, key: &str) -> Result<Option<Vec<u8>>, ProxyError> {
+        let _ = key;
+        Ok(None)
+    }
+    async fn set_preview(
+        &self,
+        key: &str,
+        body: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<(), ProxyError> {
+        let _ = (key, body, ttl_seconds);
+        Ok(())
+    }
+    /// Rate limit **por capacidad** de preview (`rlp:{crypt_id}:{capability}`). El default delega
+    /// en `check_rate_limit` (sin aislamiento por capacidad) para los stubs; el almacén real lo
+    /// sobrescribe con un bucket propio por capacidad.
+    async fn check_preview_rate_limit(
+        &self,
+        crypt_id: &str,
+        capability: &str,
+        max_requests: u32,
+        window_seconds: u64,
+    ) -> RateLimitDecision {
+        let _ = capability;
+        self.check_rate_limit(crypt_id, max_requests, window_seconds)
+            .await
+    }
 }
 
 #[async_trait]

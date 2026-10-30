@@ -4,6 +4,7 @@ pub mod changes_feed;
 pub mod fallback;
 pub mod identity;
 pub mod lua_engine;
+pub mod preview;
 pub mod proxy_service;
 pub mod settings_store;
 pub mod webhook_service;

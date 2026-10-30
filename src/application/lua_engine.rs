@@ -723,6 +723,7 @@ mod tests {
                     fallback_urls: HashMap::new(),
                 },
                 header_rules: Vec::new(),
+                preview: Default::default(),
             },
         }
     }

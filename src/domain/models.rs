@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::domain::header_rules::HeaderRule;
+use crate::domain::preview::config::PreviewConfig;
 
 /// Naturaleza de un documento `client_config`. Un `Admin` identifica a un operador del panel de
 /// administración: **nunca** puede usar el proxy ni la API de cliente (la separación se fuerza en
@@ -44,9 +45,13 @@ pub struct ClientConfig {
     /// `serde(default)` mantiene compatibles los documentos de CouchDB anteriores al campo.
     #[serde(default)]
     pub header_rules: Vec<HeaderRule>,
+    /// Sección de preview (`/mt/` y `/pv/`). `#[serde(default)]`: los documentos anteriores a la
+    /// feature parsean con `enabled=false` (fail-safe) y el preview queda desactivado.
+    #[serde(default)]
+    pub preview: PreviewConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RateLimitConfig {
     pub max_requests: u32,
     pub window_seconds: u64,
@@ -146,6 +151,8 @@ pub struct ClientConfigResponse {
     pub error_handling: ErrorHandlingConfig,
     #[serde(default)]
     pub header_rules: Vec<HeaderRule>,
+    #[serde(default)]
+    pub preview: PreviewConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +190,7 @@ impl ClientConfig {
                 fallback_urls: HashMap::new(),
             },
             header_rules: Vec::new(),
+            preview: PreviewConfig::default(),
         }
     }
 
@@ -205,6 +213,7 @@ impl From<ClientConfig> for ClientConfigResponse {
             },
             error_handling: config.error_handling,
             header_rules: config.header_rules,
+            preview: config.preview,
         }
     }
 }
@@ -218,6 +227,10 @@ pub struct ClientConfigUpdate {
     pub error_handling: Option<ErrorHandlingConfig>,
     /// Sustituye la lista completa de reglas (como `whitelist`): enviar `[]` las desactiva.
     pub header_rules: Option<Vec<HeaderRule>>,
+    /// Sustituye la sección `preview` completa. `None` = no se toca; `Some(cfg)` = se valida y se
+    /// guarda tal cual (el operador decide `enabled`, capacidades y límites).
+    #[serde(default)]
+    pub preview: Option<PreviewConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +395,7 @@ mod tests {
                 fallback_urls: HashMap::new(),
             },
             header_rules: Vec::new(),
+            preview: Default::default(),
         };
         assert!(!config.is_degraded());
     }

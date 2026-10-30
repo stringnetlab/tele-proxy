@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::domain::errors::ProxyError;
 use crate::domain::runtime_settings::RuntimeSettings;
 use crate::domain::services::{CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+use crate::infrastructure::preview::renderer::BrowserlessRenderer;
 
 use super::settings_store::SettingsStore;
 
@@ -14,6 +15,9 @@ pub struct ProxyService {
     lua_executor: Arc<dyn LuaExecutor>,
     degraded_mode: Arc<AtomicBool>,
     settings: Arc<SettingsStore>,
+    /// Sidecar de render (browserless). `None` cuando no se configuró `BROWSERLESS_URL`: `/pv/`
+    /// degrada a `render_unavailable` en vez de intentar red.
+    renderer: Option<Arc<BrowserlessRenderer>>,
 }
 
 impl ProxyService {
@@ -31,6 +35,7 @@ impl ProxyService {
             lua_executor,
             degraded_mode: Arc::new(AtomicBool::new(false)),
             settings,
+            renderer: None,
         }
     }
 
@@ -39,6 +44,17 @@ impl ProxyService {
     pub fn with_degraded_flag(mut self, degraded: Arc<AtomicBool>) -> Self {
         self.degraded_mode = degraded;
         self
+    }
+
+    /// Engancha el sidecar de render. Se llama en el arranque solo si `BROWSERLESS_URL` está
+    /// configurado; sin él, `/pv/` responde `503 render_unavailable` (fail-soft).
+    pub fn with_renderer(mut self, renderer: Arc<BrowserlessRenderer>) -> Self {
+        self.renderer = Some(renderer);
+        self
+    }
+
+    pub fn renderer(&self) -> Option<&Arc<BrowserlessRenderer>> {
+        self.renderer.as_ref()
     }
 
     /// Snapshot de los ajustes globales (`MODO` verboso, User-Agent del origen, timeouts y límites

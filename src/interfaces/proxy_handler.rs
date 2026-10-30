@@ -799,7 +799,7 @@ fn build_response(
         })
 }
 
-fn validate_crypt_id(crypt_id: &str) -> bool {
+pub(crate) fn validate_crypt_id(crypt_id: &str) -> bool {
     if crypt_id.len() != 12 {
         return false;
     }
@@ -1122,6 +1122,7 @@ mod tests {
                     }],
                 },
             }],
+            preview: Default::default(),
         };
 
         let mut request = HeaderMap::new();

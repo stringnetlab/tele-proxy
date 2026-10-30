@@ -2,6 +2,10 @@ use serde::Serialize;
 use thiserror::Error;
 use tracing::Level;
 
+/// `Retry-After` fijo del 503 fail-soft del sidecar de render: el navegador/cliente reintenta
+/// más tarde en vez de martillear un browserless que acaba de caerse o está saturado.
+pub const RENDER_RETRY_AFTER_SECS: u32 = 30;
+
 #[derive(Error, Debug)]
 pub enum ProxyError {
     #[error("crypt_id inválido: {reason}")]
@@ -92,6 +96,33 @@ pub enum ProxyError {
     #[error("Servicio no disponible: {reason}")]
     ServiceUnavailable { reason: String },
 
+    /// Preview desactivado para el cliente: la sección `preview.enabled` es `false` (o el
+    /// documento no la trae, que es el default fail-safe). 403, no 404: el endpoint existe, el
+    /// cliente no tiene la capacidad.
+    #[error("Preview desactivado: {reason}")]
+    PreviewDisabled { reason: String },
+
+    /// Parámetro de preview desconocido o fuera de rango (schema cerrada, D1). 400.
+    #[error("Parámetros de preview inválidos: {reason}")]
+    InvalidPreviewParams { reason: String },
+
+    /// El cuerpo a parsear supera el tope de preview (2 MB por defecto). 413. Distinto de
+    /// `PayloadTooLarge` (que es del proxy `/aq/`) para que el diccionario separe ambos caminos.
+    #[error("Cuerpo de preview demasiado grande: {content_length} bytes (máx: {max_allowed})")]
+    PreviewPayloadTooLarge {
+        content_length: u64,
+        max_allowed: u64,
+    },
+
+    /// El sidecar de render (browserless) no está disponible o no responde. 503 fail-soft: nunca
+    /// 500. Lleva `Retry-After` para que el cliente espere.
+    #[error("Render no disponible: {reason}")]
+    RenderUnavailable { reason: String },
+
+    /// El sidecar de render superó el deadline. 504.
+    #[error("Timeout del render: {timeout_ms}ms (url={url})")]
+    RenderTimeout { url: String, timeout_ms: u64 },
+
     #[error("Configuración no encontrada para el cliente: {internal_id}")]
     ConfigNotFound { internal_id: String },
 
@@ -135,6 +166,11 @@ impl ProxyError {
             Self::Unauthorized { .. } => 401,
             Self::Forbidden { .. } => 403,
             Self::ServiceUnavailable { .. } => 503,
+            Self::PreviewDisabled { .. } => 403,
+            Self::InvalidPreviewParams { .. } => 400,
+            Self::PreviewPayloadTooLarge { .. } => 413,
+            Self::RenderUnavailable { .. } => 503,
+            Self::RenderTimeout { .. } => 504,
             Self::ConfigNotFound { .. } => 404,
             Self::Internal { .. } => 500,
         }
@@ -163,6 +199,11 @@ impl ProxyError {
             Self::Unauthorized { .. } => "unauthorized",
             Self::Forbidden { .. } => "forbidden",
             Self::ServiceUnavailable { .. } => "service_unavailable",
+            Self::PreviewDisabled { .. } => "preview_disabled",
+            Self::InvalidPreviewParams { .. } => "invalid_preview_params",
+            Self::PreviewPayloadTooLarge { .. } => "preview_payload_too_large",
+            Self::RenderUnavailable { .. } => "render_unavailable",
+            Self::RenderTimeout { .. } => "render_timeout",
             Self::ConfigNotFound { .. } => "config_not_found",
             Self::Internal { .. } => "internal_error",
         }
@@ -185,6 +226,11 @@ impl ProxyError {
             | Self::UpstreamTimeout { .. }
             | Self::Unauthorized { .. }
             | Self::Forbidden { .. }
+            | Self::PreviewDisabled { .. }
+            | Self::InvalidPreviewParams { .. }
+            | Self::PreviewPayloadTooLarge { .. }
+            | Self::RenderUnavailable { .. }
+            | Self::RenderTimeout { .. }
             | Self::ServiceUnavailable { .. } => Level::WARN,
 
             Self::InvalidCryptId { .. }
@@ -210,16 +256,20 @@ impl ProxyError {
                 "El origen no responde"
             }
             Self::UpstreamTimeout { .. } => "El origen no responde a tiempo",
+            Self::RenderUnavailable { .. } => "Servicio de render no disponible",
+            Self::RenderTimeout { .. } => "El render no responde a tiempo",
             _ => "Error interno del servidor",
         }
     }
 
-    /// `Retry-After` en segundos; `None` para todo error que no sea 429.
+    /// `Retry-After` en segundos; `None` para todo error que no sea 429 o un render no
+    /// disponible (503 fail-soft del sidecar, que invita a reintentar más tarde).
     pub fn retry_after_secs(&self) -> Option<u32> {
         match self {
             Self::RateLimitExceeded {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
+            Self::RenderUnavailable { .. } => Some(RENDER_RETRY_AFTER_SECS),
             _ => None,
         }
     }
@@ -325,6 +375,19 @@ impl ProxyError {
             Self::Unauthorized { reason } => vec![("reason", reason.clone())],
             Self::Forbidden { reason } => vec![("reason", reason.clone())],
             Self::ServiceUnavailable { reason } => vec![("reason", reason.clone())],
+            Self::PreviewDisabled { reason } => vec![("reason", reason.clone())],
+            Self::InvalidPreviewParams { reason } => vec![("reason", reason.clone())],
+            Self::PreviewPayloadTooLarge {
+                content_length,
+                max_allowed,
+            } => vec![
+                ("content_length", content_length.to_string()),
+                ("max_allowed", max_allowed.to_string()),
+            ],
+            Self::RenderUnavailable { reason } => vec![("reason", reason.clone())],
+            Self::RenderTimeout { url, timeout_ms } => {
+                vec![("url", url.clone()), ("timeout_ms", timeout_ms.to_string())]
+            }
             Self::ConfigNotFound { internal_id } => vec![("internal_id", internal_id.clone())],
             Self::Internal { reason } => vec![("reason", reason.clone())],
         }
@@ -344,6 +407,7 @@ impl ProxyError {
             | Self::InvalidUrlFormat { url, .. }
             | Self::UpstreamError { url, .. }
             | Self::UpstreamTimeout { url, .. }
+            | Self::RenderTimeout { url, .. }
             | Self::WebhookFailed { url, .. } => Some(url.as_str()),
             Self::WebhookTimeout { webhook_url, .. } => Some(webhook_url.as_str()),
             _ => None,

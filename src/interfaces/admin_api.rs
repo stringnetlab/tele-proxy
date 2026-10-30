@@ -871,6 +871,7 @@ mod tests {
                 fallback_urls: Default::default(),
             },
             header_rules: Vec::new(),
+            preview: Default::default(),
         };
 
         // Listado: sin código Lua y sin el hash del bearer token.

@@ -21,11 +21,13 @@ use tele_proxy::domain::validators::{validate_allowed_domain_list, validate_cors
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
 use tele_proxy::infrastructure::dns_resolver::SecureDnsResolver;
 use tele_proxy::infrastructure::local_rate_limiter::LocalRateLimiter;
+use tele_proxy::infrastructure::preview::renderer::BrowserlessRenderer;
 use tele_proxy::infrastructure::valkey_cache::{ValkeyCacheStore, ValkeySessionStore};
 use tele_proxy::interfaces::admin_api::admin_routes;
 use tele_proxy::interfaces::admin_ui::admin_ui_routes;
 use tele_proxy::interfaces::control_api::{control_routes, ControlState};
 use tele_proxy::interfaces::cors::cors_layer;
+use tele_proxy::interfaces::preview_handler::{mt_handler, pv_handler};
 use tele_proxy::interfaces::proxy_handler::proxy_handler;
 
 #[derive(Debug)]
@@ -49,6 +51,14 @@ struct AppConfig {
     /// User-Agent por defecto para las peticiones al origen cuando el cliente no envía el
     /// suyo. Vacío = el User-Agent por defecto de reqwest.
     upstream_user_agent: String,
+    /// URL del sidecar browserless (`/screenshot`, `/pdf`). Vacío = render desactivado: `/pv/`
+    /// responde `503 render_unavailable` (fail-soft), nunca intenta red.
+    browserless_url: String,
+    browserless_token: String,
+    /// Techo del deadline de render; la petición lo acota contra `preview.max_render_timeout_ms`.
+    render_timeout_ms: u64,
+    /// Tope del binario renderizado que se acepta del sidecar (defensa contra un render desbocado).
+    preview_asset_max_bytes: u64,
 }
 
 impl AppConfig {
@@ -83,6 +93,15 @@ impl AppConfig {
                 .map(|value| value.eq_ignore_ascii_case("desarrollo"))
                 .unwrap_or(false),
             upstream_user_agent: env_var_or("UPSTREAM_USER_AGENT", "")?,
+            browserless_url: env_var_or("BROWSERLESS_URL", "")?,
+            browserless_token: env_var_or("BROWSERLESS_TOKEN", "")?,
+            render_timeout_ms: parse_in_range("RENDER_TIMEOUT_MS", "30000", 1u64, 120_000u64)?,
+            preview_asset_max_bytes: parse_in_range(
+                "PREVIEW_ASSET_MAX_BYTES",
+                "10485760",
+                1u64,
+                52_428_800u64,
+            )?,
         })
     }
 }
@@ -246,7 +265,7 @@ async fn index_control(State(state): State<ControlState>) -> String {
 /// Número de release desplegado: se incrementa **a mano en cada deploy** que se quiera
 /// identificar. Es deliberadamente un entero simple, sin semver ni hash: `GET /` lo devuelve tal
 /// cual y permite verificar con un curl qué release está sirviendo.
-const RELEASE: &str = "5";
+const RELEASE: &str = "6";
 
 fn index_body(verbose: bool, release: &str) -> String {
     const NAME: &str = "TELE - PROXY";
@@ -259,6 +278,8 @@ fn index_body(verbose: bool, release: &str) -> String {
         String::new(),
         "Endpoints del proxy (puerto HTTP_PROXY_PORT):".into(),
         "  GET  /aq/{crypt_id}/?url=<url>[&mime=<mime>]   Proxy publico multi-cliente".into(),
+        "  GET  /mt/{crypt_id}?url=<url>[&content=1]      Metadata de una URL (meta/OG/Twitter/JSON-LD)".into(),
+        "  GET  /pv/{crypt_id}?url=<url>[&format=pdf]     Preview renderizado (screenshot PNG o PDF)".into(),
         "  GET  /health                                   Healthcheck del contenedor".into(),
         "  GET  /                                         Este indice".into(),
         String::new(),
@@ -406,6 +427,20 @@ async fn main() {
         webhook_fetcher,
     ));
 
+    // Sidecar de render (browserless). Se construye siempre: con `BROWSERLESS_URL` vacío queda
+    // desactivado y `/pv/` responde `503 render_unavailable` (fail-soft) en vez de tentar red.
+    let renderer = Arc::new(BrowserlessRenderer::new(
+        Some(config.browserless_url.clone()),
+        Some(config.browserless_token.clone()),
+        std::time::Duration::from_millis(config.render_timeout_ms),
+        config.preview_asset_max_bytes,
+    ));
+    if renderer.is_configured() {
+        tracing::info!("Renderer browserless configurado para /pv/");
+    } else {
+        tracing::info!("BROWSERLESS_URL vacío: /pv/ degradará a render_unavailable");
+    }
+
     let proxy_service = Arc::new(
         ProxyService::new(
             Arc::clone(&config_fetcher) as Arc<_>,
@@ -414,7 +449,8 @@ async fn main() {
             lua_executor,
             Arc::clone(&settings_store),
         )
-        .with_degraded_flag(cache_degraded),
+        .with_degraded_flag(cache_degraded)
+        .with_renderer(renderer),
     );
 
     // --- Administración global (panel /api/v1/admin + /admin/) ---
@@ -498,6 +534,12 @@ async fn main() {
 
     let proxy_app = Router::new()
         .route("/aq/{crypt_id}/", axum::routing::get(proxy_handler))
+        // Preview: se registran ambas formas (con y sin slash final) porque `/aq/` usa slash y la
+        // petición del usuario escribe `/mt/{crypt_id}`; así ninguna de las dos da 404.
+        .route("/mt/{crypt_id}", axum::routing::get(mt_handler))
+        .route("/mt/{crypt_id}/", axum::routing::get(mt_handler))
+        .route("/pv/{crypt_id}", axum::routing::get(pv_handler))
+        .route("/pv/{crypt_id}/", axum::routing::get(pv_handler))
         .route("/health", axum::routing::get(healthcheck))
         .route("/", axum::routing::get(index))
         .with_state(Arc::clone(&proxy_service));
@@ -592,6 +634,8 @@ mod tests {
         assert!(body.contains("release 7"), "{body}");
         for endpoint in [
             "/aq/{crypt_id}/",
+            "/mt/{crypt_id}",
+            "/pv/{crypt_id}",
             "/api/v1/clients/config",
             "/api/v1/clients/rotate-id",
             "/health",

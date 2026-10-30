@@ -189,6 +189,12 @@ pub const MAX_SCRIPTING_BODY_BYTES: u64 = 52_428_800;
 pub const MAX_HEADER_RULES: usize = 50;
 pub const MAX_HEADERS_PER_RULE: usize = 10;
 pub const MAX_HEADER_RULE_EXPRESSION_BYTES: usize = 4_096;
+/// Cotas de la sección `preview` (D6). Acotan lo que el operador puede pedir por config para que
+/// un `PUT` no fije un render infinito ni un parseo de cuerpo desmedido.
+pub const MAX_PREVIEW_TTL_SECONDS: u64 = 2_678_400; // 31 días
+pub const MAX_PREVIEW_RENDER_TIMEOUT_MS: u64 = 120_000; // 2 min
+pub const MAX_PREVIEW_BODY_BYTES: u64 = 10_485_760; // 10 MB
+pub const MAX_PREVIEW_VIEWPORT_SIDE: u32 = 4096;
 const MAX_HEADER_NAME_BYTES: usize = 128;
 const MAX_HEADER_VALUE_BYTES: usize = 4_096;
 const MAX_HOST_BYTES: usize = 253;
@@ -317,6 +323,61 @@ pub fn validate_config_update(update: &ClientConfigUpdate) -> Result<(), ProxyEr
         validate_header_rules(header_rules)?;
     }
 
+    if let Some(preview) = &update.preview {
+        validate_preview(preview)?;
+    }
+
+    Ok(())
+}
+
+/// Cotas de la sección `preview`. Rechaza valores que convertirían el fetch/render en un recurso
+/// sin techo. `rate_limit` reutiliza el mismo techo que el de `/aq/` (`MAX_REQUESTS_CEILING`).
+fn validate_preview(
+    preview: &crate::domain::preview::config::PreviewConfig,
+) -> Result<(), ProxyError> {
+    if preview.rate_limit.max_requests > MAX_REQUESTS_CEILING {
+        return Err(invalid_config(
+            "preview.rate_limit.max_requests",
+            format!("excede el techo de {MAX_REQUESTS_CEILING}"),
+        ));
+    }
+    if preview.rate_limit.window_seconds > WINDOW_SECONDS_CEILING {
+        return Err(invalid_config(
+            "preview.rate_limit.window_seconds",
+            format!("excede el techo de {WINDOW_SECONDS_CEILING}"),
+        ));
+    }
+    if preview.ttl_default_seconds > preview.ttl_max_seconds {
+        return Err(invalid_config(
+            "preview.ttl_default_seconds",
+            "no puede superar a ttl_max_seconds".to_string(),
+        ));
+    }
+    if preview.ttl_max_seconds > MAX_PREVIEW_TTL_SECONDS {
+        return Err(invalid_config(
+            "preview.ttl_max_seconds",
+            format!("excede el techo de {MAX_PREVIEW_TTL_SECONDS}"),
+        ));
+    }
+    if preview.max_render_timeout_ms > MAX_PREVIEW_RENDER_TIMEOUT_MS {
+        return Err(invalid_config(
+            "preview.max_render_timeout_ms",
+            format!("excede el techo de {MAX_PREVIEW_RENDER_TIMEOUT_MS}"),
+        ));
+    }
+    if preview.max_body_bytes > MAX_PREVIEW_BODY_BYTES {
+        return Err(invalid_config(
+            "preview.max_body_bytes",
+            format!("excede el techo de {MAX_PREVIEW_BODY_BYTES}"),
+        ));
+    }
+    let [w, h] = preview.screenshot.default_viewport;
+    if w == 0 || h == 0 || w > MAX_PREVIEW_VIEWPORT_SIDE || h > MAX_PREVIEW_VIEWPORT_SIDE {
+        return Err(invalid_config(
+            "preview.screenshot.default_viewport",
+            format!("cada lado debe estar en 1..={MAX_PREVIEW_VIEWPORT_SIDE}"),
+        ));
+    }
     Ok(())
 }
 
@@ -661,6 +722,7 @@ mod tests {
             scripting: None,
             error_handling: None,
             header_rules: None,
+            preview: None,
         }
     }
 
@@ -846,6 +908,7 @@ mod tests {
             }),
             error_handling: None,
             header_rules: None,
+            preview: None,
         };
         assert!(validate_config_update(&update).is_ok());
     }
@@ -1405,6 +1468,95 @@ mod tests {
         assert!(
             validate_config_update(&update).is_ok(),
             "la receta completa de docs/HEADER_RULES.md § 9.9 debe validar"
+        );
+    }
+
+    fn valid_preview() -> crate::domain::preview::config::PreviewConfig {
+        crate::domain::preview::config::PreviewConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn update_with_preview(
+        preview: crate::domain::preview::config::PreviewConfig,
+    ) -> ClientConfigUpdate {
+        ClientConfigUpdate {
+            preview: Some(preview),
+            ..base_update()
+        }
+    }
+
+    #[test]
+    fn preview_por_default_valida() {
+        assert!(validate_config_update(&update_with_preview(valid_preview())).is_ok());
+    }
+
+    #[test]
+    fn preview_ttl_default_no_puede_superar_a_ttl_max() {
+        let mut preview = valid_preview();
+        preview.ttl_max_seconds = 100;
+        preview.ttl_default_seconds = 101;
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(preview))),
+            "preview.ttl_default_seconds"
+        );
+    }
+
+    #[test]
+    fn preview_ttl_max_sobre_el_techo_se_rechaza() {
+        let mut preview = valid_preview();
+        preview.ttl_max_seconds = MAX_PREVIEW_TTL_SECONDS + 1;
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(preview))),
+            "preview.ttl_max_seconds"
+        );
+    }
+
+    #[test]
+    fn preview_render_timeout_sobre_el_techo_se_rechaza() {
+        let mut preview = valid_preview();
+        preview.max_render_timeout_ms = MAX_PREVIEW_RENDER_TIMEOUT_MS + 1;
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(preview))),
+            "preview.max_render_timeout_ms"
+        );
+    }
+
+    #[test]
+    fn preview_body_bytes_sobre_el_techo_se_rechaza() {
+        let mut preview = valid_preview();
+        preview.max_body_bytes = MAX_PREVIEW_BODY_BYTES + 1;
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(preview))),
+            "preview.max_body_bytes"
+        );
+    }
+
+    #[test]
+    fn preview_viewport_fuera_de_rango_se_rechaza() {
+        let mut zero = valid_preview();
+        zero.screenshot.default_viewport = [0, 1080];
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(zero))),
+            "preview.screenshot.default_viewport"
+        );
+
+        let mut huge = valid_preview();
+        huge.screenshot.default_viewport = [MAX_PREVIEW_VIEWPORT_SIDE + 1, 100];
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(huge))),
+            "preview.screenshot.default_viewport"
+        );
+    }
+
+    #[test]
+    fn preview_rate_limit_sobre_el_techo_se_rechaza() {
+        let mut preview = valid_preview();
+        preview.rate_limit.max_requests = MAX_REQUESTS_CEILING + 1;
+        assert_eq!(
+            invalid_field(validate_config_update(&update_with_preview(preview))),
+            "preview.rate_limit.max_requests"
         );
     }
 }

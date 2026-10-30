@@ -329,6 +329,12 @@ impl CouchDbRepository {
                 fallback_urls: HashMap::new(),
             },
             header_rules: Vec::new(),
+            // El cliente demo nace con preview activo para que `/mt/` sea probable de caja;
+            // los clientes reales siguen el default fail-safe (`enabled=false`).
+            preview: crate::domain::preview::config::PreviewConfig {
+                enabled: true,
+                ..Default::default()
+            },
         };
 
         let url = self.doc_url(&demo_config.id);

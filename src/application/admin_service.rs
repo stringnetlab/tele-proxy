@@ -459,6 +459,7 @@ impl AdminService {
                 fallback_urls: std::collections::HashMap::new(),
             },
             header_rules: Vec::new(),
+            preview: crate::domain::preview::config::PreviewConfig::default(),
         };
         let saved = self.repo.put_client(&config).await?;
         tracing::info!(
@@ -498,6 +499,7 @@ impl AdminService {
             scripting,
             error_handling,
             header_rules,
+            preview,
         } = &update.config;
 
         if let Some(whitelist) = whitelist {
@@ -528,6 +530,9 @@ impl AdminService {
         }
         if let Some(header_rules) = header_rules {
             config.header_rules = header_rules.clone();
+        }
+        if let Some(preview) = preview {
+            config.preview = preview.clone();
         }
         if let Some(wildcard) = update.wildcard {
             config.wildcard = wildcard;
@@ -1130,6 +1135,7 @@ pub(crate) mod tests {
             scripting: None,
             error_handling: None,
             header_rules: None,
+            preview: None,
         };
         let quitado = svc
             .update_client(
@@ -1212,6 +1218,7 @@ pub(crate) mod tests {
                 fallback_urls: std::collections::HashMap::new(),
             },
             header_rules: Vec::new(),
+            preview: Default::default(),
         };
         assert!(AdminService::ensure_client_kind(&config).is_err());
         config.kind = ClientKind::Client;

@@ -379,6 +379,61 @@ impl CacheStore for ValkeyCacheStore {
             }
         }
     }
+
+    async fn get_preview(&self, key: &str) -> Result<Option<Vec<u8>>, ProxyError> {
+        let Some(mut conn) = self.connection().await else {
+            return Ok(None);
+        };
+        match conn.get::<_, Option<Vec<u8>>>(key).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                tracing::warn!(error = %e, key = %key, "GET preview de Valkey falló, tratando como miss");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn set_preview(
+        &self,
+        key: &str,
+        body: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<(), ProxyError> {
+        let Some(mut conn) = self.connection().await else {
+            return Ok(());
+        };
+        let result = if ttl_seconds == 0 {
+            conn.set::<_, _, ()>(key, body.to_vec()).await
+        } else {
+            conn.set_ex::<_, _, ()>(key, body.to_vec(), ttl_seconds)
+                .await
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, key = %key, "SET preview de Valkey falló, omitiendo la caché");
+        }
+        Ok(())
+    }
+
+    async fn check_preview_rate_limit(
+        &self,
+        crypt_id: &str,
+        capability: &str,
+        max_requests: u32,
+        window_seconds: u64,
+    ) -> RateLimitDecision {
+        let key = crate::application::cache_key::preview_rate_limit_key(crypt_id, capability);
+        match self.distributed_count(&key, window_seconds).await {
+            Some((current_count, ttl_ms)) => RateLimitDecision {
+                allowed: current_count <= max_requests,
+                current_count,
+                retry_after_secs: retry_after_secs(ttl_ms, window_seconds),
+                degraded: false,
+            },
+            // El fallback local usa la misma clave compuesta para que cada capacidad tenga su
+            // contador independiente también en modo degradado.
+            None => self.local.check(&key, max_requests, window_seconds),
+        }
+    }
 }
 
 /// Almacén de sesiones y estados OAuth de la API admin sobre la **misma** conexión viva de Valkey
