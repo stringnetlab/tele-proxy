@@ -88,7 +88,10 @@ impl GoogleIdentityProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ProxyError::Internal {
-                reason: format!("No se pudo construir el cliente HTTP de Google OAuth: {}", e),
+                reason: format!(
+                    "No se pudo construir el cliente HTTP de Google OAuth: {}",
+                    e
+                ),
             })?;
         Ok(Self {
             client_id,
@@ -112,10 +115,7 @@ impl GoogleIdentityProvider {
 
     /// JWKS en caché (~1 h); si el `kid` no está, fuerza un refresco una vez. Errores sin
     /// detalles internos: el motivo vive en el log, el cliente recibe un 401 escueto.
-    async fn jwk_for_kid(
-        &self,
-        kid: &str,
-    ) -> Result<jsonwebtoken::jwk::Jwk, ProxyError> {
+    async fn jwk_for_kid(&self, kid: &str) -> Result<jsonwebtoken::jwk::Jwk, ProxyError> {
         {
             let cached = self.jwks.read().await;
             if let Some((set, fetched_at)) = cached.as_ref() {
@@ -136,25 +136,18 @@ impl GoogleIdentityProvider {
     }
 
     async fn fetch_jwks(&self) -> Result<jsonwebtoken::jwk::JwkSet, ProxyError> {
-        let resp = self
-            .http
-            .get(GOOGLE_JWKS_URL)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "Falló la descarga de los JWKS de Google");
-                ProxyError::Unauthorized {
-                    reason: "no se pudieron obtener las claves públicas de Google".to_string(),
-                }
-            })?;
-        let body = crate::infrastructure::http_client::read_body_capped(
-            resp,
-            MAX_OAUTH_RESPONSE_BYTES,
-        )
-        .await
-        .map_err(|_| ProxyError::Unauthorized {
-            reason: "los JWKS de Google no tienen la forma esperada".to_string(),
+        let resp = self.http.get(GOOGLE_JWKS_URL).send().await.map_err(|e| {
+            tracing::warn!(error = %e, "Falló la descarga de los JWKS de Google");
+            ProxyError::Unauthorized {
+                reason: "no se pudieron obtener las claves públicas de Google".to_string(),
+            }
         })?;
+        let body =
+            crate::infrastructure::http_client::read_body_capped(resp, MAX_OAUTH_RESPONSE_BYTES)
+                .await
+                .map_err(|_| ProxyError::Unauthorized {
+                    reason: "los JWKS de Google no tienen la forma esperada".to_string(),
+                })?;
         serde_json::from_slice(&body).map_err(|e| {
             tracing::warn!(error = %e, "Los JWKS de Google no parsean");
             ProxyError::Unauthorized {
@@ -230,14 +223,13 @@ impl IdentityProvider for GoogleIdentityProvider {
                 }
             })?;
 
-        let body = crate::infrastructure::http_client::read_body_capped(
-            resp,
-            MAX_OAUTH_RESPONSE_BYTES,
-        )
-        .await
-        .map_err(|_| ProxyError::Unauthorized {
-            reason: "la respuesta del token endpoint no tiene la forma esperada".to_string(),
-        })?;
+        let body =
+            crate::infrastructure::http_client::read_body_capped(resp, MAX_OAUTH_RESPONSE_BYTES)
+                .await
+                .map_err(|_| ProxyError::Unauthorized {
+                    reason: "la respuesta del token endpoint no tiene la forma esperada"
+                        .to_string(),
+                })?;
         let token: GoogleTokenResponse = serde_json::from_slice(&body).map_err(|e| {
             tracing::warn!(error = %e, "El token endpoint de Google no devolvió un id_token");
             ProxyError::Unauthorized {

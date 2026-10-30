@@ -114,7 +114,10 @@ mod tests {
         // El preflight sigue respondiendo, pero sin Access-Control-Allow-Origin: el navegador
         // bloquea la petición real.
         assert!(response.status().is_success());
-        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
     }
 
     #[test]

@@ -134,7 +134,8 @@ pub struct AdminClientUpdate {
 
 /// Casos de uso de la administración global: login Google con dominios permitidos, sesiones,
 /// verificación del master token y CRUD de admins y clientes con auditoría.
-pub struct AdminService {    repo: Arc<dyn AdminRepository>,
+pub struct AdminService {
+    repo: Arc<dyn AdminRepository>,
     sessions: Arc<dyn SessionStore>,
     providers: IdentityProviders,
     settings: AdminSettings,
@@ -174,14 +175,19 @@ impl AdminService {
 
     /// URL de inicio de login Google con un state fresco (de un solo uso) ya persistido.
     pub async fn google_login_url(&self) -> Result<String, ProxyError> {
-        let provider = self.providers.get("google").ok_or_else(|| {
-            ProxyError::ServiceUnavailable {
-                reason: "login con Google no configurado".to_string(),
-            }
-        })?;
+        let provider =
+            self.providers
+                .get("google")
+                .ok_or_else(|| ProxyError::ServiceUnavailable {
+                    reason: "login con Google no configurado".to_string(),
+                })?;
         let state = nanoid::nanoid!(24);
         self.sessions
-            .setex(&oauth_state_key(&state), "1", self.settings.oauth_state_ttl_seconds)
+            .setex(
+                &oauth_state_key(&state),
+                "1",
+                self.settings.oauth_state_ttl_seconds,
+            )
             .await?;
         Ok(provider.authorization_url(&state))
     }
@@ -201,11 +207,12 @@ impl AdminService {
             });
         }
 
-        let provider = self.providers.get("google").ok_or_else(|| {
-            ProxyError::ServiceUnavailable {
-                reason: "login con Google no configurado".to_string(),
-            }
-        })?;
+        let provider =
+            self.providers
+                .get("google")
+                .ok_or_else(|| ProxyError::ServiceUnavailable {
+                    reason: "login con Google no configurado".to_string(),
+                })?;
         let identity = provider.exchange_code(code).await?;
         self.login_verified_identity("google", identity).await
     }
@@ -254,7 +261,11 @@ impl AdminService {
         }
 
         let session = self.create_session(&admin.email).await?;
-        audit(&admin.email, &format!("login_{provider_name}"), &admin.email);
+        audit(
+            &admin.email,
+            &format!("login_{provider_name}"),
+            &admin.email,
+        );
         Ok(session)
     }
 
@@ -359,7 +370,11 @@ impl AdminService {
         self.invalidate_admin_active_cache(&email).await;
         audit(
             actor,
-            if active { "admin_activate" } else { "admin_deactivate" },
+            if active {
+                "admin_activate"
+            } else {
+                "admin_deactivate"
+            },
             &email,
         );
         Ok(AdminUserResponse::from(saved))
@@ -586,8 +601,7 @@ impl AdminService {
     pub fn ensure_client_kind(config: &ClientConfig) -> Result<(), ProxyError> {
         if config.kind == ClientKind::Admin {
             return Err(ProxyError::Forbidden {
-                reason: "un administrador no puede usar el proxy ni la API de cliente"
-                    .to_string(),
+                reason: "un administrador no puede usar el proxy ni la API de cliente".to_string(),
             });
         }
         Ok(())
@@ -628,7 +642,11 @@ pub(crate) mod tests {
         }
 
         async fn list_admins(&self) -> Result<Vec<AdminUser>, ProxyError> {
-            Ok(self.admins.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            Ok(self
+                .admins
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone())
         }
 
         async fn put_admin(&self, admin: &AdminUser) -> Result<AdminUser, ProxyError> {
@@ -657,7 +675,11 @@ pub(crate) mod tests {
             _limit: u64,
             _skip: u64,
         ) -> Result<(Vec<ClientConfig>, u64), ProxyError> {
-            let clients = self.clients.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let clients = self
+                .clients
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             let total = clients.len() as u64;
             Ok((clients, total))
         }
@@ -710,12 +732,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl SessionStore for FakeSessions {
-        async fn setex(
-            &self,
-            key: &str,
-            value: &str,
-            _ttl_seconds: u64,
-        ) -> Result<(), ProxyError> {
+        async fn setex(&self, key: &str, value: &str, _ttl_seconds: u64) -> Result<(), ProxyError> {
             self.map
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -770,7 +787,7 @@ pub(crate) mod tests {
 
     pub(crate) fn settings(master: Option<&str>) -> AdminSettings {
         AdminSettings {
-            master_token_hash: master.map(|token| keyed_hash(token)),
+            master_token_hash: master.map(keyed_hash),
             allowed_domains: vec!["gmail.com".to_string(), "stringnet.pe".to_string()],
             session_ttl_seconds: 3600,
             oauth_state_ttl_seconds: 300,
@@ -879,7 +896,11 @@ pub(crate) mod tests {
 
         // El state se genera en `google_login_url` y se persiste de un solo uso.
         let url = svc.google_login_url().await.expect("url de login");
-        let state = url.split("state=").nth(1).expect("state en la url").to_string();
+        let state = url
+            .split("state=")
+            .nth(1)
+            .expect("state en la url")
+            .to_string();
 
         let session = svc
             .complete_google_login("code", &state)
@@ -957,7 +978,7 @@ pub(crate) mod tests {
         let state = svc.google_login_url().await.expect("url");
         let state = state.split("state=").nth(1).expect("state").to_string();
         let result = svc.complete_google_login("code", &state).await;
-        assert!(matches!(result, Err(ProxyError::Forbidden { ..})));
+        assert!(matches!(result, Err(ProxyError::Forbidden { .. })));
     }
 
     #[tokio::test]
@@ -1043,12 +1064,18 @@ pub(crate) mod tests {
             IdentityProviders::new(),
             Some("supersecret"),
         );
-        let (config, token) = svc.create_client("master_token", None).await.expect("crear cliente");
+        let (config, token) = svc
+            .create_client("master_token", None)
+            .await
+            .expect("crear cliente");
         assert_eq!(token.len(), 32);
         assert_eq!(config.kind, ClientKind::Client);
         assert_eq!(config.bearer_token_hash, keyed_hash(&token));
         // El token en claro no se guarda: solo su hash.
-        let stored = svc.get_client(&config.internal_id).await.expect("leer cliente");
+        let stored = svc
+            .get_client(&config.internal_id)
+            .await
+            .expect("leer cliente");
         assert!(!serde_json::to_string(&stored)
             .expect("serializar")
             .contains(&token));
@@ -1064,7 +1091,10 @@ pub(crate) mod tests {
             IdentityProviders::new(),
             Some("supersecret"),
         );
-        let (config, token_viejo) = svc.create_client("master_token", None).await.expect("crear");
+        let (config, token_viejo) = svc
+            .create_client("master_token", None)
+            .await
+            .expect("crear");
         let (rotado, token_nuevo) = svc
             .rotate_client_token(&config.internal_id, "master_token")
             .await
@@ -1141,10 +1171,11 @@ pub(crate) mod tests {
             "whitelist": ["example.com"],
             "rate_limit": {"max_requests": 50, "window_seconds": 60}
         }"#;
-        let update: crate::domain::models::ClientConfigUpdate =
-            serde_json::from_str(json).expect("el payload del cliente deserializa (campo ignorado)");
-        crate::domain::validators::validate_config_update(&update)
-            .expect("el payload del cliente valida; el wildcard viajó desapercibido porque no existe");
+        let update: crate::domain::models::ClientConfigUpdate = serde_json::from_str(json)
+            .expect("el payload del cliente deserializa (campo ignorado)");
+        crate::domain::validators::validate_config_update(&update).expect(
+            "el payload del cliente valida; el wildcard viajó desapercibido porque no existe",
+        );
         let serialized = serde_json::to_string(&update).expect("serializar");
         assert!(
             !serialized.contains("wildcard"),

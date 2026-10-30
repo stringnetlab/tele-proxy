@@ -335,8 +335,12 @@ mod tests {
         assert_eq!(config.kind, ClientKind::Client);
 
         // Y con el campo explícito se respeta.
-        let json_wildcard = json.replace("\"config_version\": 3", "\"config_version\": 3, \"wildcard\": true");
-        let config: ClientConfig = serde_json::from_str(&json_wildcard).expect("documento wildcard");
+        let json_wildcard = json.replace(
+            "\"config_version\": 3",
+            "\"config_version\": 3, \"wildcard\": true",
+        );
+        let config: ClientConfig =
+            serde_json::from_str(&json_wildcard).expect("documento wildcard");
         assert!(config.wildcard);
     }
 

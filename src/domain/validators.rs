@@ -1316,8 +1316,14 @@ mod tests {
         );
 
         // Vacío = sin capa CORS (comportamiento actual).
-        assert_eq!(validate_cors_allowed_origins("").expect("vacío"), Vec::<String>::new());
-        assert_eq!(validate_cors_allowed_origins(" , ").expect("vacío"), Vec::<String>::new());
+        assert_eq!(
+            validate_cors_allowed_origins("").expect("vacío"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            validate_cors_allowed_origins(" , ").expect("vacío"),
+            Vec::<String>::new()
+        );
 
         // Comodines y orígenes incompletos se rechazan (con credenciales, '*' sería CSRF).
         for raw in [

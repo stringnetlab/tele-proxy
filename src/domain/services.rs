@@ -83,8 +83,10 @@ pub trait AdminRepository: Send + Sync {
         limit: u64,
         skip: u64,
     ) -> Result<(Vec<ClientConfig>, u64), ProxyError>;
-    async fn get_client_by_internal_id(&self, internal_id: &str)
-        -> Result<ClientConfig, ProxyError>;
+    async fn get_client_by_internal_id(
+        &self,
+        internal_id: &str,
+    ) -> Result<ClientConfig, ProxyError>;
     /// Escribe el documento completo, invalida la caché local bajo los identificadores
     /// anteriores y devuelve el config con el `_rev` actualizado.
     async fn put_client(&self, config: &ClientConfig) -> Result<ClientConfig, ProxyError>;
