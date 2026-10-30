@@ -411,8 +411,14 @@ impl CouchDbRepository {
             }
         }
 
-        let doc: T = resp.json().await.map_err(|e| ProxyError::Internal {
-            reason: format!("No se pudo parsear la respuesta de CouchDB: {}", e),
+        // Se lee el cuerpo y se deserializa aquí (en vez de `resp.json()`) para que el mensaje
+        // incluya el error real de serde —qué campo falta o tiene el tipo equivocado— en lugar del
+        // opaco "error decoding response body" de reqwest, que descarta el detalle.
+        let body = resp.bytes().await.map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo leer el cuerpo de CouchDB ({doc_id}): {e}"),
+        })?;
+        let doc: T = serde_json::from_slice(&body).map_err(|e| ProxyError::Internal {
+            reason: format!("No se pudo parsear el documento de CouchDB '{doc_id}': {e}"),
         })?;
 
         Ok(doc)
