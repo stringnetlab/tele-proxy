@@ -517,6 +517,8 @@ paths:
         el `PUT` comprueba el formato, la comparación `sha256(code) == code_hash` ocurre
         en tiempo de ejecución antes de correr el script (ver `spec.md`, Fase 4).
         Incrementa automáticamente el config_version (invalida caché sin purga masiva).
+        La sección `preview` es del operador: aquí se valida pero no se aplica; se fija con
+        `PUT /api/v1/admin/clients/{id}`.
       security:
         - BearerAuth: []
       requestBody:
@@ -1396,7 +1398,11 @@ components:
             antes de escribir: un error devuelve 400 `invalid_config` con el campo concreto,
             p. ej. `header_rules[0].expression`.
         preview:
-          $ref: "#/components/schemas/PreviewConfig"
+          allOf:
+            - $ref: "#/components/schemas/PreviewConfig"
+          description: |
+            Solo el `PUT` admin la aplica. En el `PUT` de la API de cliente se valida pero se
+            ignora: el interruptor, las capacidades y los topes de preview los decide el operador.
 
     HeaderRule:
       type: object
