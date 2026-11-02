@@ -259,7 +259,12 @@ impl ProxyService {
         // anti-SSRF de IP, igual que en el fetch de `/mt/`.
         let parsed = validate_url_strict(url)?;
         let domain = extract_domain(&parsed)?;
-        if !host_allowed(&domain, &config.whitelist, config.wildcard) {
+        if !host_allowed(
+            &domain,
+            parsed.port_or_known_default(),
+            &config.whitelist,
+            config.wildcard,
+        ) {
             return Err(ProxyError::DomainNotWhitelisted { domain });
         }
         self.validate_destination_ip(&parsed).await?;

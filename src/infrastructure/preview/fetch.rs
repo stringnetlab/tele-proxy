@@ -60,7 +60,12 @@ impl PreviewFetcher {
 
         for _hop in 0..=MAX_REDIRECTS {
             let domain = extract_domain(&current)?;
-            if !host_allowed(&domain, whitelist, wildcard) {
+            if !host_allowed(
+                &domain,
+                current.port_or_known_default(),
+                whitelist,
+                wildcard,
+            ) {
                 return Err(ProxyError::DomainNotWhitelisted { domain });
             }
 

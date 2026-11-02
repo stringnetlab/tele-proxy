@@ -162,21 +162,70 @@ pub fn extract_domain(url: &Url) -> Result<String, ProxyError> {
     Ok(host.to_lowercase())
 }
 
-pub fn domain_matches_whitelist(domain: &str, whitelist: &[String]) -> bool {
-    let domain_lower = domain.to_lowercase();
-    whitelist.iter().any(|allowed| {
-        let allowed_lower = allowed.to_lowercase();
-        domain_lower == allowed_lower || domain_lower.ends_with(&format!(".{}", allowed_lower))
+/// Autorización de salida por dominio y puerto del pipeline anti-SSRF. Una entrada `host` permite
+/// cualquier puerto; una entrada `host:puerto` solo ese puerto efectivo (`port_or_known_default`,
+/// así que `https://host` compara con 443 y `http://host` con 80). Las entradas con corchetes
+/// (`[2001:db8::1]`) se comparan como IP exacta, sin sufijos.
+pub fn host_matches_whitelist(host: &str, port: Option<u16>, whitelist: &[String]) -> bool {
+    let host = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
+    whitelist.iter().any(|entry| {
+        let Some((allowed_host, allowed_port)) = parse_whitelist_entry(entry) else {
+            return false;
+        };
+        if allowed_port.is_some() && allowed_port != port {
+            return false;
+        }
+        let allowed_host = allowed_host.to_lowercase();
+        // IPs literales (IPv4 o IPv6 entre corchetes) se comparan exactas; el matching por
+        // sufijo solo tiene sentido para nombres.
+        if allowed_host.contains(':') || allowed_host.parse::<IpAddr>().is_ok() {
+            host == allowed_host
+        } else {
+            host == allowed_host || host.ends_with(&format!(".{}", allowed_host))
+        }
     })
 }
 
-/// Autorización de salida por dominio del pipeline anti-SSRF. Con `wildcard: true` (cliente
-/// especial de confianza, fijado **solo** por la API admin) la whitelist se ignora: cualquier
-/// dominio pasa. Lo que wildcard NO salta es la capa de IP: las IP privadas literales las
-/// rechaza `validate_url_strict` antes de llegar aquí, y las resueltas por DNS las cierra el
-/// pinning con `resolve_and_validate`. Un cliente wildcard sigue sin poder tocar redes internas.
-pub fn host_allowed(domain: &str, whitelist: &[String], wildcard: bool) -> bool {
-    wildcard || domain_matches_whitelist(domain, whitelist)
+/// Autorización de salida del pipeline anti-SSRF. Con `wildcard: true` (cliente especial de
+/// confianza, fijado **solo** por la API admin) la whitelist se ignora: cualquier dominio pasa.
+/// Lo que wildcard NO salta es la capa de IP: las IP privadas literales las rechaza
+/// `validate_url_strict` antes de llegar aquí, y las resueltas por DNS las cierra el pinning con
+/// `resolve_and_validate`. Un cliente wildcard sigue sin poder tocar redes internas.
+pub fn host_allowed(host: &str, port: Option<u16>, whitelist: &[String], wildcard: bool) -> bool {
+    wildcard || host_matches_whitelist(host, port, whitelist)
+}
+
+/// Separa `host[:puerto]` de una entrada de `whitelist`. `None` significa "entrada inerte": la
+/// validación de escritura ya la habría rechazado, pero un documento editado a mano en CouchDB
+/// puede traer cualquier cosa y no debe autorizar nada.
+fn parse_whitelist_entry(entry: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        return match tail {
+            "" => Some((host, None)),
+            _ => Some((host, Some(parse_port(tail.strip_prefix(':')?)?))),
+        };
+    }
+
+    match entry.matches(':').count() {
+        0 => Some((entry, None)),
+        1 => {
+            let (host, port) = entry.rsplit_once(':')?;
+            if host.is_empty() {
+                return None;
+            }
+            Some((host, Some(parse_port(port)?)))
+        }
+        // IPv6 sin corchetes: ambigua entre host y puerto.
+        _ => None,
+    }
+}
+
+fn parse_port(raw: &str) -> Option<u16> {
+    raw.parse::<u16>().ok().filter(|port| *port != 0)
 }
 
 /// Cotas de `ClientConfigUpdate` (`docs/api_contract.yaml`), comprobadas **antes** de escribir en
@@ -616,11 +665,22 @@ pub fn validate_allowed_domain_list(raw: &str) -> Result<Vec<String>, ProxyError
     Ok(domains)
 }
 
-/// Una entrada de `whitelist` tiene que ser el host desnudo: si admite `:`, `/`, `@`, espacios o
-/// caracteres de control, el cliente puede meter una cabecera `Host`/`Authorization` entera
-/// (`docs/BDD.md`, Feature 6); si admite una IP privada, fija la puerta anti-SSRF desde la config.
+/// Una entrada de `whitelist` es `host` (cualquier puerto) o `host:puerto` (solo ese puerto). Si
+/// admitiera `/`, `@`, espacios o caracteres de control, el cliente podría meter una cabecera
+/// `Host`/`Authorization` entera (`docs/BDD.md`, Feature 6); si admitiera una IP privada, fijaría
+/// la puerta anti-SSRF desde la config.
 fn validate_whitelist_entry(entry: &str) -> Result<(), ProxyError> {
-    if let Ok(ip) = entry.parse::<IpAddr>() {
+    let Some((host, _port)) = parse_whitelist_entry(entry) else {
+        return Err(invalid_config(
+            "whitelist",
+            format!(
+                "'{}' is not a bare domain name or host:port",
+                display_entry(entry)
+            ),
+        ));
+    };
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_ip(&ip) {
             return Err(invalid_config(
                 "whitelist",
@@ -633,10 +693,13 @@ fn validate_whitelist_entry(entry: &str) -> Result<(), ProxyError> {
         return Ok(());
     }
 
-    if !is_valid_hostname(entry) {
+    if !is_valid_hostname(host) {
         return Err(invalid_config(
             "whitelist",
-            format!("'{}' is not a bare domain name", display_entry(entry)),
+            format!(
+                "'{}' is not a bare domain name or host:port",
+                display_entry(entry)
+            ),
         ));
     }
 
@@ -841,24 +904,131 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_matches_whitelist() {
+    fn test_host_matches_whitelist() {
         let whitelist = vec![
             "shutterstock.com".to_string(),
             "gettyimages.com".to_string(),
         ];
 
-        assert!(domain_matches_whitelist("shutterstock.com", &whitelist));
-        assert!(domain_matches_whitelist("www.shutterstock.com", &whitelist));
-        assert!(domain_matches_whitelist("cdn.shutterstock.com", &whitelist));
-        assert!(domain_matches_whitelist("SHUTTERSTOCK.COM", &whitelist));
-        assert!(domain_matches_whitelist("gettyimages.com", &whitelist));
-
-        assert!(!domain_matches_whitelist("malicious.com", &whitelist));
-        assert!(!domain_matches_whitelist("notshutterstock.com", &whitelist));
-        assert!(!domain_matches_whitelist(
-            "shutterstock.com.evil.com",
+        assert!(host_matches_whitelist(
+            "shutterstock.com",
+            Some(443),
             &whitelist
         ));
+        assert!(host_matches_whitelist(
+            "www.shutterstock.com",
+            Some(443),
+            &whitelist
+        ));
+        assert!(host_matches_whitelist(
+            "cdn.shutterstock.com",
+            Some(80),
+            &whitelist
+        ));
+        assert!(host_matches_whitelist("SHUTTERSTOCK.COM", None, &whitelist));
+        assert!(host_matches_whitelist(
+            "gettyimages.com",
+            Some(8443),
+            &whitelist
+        ));
+
+        assert!(!host_matches_whitelist(
+            "malicious.com",
+            Some(443),
+            &whitelist
+        ));
+        assert!(!host_matches_whitelist(
+            "notshutterstock.com",
+            Some(443),
+            &whitelist
+        ));
+        assert!(!host_matches_whitelist(
+            "shutterstock.com.evil.com",
+            Some(443),
+            &whitelist
+        ));
+
+        // Una IP literal se compara exacta, sin matching por sufijo.
+        let ips = vec!["8.8.8.8".to_string()];
+        assert!(host_matches_whitelist("8.8.8.8", Some(53), &ips));
+        assert!(!host_matches_whitelist("1.8.8.8.8", Some(53), &ips));
+    }
+
+    #[test]
+    fn test_whitelist_entry_con_puerto_limita_el_egress() {
+        let con_puerto = vec!["cdn.example.com:8443".to_string()];
+        assert!(host_matches_whitelist(
+            "cdn.example.com",
+            Some(8443),
+            &con_puerto
+        ));
+        assert!(host_matches_whitelist(
+            "sub.cdn.example.com",
+            Some(8443),
+            &con_puerto
+        ));
+        assert!(!host_matches_whitelist(
+            "cdn.example.com",
+            Some(443),
+            &con_puerto
+        ));
+
+        // Una entrada sin puerto sigue permitiendo cualquier puerto.
+        let sin_puerto = vec!["example.com".to_string()];
+        assert!(host_matches_whitelist(
+            "example.com",
+            Some(443),
+            &sin_puerto
+        ));
+        assert!(host_matches_whitelist("example.com", Some(22), &sin_puerto));
+
+        // IPv6 entre corchetes: comparación exacta, sin sufijos.
+        let ipv6 = vec!["[2606:4700::1111]:443".to_string()];
+        assert!(host_matches_whitelist("2606:4700::1111", Some(443), &ipv6));
+        assert!(!host_matches_whitelist("2606:4700::1111", Some(80), &ipv6));
+        assert!(!host_matches_whitelist("2606:4700::1112", Some(443), &ipv6));
+    }
+
+    #[test]
+    fn test_validate_whitelist_entry_acepta_puertos_validos() {
+        for entry in [
+            "example.com",
+            "example.com:443",
+            "8.8.8.8:53",
+            "[2606:4700::1111]:8443",
+        ] {
+            let update = ClientConfigUpdate {
+                whitelist: Some(vec![entry.to_string()]),
+                ..base_update()
+            };
+            assert!(
+                validate_config_update(&update).is_ok(),
+                "{entry:?} debería ser aceptada"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_whitelist_entry_rechaza_puertos_invalidos() {
+        for entry in [
+            "example.com:0",
+            "example.com:65536",
+            "example.com:http",
+            "example.com:",
+            ":443",
+            "https://example.com",
+            "user:pass@example.com",
+            "2001:db8::1",
+        ] {
+            let update = ClientConfigUpdate {
+                whitelist: Some(vec![entry.to_string()]),
+                ..base_update()
+            };
+            assert!(
+                validate_config_update(&update).is_err(),
+                "{entry:?} debería ser rechazada"
+            );
+        }
     }
 
     #[test]
@@ -868,20 +1038,25 @@ mod tests {
         // wildcard=true: cualquier dominio pasa, whitelist vacía incluida.
         for domain in ["example.com", "api.cualquiera.org", "otro.net"] {
             assert!(
-                host_allowed(domain, &[], true),
+                host_allowed(domain, Some(443), &[], true),
                 "{domain:?} debería pasar con wildcard"
             );
             assert!(
-                host_allowed(domain, &whitelist, true),
+                host_allowed(domain, Some(443), &whitelist, true),
                 "{domain:?} debería pasar con wildcard aunque la whitelist diga otra cosa"
             );
         }
 
         // wildcard=false (o ausente): comportamiento actual, exactamente la whitelist.
-        assert!(host_allowed("example.com", &whitelist, false));
-        assert!(host_allowed("cdn.example.com", &whitelist, false));
-        assert!(!host_allowed("api.cualquiera.org", &whitelist, false));
-        assert!(!host_allowed("example.com", &[], false));
+        assert!(host_allowed("example.com", Some(443), &whitelist, false));
+        assert!(host_allowed("cdn.example.com", Some(80), &whitelist, false));
+        assert!(!host_allowed(
+            "api.cualquiera.org",
+            Some(443),
+            &whitelist,
+            false
+        ));
+        assert!(!host_allowed("example.com", Some(443), &[], false));
     }
 
     #[test]
@@ -953,7 +1128,6 @@ mod tests {
     #[test]
     fn test_validate_config_update_rejects_whitelist_entries_that_are_not_bare_hosts() {
         let entries = [
-            "shutterstock.com:8080",
             "user:pass@shutterstock.com",
             "https://shutterstock.com",
             "shutterstock.com/admin",

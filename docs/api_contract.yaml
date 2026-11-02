@@ -1283,9 +1283,13 @@ components:
           description: Versión actual de la configuración
         whitelist:
           type: array
+          description: |
+            Hosts permitidos para la salida del cliente. Cada entrada es `host` (cualquier
+            puerto) o `host:puerto` (solo el puerto efectivo; 443/80 por defecto). Matching
+            por sufijo para nombres y exacto para IP literales.
           items:
             type: string
-          example: ["shutterstock.com", "gettyimages.com"]
+          example: ["shutterstock.com", "cdn.gettyimages.com:8443"]
         rate_limit:
           type: object
           properties:
@@ -1349,9 +1353,12 @@ components:
       properties:
         whitelist:
           type: array
+          description: |
+            Hosts permitidos para la salida del cliente. Cada entrada es `host` (cualquier
+            puerto) o `host:puerto` (solo el puerto efectivo; 443/80 por defecto).
           items:
             type: string
-          example: ["shutterstock.com", "gettyimages.com"]
+          example: ["shutterstock.com", "cdn.gettyimages.com:8443"]
         rate_limit:
           type: object
           properties:

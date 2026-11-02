@@ -110,6 +110,14 @@ Feature: Protección Anti-SSRF y DNS Seguro
     When envío una solicitud con "?url=ftp://user:pass@169.254.169.254/"
     Then el servicio debe responder con HTTP 400 Bad Request
     And debe registrar un log de error con "event": "invalid_url_format"
+
+  Scenario: La whitelist puede fijar el puerto de salida
+    Given el cliente tiene "whitelist": ["cdn.example.com:8443"]
+    When solicita "https://cdn.example.com:8443/asset.png"
+    Then la petición supera la comprobación de whitelist
+    When solicita "https://cdn.example.com/asset.png" (puerto efectivo 443)
+    Then el servicio responde con HTTP 403 "domain_not_whitelisted"
+    And una entrada sin puerto ("example.com") sigue admitiendo cualquier puerto
 ```
 
 ## Feature 3: Caché, Streaming y Límites de Recursos

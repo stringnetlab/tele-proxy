@@ -338,15 +338,16 @@ Cada cliente es un documento JSON en la base `tele_proxy_configs` de CouchDB, ge
 #### `whitelist` — dominios permitidos
 
 ```json
-"whitelist": ["shutterstock.com", "8.8.8.8"]
+"whitelist": ["shutterstock.com", "cdn.gettyimages.com:8443", "8.8.8.8"]
 ```
 
 | Restricción | Valor |
 |---|---|
 | Máximo | 100 entradas |
-| Formato | Hostname desnudo (sin esquema, puerto, path, credenciales ni fragmento) o IP **pública** |
-| Matching | Sufijo, case-insensitive: `cdn.shutterstock.com` matchea `shutterstock.com` |
-| Rechazadas | `localhost`, IPs privadas (RFC 1918, loopback, link-local, CGNAT), `dominio:8080`, `https://dominio`, `user:pass@dominio` |
+| Formato | `host` o `host:puerto` (sin esquema, path, credenciales ni fragmento) o IP **pública** |
+| Puertos | Sin puerto: cualquier puerto. Con puerto: solo el efectivo (443/80 por defecto) |
+| Matching | Sufijo, case-insensitive: `cdn.shutterstock.com` matchea `shutterstock.com`; las IP se comparan exactas |
+| Rechazadas | `localhost`, IPs privadas (RFC 1918, loopback, link-local, CGNAT), `dominio:0`, `dominio:http`, `https://dominio`, `user:pass@dominio` |
 
 #### `rate_limit` — límite de peticiones
 
