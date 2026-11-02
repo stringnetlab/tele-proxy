@@ -114,9 +114,13 @@ el body crudo del origen.
 3. `/pv/` entrega al sidecar **después** de validar el destino (whitelist + anti-SSRF de IP), para
    que Chromium no pueda apuntar a redes internas.
 
-No hay escalado automático `prerender=auto` en esta entrega: `/mt/` es siempre fetch-only y `/pv/`
-es siempre render (vía sidecar). [PENDIENTE] la puerta de usabilidad html-get (fetch → render solo
-si el render es estrictamente mejor).
+`/mt/` es fetch-first: la extracción directa es la vía normal y no depende del sidecar. La puerta
+de usabilidad html-get **sí está implementada** [IMPLEMENTADO]: si el fetch devuelve un desafío
+anti-bot declarado o un documento sin título, descripción ni imagen (shell de SPA), se escala a
+`/content` del sidecar y se reconstruye el preview con el HTML renderizado. El render solo sustituye
+al fetch si aporta **estrictamente más** campos (`preview_quality`) y sin señal anti-bot; cualquier
+fallo del sidecar degrada al resultado del fetch. `?prerender=auto` sigue sin existir: la decisión
+es interna, no un parámetro del cliente. `/pv/` continúa siendo siempre render.
 
 ---
 
