@@ -113,7 +113,12 @@ async fn handle_proxy(
     // `wildcard` (cliente de confianza) salta solo la whitelist de dominios: la capa de IP
     // (IP privadas literales aquí arriba en `validate_url_strict`, pinning DNS después) sigue
     // aplicando exactamente igual.
-    if !host_allowed(&domain, &config.whitelist, config.wildcard) {
+    if !host_allowed(
+        &domain,
+        url.port_or_known_default(),
+        &config.whitelist,
+        config.wildcard,
+    ) {
         return Err(api_err(ProxyError::DomainNotWhitelisted { domain }));
     }
 
@@ -1014,8 +1019,8 @@ mod tests {
         use crate::domain::validators::{host_allowed, validate_url_strict};
 
         // Cliente wildcard: la whitelist de dominios se ignora (cualquier host pasa)...
-        assert!(host_allowed("169.254.169.254", &[], true));
-        assert!(host_allowed("api.cualquiera.org", &[], true));
+        assert!(host_allowed("169.254.169.254", Some(80), &[], true));
+        assert!(host_allowed("api.cualquiera.org", Some(443), &[], true));
 
         // ...pero la capa de IP está **antes** y no depende de wildcard: la IP privada literal
         // sigue cayendo con 403 `ssrf_blocked` en `validate_url_strict`, igual que para un

@@ -68,7 +68,12 @@ impl WebhookFetcher for ValidatingWebhookFetcher {
 
         // `wildcard` heredado del cliente: salta la whitelist de dominios, no el anti-SSRF de IP
         // (`validate_url_strict` arriba y el resolver validado abajo siguen aplicando).
-        if !host_allowed(&domain, &request.whitelist, request.wildcard) {
+        if !host_allowed(
+            &domain,
+            url.port_or_known_default(),
+            &request.whitelist,
+            request.wildcard,
+        ) {
             return Err(ProxyError::DomainNotWhitelisted { domain });
         }
 
