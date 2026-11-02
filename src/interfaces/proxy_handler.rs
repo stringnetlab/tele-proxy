@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use serde::Deserialize;
 
@@ -25,6 +25,41 @@ pub struct ProxyQuery {
 }
 
 pub async fn proxy_handler(
+    State(service): State<Arc<ProxyService>>,
+    Path(crypt_id): Path<String>,
+    Query(query): Query<ProxyQuery>,
+    request_headers: HeaderMap,
+) -> Response {
+    let started = std::time::Instant::now();
+    let path = format!("/aq/{crypt_id}/");
+    let result = handle_proxy(
+        State(service),
+        Path(crypt_id),
+        Query(query),
+        request_headers,
+    )
+    .await;
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    tracing::info!(
+        event = "request_completed",
+        method = "GET",
+        path = %path,
+        status = response.status().as_u16(),
+        x_cache = response
+            .headers()
+            .get("X-Cache")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "proxy request finished"
+    );
+    response
+}
+
+async fn handle_proxy(
     State(service): State<Arc<ProxyService>>,
     Path(crypt_id): Path<String>,
     Query(query): Query<ProxyQuery>,
@@ -93,6 +128,15 @@ pub async fn proxy_handler(
         .await
         .map_err(&api_err)?
     {
+        log_mime_discrepancy(
+            &crypt_id,
+            query.mime.as_deref(),
+            cached
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.as_str()),
+        );
         let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)
             .map_err(&api_err)?;
         if degraded {
@@ -185,6 +229,8 @@ pub async fn proxy_handler(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
+
+    log_mime_discrepancy(&crypt_id, query.mime.as_deref(), Some(content_type));
 
     let mut response_pairs: Vec<(String, String)> = headers
         .iter()
@@ -752,6 +798,30 @@ fn must_not_forward_header(name: &str) -> bool {
     )
 }
 
+/// La respuesta siempre conserva el `Content-Type` del origen; `?mime=` solo alimenta al script
+/// Lua y la cadena de fallback. Cuando ambos discrepan se registra el evento para detectar
+/// clientes que asumen un tipo que el origen no entrega (BDD Feature 5).
+fn log_mime_discrepancy(crypt_id: &str, forced_mime: Option<&str>, real_mime: Option<&str>) {
+    let (Some(forced), Some(real)) = (forced_mime, real_mime) else {
+        return;
+    };
+    let forced = normalize_mime(forced);
+    let real = normalize_mime(real);
+    if !forced.eq_ignore_ascii_case(real) {
+        tracing::warn!(
+            event = "mime_discrepancy",
+            crypt_id = %crypt_id,
+            forced_mime = %forced,
+            real_mime = %real,
+            "el ?mime= forzado difiere del Content-Type real del origen"
+        );
+    }
+}
+
+fn normalize_mime(value: &str) -> &str {
+    value.split(';').next().unwrap_or(value).trim()
+}
+
 // Derive a MIME type from the requested URL's path extension so wrapped-mode fallbacks
 // pick the right embedded placeholder (e.g. an image SVG for ".jpg") when the caller
 // did not pass an explicit "?mime=" param. Returns None for unknown or extension-less
@@ -812,7 +882,14 @@ pub(crate) fn validate_crypt_id(crypt_id: &str) -> bool {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{infer_mime_from_url, must_not_forward_header};
+    use super::{infer_mime_from_url, must_not_forward_header, normalize_mime};
+
+    #[test]
+    fn normaliza_el_mime_para_comparar_sin_parametros_ni_mayusculas() {
+        assert_eq!(normalize_mime(" text/HTML ; charset=utf-8"), "text/HTML");
+        assert_eq!(normalize_mime("image/jpeg"), "image/jpeg");
+        assert_eq!(normalize_mime(""), "");
+    }
 
     #[test]
     fn wildcard_no_salta_el_antissrf_de_ip() {

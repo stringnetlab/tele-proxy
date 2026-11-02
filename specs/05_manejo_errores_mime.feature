@@ -36,7 +36,7 @@ Feature: Respuestas de Error Consistentes
     Then el servicio debe priorizar el parámetro "?mime=" sobre el header "Accept"
     And debe servir el fallback de PDF
 
-  @linux @pending
+  @linux
   Scenario: Discrepancia entre MIME forzado y real
     Given el cliente solicita "?mime=text/html"
     But el origen responde exitosamente con "Content-Type: image/jpeg"
