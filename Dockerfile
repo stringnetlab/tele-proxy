@@ -48,6 +48,9 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/tele-proxy /app/tele-proxy
 COPY --from=builder /app/config /app/config
+# Smoke test del sidecar de render (docs/DEPLOYMENT.md § Verificación del sidecar). Se ejecuta
+# dentro de este contenedor porque comparte `red-preview` y ya trae curl.
+COPY scripts /app/scripts
 
 RUN chown -R teleproxy:teleproxy /app
 

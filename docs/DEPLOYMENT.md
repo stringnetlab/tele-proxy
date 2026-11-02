@@ -318,6 +318,34 @@ for i in $(seq 1 60); do curl -s -o /dev/null -w '%{http_code} ' \
 curl -si "https://tele.velone.ai/aq/${CRYPT_ID}/?url=${URL}" | grep -i '^retry-after'
 ```
 
+### 7. Verificación del sidecar de render (browserless)
+
+El sidecar no publica puerto: solo es alcanzable desde `tele-proxy` por `red-preview`. El script
+versionado `scripts/smoke_render.sh` (copiado a `/app/scripts` en la imagen) verifica el contrato
+completo de `src/infrastructure/preview/renderer.rs` contra un sidecar real:
+
+- `GET /pressure` → 200 y JSON con `pressure` (lo usa `BrowserlessRenderer::healthy()`)
+- `POST /content` → HTML renderizado (lo usa el escalado de `/mt/`)
+- `POST /screenshot` → PNG (magic bytes `89 50 4E 47`)
+- `POST /pdf` → PDF (magic bytes `%PDF-`)
+- si `BROWSERLESS_TOKEN` está definido, `/pressure` **sin** token debe responder 401/403
+
+```bash
+# dentro del compose: usa la misma red y las mismas variables que el proxy
+docker compose exec tele-proxy sh /app/scripts/smoke_render.sh
+
+# con un sidecar accesible desde el host (p. ej. puerto publicado en local)
+BROWSERLESS_URL=http://localhost:3000 BROWSERLESS_TOKEN=... sh scripts/smoke_render.sh
+```
+
+Variables opcionales: `SMOKE_URL` (default `https://example.com/`), `SMOKE_MARKER` (texto que
+`/content` debe devolver, default `Example Domain`), `SMOKE_TIMEOUT_MS` (default `15000`) y
+`SMOKE_ATTEMPTS` (reintentos de arranque, default `10`). Sale con código distinto de cero si falla
+cualquier comprobación, así que sirve tal cual en un pipeline.
+
+> El script comprueba **el sidecar**, no `/pv/`: un fallo aquí no tumba `/mt/` (fetch-first) y solo
+> degrada `/pv/` a `503 render_unavailable`, por diseño.
+
 ## Monitoreo
 
 ### Logs
