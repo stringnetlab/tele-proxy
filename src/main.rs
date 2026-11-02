@@ -15,7 +15,9 @@ use tele_proxy::application::settings_store::{
     install_document, run_settings_refresh, SettingsStore, SETTINGS_REFRESH_INTERVAL,
 };
 use tele_proxy::application::webhook_service::{self, ValidatingWebhookFetcher};
-use tele_proxy::domain::runtime_settings::{RuntimeSettings, RuntimeSettingsPatch};
+use tele_proxy::domain::runtime_settings::{
+    RuntimeSettings, RuntimeSettingsPatch, CACHEABLE_SIZE_BYTES_RANGE, MAX_RESPONSE_BYTES_RANGE,
+};
 use tele_proxy::domain::services::{AdminRepository, SettingsRepository};
 use tele_proxy::domain::validators::{validate_allowed_domain_list, validate_cors_allowed_origins};
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
@@ -42,6 +44,10 @@ struct AppConfig {
     valkey_url: String,
     config_cache_ttl: u64,
     config_cache_max_capacity: u64,
+    /// Baseline de `runtime_settings.max_response_bytes` (techo de lectura del origen).
+    max_response_bytes: u64,
+    /// Baseline de `runtime_settings.cacheable_size_bytes` (por encima no se cachea).
+    cacheable_size_bytes: u64,
     lua_timeout_ms: u64,
     lua_memory_limit_mb: u32,
     webhook_timeout_ms: u64,
@@ -84,6 +90,18 @@ impl AppConfig {
             config_cache_max_capacity: env_var_or("CONFIG_CACHE_MAX_CAPACITY", "10000")?
                 .parse()
                 .map_err(|e| format!("Invalid CONFIG_CACHE_MAX_CAPACITY: {}", e))?,
+            max_response_bytes: parse_in_range(
+                "MAX_RESPONSE_SIZE_BYTES",
+                "104857600",
+                MAX_RESPONSE_BYTES_RANGE.0,
+                MAX_RESPONSE_BYTES_RANGE.1,
+            )?,
+            cacheable_size_bytes: parse_in_range(
+                "MAX_CACHEABLE_SIZE_BYTES",
+                "5242880",
+                CACHEABLE_SIZE_BYTES_RANGE.0,
+                CACHEABLE_SIZE_BYTES_RANGE.1,
+            )?,
             lua_timeout_ms: parse_in_range("LUA_TIMEOUT_MS", "200", 1u64, 60_000u64)?,
             lua_memory_limit_mb: env_var_or("LUA_MEMORY_LIMIT_MB", "50")?
                 .parse()
@@ -227,6 +245,8 @@ where
 fn runtime_settings_from_env(config: &AppConfig) -> RuntimeSettings {
     RuntimeSettings {
         upstream_user_agent: config.upstream_user_agent.clone(),
+        max_response_bytes: config.max_response_bytes,
+        cacheable_size_bytes: config.cacheable_size_bytes,
         lua_timeout_ms: config.lua_timeout_ms,
         lua_memory_limit_mb: config.lua_memory_limit_mb,
         webhook_timeout_ms: config.webhook_timeout_ms,
@@ -618,7 +638,40 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::index_body;
+    use super::{index_body, runtime_settings_from_env, AppConfig};
+
+    fn app_config() -> AppConfig {
+        AppConfig {
+            http_proxy_port: 8080,
+            http_control_port: 8081,
+            http_host: "127.0.0.1".to_string(),
+            couchdb_url: "http://couchdb:5984".to_string(),
+            couchdb_user: "user".to_string(),
+            couchdb_password: "pass".to_string(),
+            couchdb_db_name: "tele_proxy_configs".to_string(),
+            valkey_url: "redis://valkey:6379".to_string(),
+            config_cache_ttl: 300,
+            config_cache_max_capacity: 10_000,
+            max_response_bytes: 7 << 20,
+            cacheable_size_bytes: 2 << 20,
+            lua_timeout_ms: 200,
+            lua_memory_limit_mb: 50,
+            webhook_timeout_ms: 5_000,
+            modo_desarrollo: false,
+            upstream_user_agent: String::new(),
+            browserless_url: String::new(),
+            browserless_token: String::new(),
+            render_timeout_ms: 30_000,
+            preview_asset_max_bytes: 10 << 20,
+        }
+    }
+
+    #[test]
+    fn los_techos_de_bytes_del_entorno_alimentan_runtime_settings() {
+        let settings = runtime_settings_from_env(&app_config());
+        assert_eq!(settings.max_response_bytes, 7 << 20);
+        assert_eq!(settings.cacheable_size_bytes, 2 << 20);
+    }
 
     #[test]
     fn index_en_produccion_es_solo_el_release() {

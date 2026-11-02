@@ -124,21 +124,22 @@ y en el secret store de Dokploy.
 | `CONFIG_CACHE_MAX_CAPACITY` | Entradas máximas de Moka | `10000` | No | **activa** |
 | `DEFAULT_CACHE_TTL_SECONDS` | TTL de respuestas cacheadas en Valkey | `3600` | No | designada — Fase 3 |
 | `IP_CACHE_TTL_SECONDS` | TTL de la caché LRU de DNS | `300` | No | designada — `infrastructure/dns_resolver.rs`, Fase 2 |
-| `MAX_CACHEABLE_SIZE_BYTES` | Tamaño máximo cacheable (5 MB) | `5242880` | No | designada — decide `CacheDirective::Bypass`, Fase 3 |
+| `MAX_CACHEABLE_SIZE_BYTES` | Tamaño máximo cacheable (5 MB) | `5242880` | No | **activa** — baseline de `runtime_settings.cacheable_size_bytes`; rango `1024..=536870912` en el arranque, recargable en caliente |
 
 ## Límites del sistema
 
 | Variable | Descripción | Default | Req | Dónde |
 | --- | --- | --- | --- | --- |
-| `MAX_RESPONSE_SIZE_BYTES` | Tamaño máximo de respuesta del origen (100 MB) | `104857600` | No | designada — `upstream_response_body_filter`, Fase 3 |
-| `MAX_SCRIPTING_BODY_BYTES` | Cuerpo máximo que entra a Lua (5 MB) | `5242880` | No | designada como default: el bypass decide por `ClientConfig.max_scripting_body_bytes` (documento CouchDB), no por esta variable |
+| `MAX_RESPONSE_SIZE_BYTES` | Tamaño máximo de respuesta del origen (100 MB) | `104857600` | No | **activa** — baseline de `runtime_settings.max_response_bytes`; rango `1048576..=536870912` en el arranque, recargable en caliente |
+| `MAX_SCRIPTING_BODY_BYTES` | Cuerpo máximo que entra a Lua (5 MB) | `5242880` | No | **retirada** — el valor efectivo lo decide `ClientConfig.max_scripting_body_bytes` (documento CouchDB); esta variable nunca se leyó |
 | `UPSTREAM_USER_AGENT` | User-Agent por defecto para las peticiones al origen cuando el **cliente no envía el suyo**. Vacío = el de reqwest. El `User-Agent` del cliente, si llega, siempre se reenvía tal cual (lo mismo `Accept-Language`) | `""` | No | **activa** — `AppConfig::from_env()` → `runtime_settings_from_env()` (main.rs) fija el baseline de `runtime_settings.upstream_user_agent`; recargable en caliente vía `PATCH /api/v1/admin/settings` |
 | `LUA_TIMEOUT_MS` | Deadline de ejecución Lua | `200` | No | **activa** — parseada y validada por `parse_in_range` (`main.rs:57`, la función en `main.rs:75`); alimenta el baseline de `runtime_settings.lua_timeout_ms`, recargable en caliente |
 | `LUA_MEMORY_LIMIT_MB` | Límite de memoria del sandbox | `50` | No | **activa** — baseline de `runtime_settings.lua_memory_limit_mb`, recargable en caliente |
 | `WEBHOOK_TIMEOUT_MS` | Timeout de `proxy.http_request` | `5000` | No | **activa** — parseada por `parse_in_range` (`main.rs:61`); baseline de `runtime_settings.webhook_timeout_ms`, que es el techo de `WebhookRequest.timeout_ms` (`application/webhook_service.rs`) y el deadline del puente Lua->tokio (`application/lua_engine.rs`). Recargable en caliente |
 
 > **Valores congelados → `runtime_settings` recargables.** `UPSTREAM_USER_AGENT`, `LUA_TIMEOUT_MS`,
-> `LUA_MEMORY_LIMIT_MB`, `WEBHOOK_TIMEOUT_MS` y `MODO` (→ `verbose_errors`) ya no quedan fijados en
+> `LUA_MEMORY_LIMIT_MB`, `WEBHOOK_TIMEOUT_MS`, `MAX_RESPONSE_SIZE_BYTES`,
+> `MAX_CACHEABLE_SIZE_BYTES` y `MODO` (→ `verbose_errors`) ya no quedan fijados en
 > el arranque: ahora son el **baseline** del documento `runtime_settings` de CouchDB y su valor
 > efectivo se cambia en caliente con `PATCH /api/v1/admin/settings` (ver `api_contract.yaml`). El
 > entorno sigue validando el baseline en el arranque (`parse_in_range`); fuera de rango el proceso
@@ -183,7 +184,7 @@ las variables `DNS_*`/`IP_CACHE_TTL_SECONDS` cuando esas fases cableen su lectur
 
 | Variable | Descripción | Default | Req | Dónde |
 | --- | --- | --- | --- | --- |
-| `CRYPT_ID_LENGTH` | Longitud del nanoid de `crypt_id` | `12` | No | designada — el validador hoy compara `12` fijo (`RUST_STYLE_GUIDE.md:435`) |
+| `CRYPT_ID_LENGTH` | Longitud del nanoid de `crypt_id` | `12` | No | **descartada** — el contrato público fija `crypt_id` de 12 caracteres y el validador lo exige; hacerla configurable invalidaría las URLs ya distribuidas (ver § Validaciones) |
 | `BEARER_TOKEN_HASH_ALGORITHM` | Algoritmo de hash de tokens Bearer | `sha256` | No | designada — middleware de `/api/v1/`, Fase 5 |
 | `MASTER_BEARER_TOKEN` | Fallback de emergencia para la API admin (`/api/v1/admin/*`). **Solo** autoriza rutas admin: nunca la API de cliente ni el proxy. En memoria se guarda siempre hasheado (`sha256:<hex>`); vacío/ausente = master deshabilitado | vacío (deshabilitado) | No | **activa** — `admin_settings_from_env()` (`main.rs`), verificado en `AdminService::verify_master_token` |
 
@@ -257,11 +258,11 @@ Rangos aceptados; fuera de ellos el arranque **falla** (no se degrada al default
 | `ADMIN_RATE_LIMIT_REQUESTS` / `CONTROL_RATE_LIMIT_REQUESTS` | `1..=10000` | idem | **activa** |
 | `ADMIN_RATE_LIMIT_WINDOW_SECONDS` / `CONTROL_RATE_LIMIT_WINDOW_SECONDS` | `1..=3600` | idem | **activa** |
 | `ADMIN_ALLOWED_DOMAINS` | lista no vacía de dominios válidos | `validate_allowed_domain_list` | **activa** — lista vacía o dominio inválido aborta el arranque |
-| Límites de tamaño en bytes (`MAX_*`) | `1..=1073741824` | idem | pendiente — las tres `MAX_*` están designadas, nadie las parsea todavía |
-| `MAX_SCRIPTING_BODY_BYTES` | `<= MAX_CACHEABLE_SIZE_BYTES` o bypass coherente | Fase 4 | el bypass **está implementado**, pero decide el campo del documento CouchDB (`ClientConfig.max_scripting_body_bytes`, leído en `application/lua_engine.rs:437`), no esta variable; su cota (`1048576..=52428800`) la valida `PUT /config`. La relación con el tamaño cacheable sigue sin forzarse |
+| Límites de tamaño en bytes (`MAX_RESPONSE_SIZE_BYTES`, `MAX_CACHEABLE_SIZE_BYTES`) | `1048576..=536870912` / `1024..=536870912` | `parse_in_range` en `AppConfig::from_env` | **activa** — fuera de rango aborta el arranque; alimentan el baseline de `runtime_settings` |
+| `MAX_SCRIPTING_BODY_BYTES` | — | — | **retirada** — el bypass decide por `ClientConfig.max_scripting_body_bytes` (documento CouchDB), cuya cota (`1048576..=52428800`) valida `PUT /config` |
 | Rate limits | `1..=100000` RPM | Fase 5 | pendiente |
-| `CRYPT_ID_LENGTH` | `8..=24` | Fase 1 | pendiente — el validador compara `12` fijo |
-| `PROXY_WORKER_THREADS` | `1..=` paralelismo real del host | arranque | pendiente — ver la trampa de más abajo |
+| `CRYPT_ID_LENGTH` | — | — | **descartada** — el contrato y el validador fijan 12; cambiarla invalidaría las URLs ya distribuidas |
+| `PROXY_WORKER_THREADS` | `1..=` paralelismo real del host | arranque (Fase 3) | pendiente — el motor Axum actual no la lee; se cablea con `ServerConf` al terminar la portación |
 
 > **Trampa**: la fila `PROXY_WORKER_THREADS` dice *arranque*, pero el arranque aún no lee esa variable
 > (§ Runtime de Pingora). Hasta la Fase 3 ninguna implementación puede rechazar un valor absurdo; el
