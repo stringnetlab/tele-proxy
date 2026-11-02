@@ -53,12 +53,18 @@ Integrar en la portación a Pingora en curso (Fase 3 de `docs/spec.md`) para no 
 
 ### Fase C — Lua: coste de arranque y reciclaje
 
-6. **Precompilar el chunk del cliente y reutilizar la VM** (`src/application/lua_engine.rs`):
-   en `mlua`, compilar una vez por `(config_version, code_hash)` e inyectar solo el cuerpo del
-   script en un patrón envoltorio (como el `SLOT` de `isolated-function` de browserless);
-   reciclar la VM solo bajo fault, con watchdog — evita recompilar y respawn por petición.
-7. **Fail-soft de capacidades**: si el init de la VM o una capacidad opcional falla al arrancar,
-   probe memoizado y servir en bypass por petición en vez de propagar 500.
+6. **Precompilar el chunk del cliente y reutilizar la VM** (`src/application/lua_engine.rs`) —
+   **no adoptado en esta ronda**. En `mlua` el chunk compilado queda ligado a la `Lua` que lo
+   compiló, y compartir una VM entre peticiones rompería la frontera de aislamiento (globals,
+   memoria y hooks de un script visibles en el siguiente). Reciclar exigiría un pool por
+   `(internal_id, config_version)` con limpieza de `_G` y watchdog propio; el coste actual —una VM
+   por ejecución, `create_sandbox()`— es aceptable porque Lua es opt-in y el cuerpo ya está
+   acotado por `max_scripting_body_bytes`.
+7. **Fail-soft de capacidades** — **implementado**. Cualquier fallo del sandbox (init de la VM,
+   límite de memoria, error del script o timeout) degrada al cuerpo original en
+   `interfaces/proxy_handler.rs::apply_lua_scripting` con su log de dominio; solo
+   `ssrf_blocked`/`domain_not_whitelisted` abortan la petición. No hace falta un probe memoizado:
+   el fallo se contiene por ejecución.
 
 ### Fase D — Seguridad: fallbacks y saneado de bodies
 
