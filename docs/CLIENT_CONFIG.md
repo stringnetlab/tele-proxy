@@ -468,9 +468,9 @@ Autenticada por cookie de sesión del panel o master token. Las mutaciones exige
 | `POST` | `/api/v1/admin/clients/{internal_id}/rotate-id` | Nuevo `crypt_id` (`{ "new_crypt_id", "rotated_at" }`); las URLs públicas cambian e incrementa `config_version`. |
 | `POST` | `/api/v1/admin/clients/{internal_id}/purge-cache` | Borra `px:{internal_id}:*` (respuestas de `/aq/` y copias stale del fallback) sin tocar `config_version`. Devuelve `{ "purged_keys", "pattern", "purged_at" }`. |
 
-> **La vista del panel no incluye `preview`**: `GET /api/v1/admin/clients/{id}` no serializa esa
-> sección hoy. Para leer el valor efectivo usa `GET /api/v1/clients/config` con el token del
-> cliente o consulta el documento en CouchDB; para cambiarla usa el `PUT` admin.
+> **`preview` en la vista del panel**: `GET /api/v1/admin/clients/{id}` devuelve la sección
+> `preview` completa (interruptores, capacidades, TTLs, topes y rate limit), igual que el
+> documento almacenado. El código Lua solo aparece en el detalle individual, nunca en el listado.
 
 ### 2. API de cliente (`/api/v1/clients/*`)
 
