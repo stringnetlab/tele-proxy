@@ -51,7 +51,12 @@ paths:
           required: false
           description: |
             MIME type esperado del recurso (opcional).
-            Se usa para seleccionar el fallback de error adecuado si el origen falla.
+            Se usa para seleccionar el fallback de error adecuado si el origen falla y para
+            validar el cuerpo antes de servirlo: los primeros bytes (magic bytes) mandan sobre
+            el `Content-Type` declarado. En modo `wrapped`, si el hint es binario
+            (`image/*` o `application/pdf`) y el cuerpo es de otra familia, se sirve el
+            fallback; en `transparent` se entrega el cuerpo del origen y solo se registra el
+            evento `mime_sniff_mismatch`.
             Prioridad de inferencia: 1) Este parámetro, 2) Extensión de la URL,
             3) `Content-Type` del origen, 4) `application/octet-stream`.
             El header `Accept` del cliente NO interviene: selecciona lo que el cliente acepta,

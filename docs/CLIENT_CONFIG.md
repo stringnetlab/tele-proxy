@@ -284,7 +284,7 @@ original del upstream se degrada transparentemente.
 | Modo | Comportamiento |
 |---|---|
 | `transparent` (default) | El proxy reenvía el error del upstream tal cual (status code, headers, body). No se usan fallbacks. |
-| `wrapped` | Si el upstream falla y hay un fallback para el MIME de la respuesta, el proxy sirve el fallback en su lugar. |
+| `wrapped` | Si el upstream falla y hay un fallback para el MIME de la respuesta, el proxy sirve el fallback en su lugar. También cubre el caso de un cuerpo que **contradice** el MIME esperado (`?mime=`/extensión binaria): un challenge HTML servido como `image/jpeg` se sustituye por el fallback en vez de romper un `<img>`. Los candidatos stale/globales cuyo cuerpo contradiga el tipo esperado se descartan. |
 
 ### Fallback URLs
 
@@ -303,6 +303,10 @@ Notas:
   hay que reenviarlos junto al modo.
 - Las copias servidas desde fallback se cachean y se pueden purgar con
   `POST /api/v1/admin/clients/{id}/purge-cache`.
+- El TTL de la caché se elige por los **magic bytes** del cuerpo cuando permiten identificarlo
+  (PNG, JPEG, GIF, WebP, AVIF/HEIC, BMP, TIFF, ICO, SVG, PDF, WOFF/WOFF2, HTML, JSON), no por el
+  `Content-Type` declarado: un HTML que se anuncia como `image/jpeg` caduca con el TTL por defecto
+  y emite `mime_sniff_mismatch` en lugar de quedarse una hora en caché.
 
 ---
 

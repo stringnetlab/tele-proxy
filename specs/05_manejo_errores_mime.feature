@@ -44,3 +44,20 @@ Feature: Respuestas de Error Consistentes
     Then debe respetar el "Content-Type: image/jpeg" del origen
     And debe inyectar "X-Content-Type-Options: nosniff"
     And debe registrar un log WARN con "event": "mime_discrepancy"
+
+  @domain
+  Scenario: Los magic bytes corrigen el TTL de una respuesta que miente
+    Given el origen responde con "Content-Type: image/jpeg"
+    But el cuerpo empieza con "<!DOCTYPE html"
+    When el servicio almacena la respuesta en caché
+    Then el TTL se calcula con el MIME detectado ("text/html"), no con el declarado
+    And debe registrar un log WARN con "event": "mime_sniff_mismatch"
+
+  @domain
+  Scenario: HTML disfrazado de imagen en modo wrapped
+    Given el cliente tiene "error_handling.mode" = "wrapped"
+    And espera un recurso binario por "?mime=image/jpeg" o por la extensión ".jpg"
+    When el origen responde 200 con un cuerpo HTML
+    Then el servicio debe descartar la respuesta del origen
+    And debe servir el fallback de imagen con "X-Cache: FALLBACK"
+    And no debe reutilizar un fallback stale o global cuyo cuerpo contradiga el MIME esperado
