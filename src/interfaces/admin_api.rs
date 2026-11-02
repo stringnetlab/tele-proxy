@@ -13,6 +13,7 @@ use crate::domain::models::{
     ClientConfig, ClientKind, ErrorHandlingConfig, PurgeCacheResponse, RateLimitConfig,
     RotateIdResponse,
 };
+use crate::domain::preview::config::PreviewConfig;
 use crate::domain::runtime_settings::{RuntimeSettings, RuntimeSettingsPatch};
 use crate::domain::validators::validate_config_update;
 use crate::interfaces::control_api::{
@@ -474,6 +475,7 @@ struct AdminClientView {
     scripting_code: Option<String>,
     error_handling: ErrorHandlingConfig,
     header_rules: Vec<HeaderRule>,
+    preview: PreviewConfig,
 }
 
 impl AdminClientView {
@@ -493,6 +495,7 @@ impl AdminClientView {
             scripting_code: include_code.then(|| config.scripting.code.clone()),
             error_handling: config.error_handling.clone(),
             header_rules: config.header_rules.clone(),
+            preview: config.preview.clone(),
         }
     }
 }
@@ -882,6 +885,8 @@ mod tests {
         assert!(!listed.to_string().contains("return body"));
         assert_eq!(listed["kind"], "client");
         assert_eq!(listed["wildcard"], true);
+        assert_eq!(listed["preview"]["enabled"], false);
+        assert_eq!(listed["preview"]["meta_enabled"], true);
 
         // GET individual: el código Lua sí está (los admins editan scripts), el hash del
         // bearer token sigue sin estar.
