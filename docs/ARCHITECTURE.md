@@ -257,9 +257,9 @@ pub async fn resolve_and_validate(&self, hostname: &str) -> Result<IpAddr> {
 
 No usa Valkey: ver la decisión en "¿Por qué el caché DNS es in-process?".
 
-### 4. HTTP Client validado (`src/infrastructure/http_client.rs`) ⚠️ pendiente
+### 4. HTTP Client validado (`src/infrastructure/http_client.rs`) ✅ implementado
 
-Única puerta de salida que no es el proxy (webhooks Lua, `fallback_urls`). Recibe URL + whitelist + resolver, aplica el ciclo anti-SSRF completo y devuelve la respuesta sin seguir redirects. Ningún otro módulo construye un `reqwest::Client`.
+Única puerta de salida que no es el proxy (webhooks Lua, `fallback_urls`, fetch de preview). Recibe URL + whitelist + resolver, aplica el ciclo anti-SSRF completo, fija la IP validada con SNI real y devuelve la respuesta sin seguir redirects. Ningún otro módulo construye un `reqwest::Client` para salir a un origen de cliente; `pinned_client` lo usan `webhook_service`, `preview/fetch` y el handler Axum.
 
 ### 5. Lua Engine (`src/application/lua_engine.rs`)
 
