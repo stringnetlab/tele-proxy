@@ -9,6 +9,8 @@ const FALLBACK_HTML: &[u8] = include_bytes!("../assets/fallback_html.html");
 pub struct FallbackService;
 
 impl FallbackService {
+    /// `mime_hint` es el tipo que pidió el cliente: selecciona el fallback global y además
+    /// valida los cuerpos cacheados antes de servirlos.
     pub async fn resolve(
         cache_store: &dyn CacheStore,
         internal_id: &str,
@@ -20,21 +22,33 @@ impl FallbackService {
 
         let stale_key = format!("px:{}:{}:{}:stale", internal_id, config_version, url_hash);
         if let Ok(Some(cached)) = cache_store.get_response(&stale_key).await {
-            tracing::debug!(key = %stale_key, "Sirviendo fallback desde caché stale");
-            return Some(FallbackResponse {
-                source: FallbackSource::ClientCache,
-                cached,
-            });
+            if matches_expected(mime_hint, &cached.body) {
+                tracing::debug!(key = %stale_key, "Sirviendo fallback desde caché stale");
+                return Some(FallbackResponse {
+                    source: FallbackSource::ClientCache,
+                    cached,
+                });
+            }
+            tracing::warn!(
+                url = %url,
+                "El fallback stale contradice el MIME esperado; se descarta"
+            );
         }
 
         let mime = mime_hint.unwrap_or("application/octet-stream");
         let global_key = crate::application::cache_key::fallback_cache_key(mime);
         if let Ok(Some(cached)) = cache_store.get_response(&global_key).await {
-            tracing::debug!(key = %global_key, "Sirviendo fallback global de Valkey");
-            return Some(FallbackResponse {
-                source: FallbackSource::GlobalCache,
-                cached,
-            });
+            if matches_expected(mime_hint, &cached.body) {
+                tracing::debug!(key = %global_key, "Sirviendo fallback global de Valkey");
+                return Some(FallbackResponse {
+                    source: FallbackSource::GlobalCache,
+                    cached,
+                });
+            }
+            tracing::warn!(
+                key = %global_key,
+                "El fallback global contradice el MIME esperado; se usa el embebido"
+            );
         }
 
         let (content_type, body) = embedded_fallback_for_mime(mime);
@@ -97,6 +111,16 @@ fn embedded_fallback_for_mime(mime: &str) -> (&'static str, &'static [u8]) {
     }
 }
 
+/// Un candidato de la caché solo sirve si sus primeros bytes no contradicen el tipo esperado. El
+/// cuerpo desconocido se acepta: la ausencia de firma no prueba que esté mal.
+fn matches_expected(expected_mime: Option<&str>, body: &[u8]) -> bool {
+    use crate::domain::mime;
+    let Some(expected) = expected_mime.filter(|expected| mime::is_binary(expected)) else {
+        return true;
+    };
+    mime::sniff(body).is_none_or(|detected| mime::agrees(expected, detected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +151,18 @@ mod tests {
         let (ct, body) = embedded_fallback_for_mime("application/octet-stream");
         assert_eq!(ct, "application/json");
         assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn un_candidato_html_no_sirve_como_imagen() {
+        let html = b"<!DOCTYPE html><html><body>challenge</body></html>";
+        assert!(!matches_expected(Some("image/jpeg"), html));
+        assert!(!matches_expected(Some("application/pdf"), html));
+        let png = b"\x89PNG\r\n\x1A\n....";
+        assert!(matches_expected(Some("image/jpeg"), png));
+        assert!(matches_expected(None, html));
+        assert!(matches_expected(Some("text/html"), html));
+        // Sin firma reconocible no se puede probar que el candidato esté mal.
+        assert!(matches_expected(Some("image/jpeg"), b"bytes opacos"));
     }
 }

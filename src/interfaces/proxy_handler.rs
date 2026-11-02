@@ -12,6 +12,7 @@ use crate::application::fallback::{FallbackService, FallbackSource};
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::header_rules::{self, RuleContext};
+use crate::domain::mime;
 use crate::domain::models::{CachedResponse, ClientConfig, ProxyContext};
 use crate::domain::runtime_settings::RuntimeSettings;
 use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
@@ -122,28 +123,52 @@ async fn handle_proxy(
 
     let cache_key = response_cache_key(&config.internal_id, config.config_version, &query.url);
 
+    // BDD Feature 5: the fallback MIME is taken from the explicit "?mime=" param when
+    // present, otherwise inferred from the requested URL's file extension. Without the
+    // extension fallback, a ".jpg" request that errors resolves mime to octet-stream and
+    // the embedded fallback wrongly returns a JSON error body, breaking <img> layout.
+    let fallback_mime = query
+        .mime
+        .as_deref()
+        .or_else(|| infer_mime_from_url(&query.url));
+
     if let Some(cached) = service
         .cache_store()
         .get_response(&cache_key)
         .await
         .map_err(&api_err)?
     {
-        log_mime_discrepancy(
-            &crypt_id,
-            query.mime.as_deref(),
-            cached
-                .headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
-                .map(|(_, value)| value.as_str()),
-        );
-        let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)
-            .map_err(&api_err)?;
-        if degraded {
-            resp.headers_mut()
-                .insert("X-Degraded-Mode", HeaderValue::from_static("true"));
+        let cached_content_type = cached
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str());
+        log_mime_discrepancy(&crypt_id, query.mime.as_deref(), cached_content_type);
+        if let Some(declared) = cached_content_type {
+            log_mime_sniff_mismatch(
+                &crypt_id,
+                declared,
+                fallback_mime,
+                mime::sniff(&cached.body),
+            );
         }
-        return Ok(resp);
+        // Una entrada cacheada con el cuerpo equivocado (un challenge HTML servido como
+        // image/jpeg) no se sirve: se trata como miss para que el origen pueda corregirse y
+        // el fallback, si toca, no reutilice el mismo cuerpo mentiroso.
+        if contradicts_expected(fallback_mime, &cached.body) {
+            tracing::warn!(
+                url = %query.url,
+                "La respuesta cacheada no corresponde al MIME esperado; se ignora la caché"
+            );
+        } else {
+            let mut resp = build_response_from_cached(&cached, &config, &request_headers, &url)
+                .map_err(&api_err)?;
+            if degraded {
+                resp.headers_mut()
+                    .insert("X-Degraded-Mode", HeaderValue::from_static("true"));
+            }
+            return Ok(resp);
+        }
     }
 
     let hostname = url.host_str().ok_or_else(|| ProxyError::InvalidUrlFormat {
@@ -156,15 +181,6 @@ async fn handle_proxy(
         .resolve_and_validate(hostname)
         .await
         .map_err(&api_err)?;
-
-    // BDD Feature 5: the fallback MIME is taken from the explicit "?mime=" param when
-    // present, otherwise inferred from the requested URL's file extension. Without the
-    // extension fallback, a ".jpg" request that errors resolves mime to octet-stream and
-    // the embedded fallback wrongly returns a JSON error body, breaking <img> layout.
-    let fallback_mime = query
-        .mime
-        .as_deref()
-        .or_else(|| infer_mime_from_url(&query.url));
 
     let upstream_result =
         make_upstream_request(&url, resolved_ip, &request_headers, &settings).await;
@@ -232,6 +248,35 @@ async fn handle_proxy(
 
     log_mime_discrepancy(&crypt_id, query.mime.as_deref(), Some(content_type));
 
+    // Los magic bytes deciden frente al Content-Type declarado: un challenge anti-bot servido
+    // como image/jpeg o un PDF anunciado como text/html no se detecta mirando la cabecera.
+    let sniffed_mime = mime::sniff(&body_bytes);
+    log_mime_sniff_mismatch(&crypt_id, content_type, fallback_mime, sniffed_mime);
+
+    // BDD Feature 5: si el cliente espera un recurso binario (imagen o PDF) y el cuerpo es de
+    // otra familia, el layout se rompe igual que con un 500. En modo wrapped se resuelve con el
+    // fallback; en transparent se entrega lo que envió el origen.
+    if let (Some(expected), Some(detected)) = (fallback_mime, sniffed_mime) {
+        if mime::is_binary(expected)
+            && !mime::agrees(expected, detected)
+            && config.error_handling.mode == crate::domain::models::ErrorMode::Wrapped
+        {
+            return try_fallback_or_error(
+                &service,
+                &config,
+                &query.url,
+                fallback_mime,
+                &request_headers,
+                ProxyError::MimeMismatch {
+                    expected: expected.to_string(),
+                    detected: detected.to_string(),
+                },
+            )
+            .await
+            .map_err(&api_err);
+        }
+    }
+
     let mut response_pairs: Vec<(String, String)> = headers
         .iter()
         .filter(|(k, _)| !must_not_forward_header(k.as_str()))
@@ -276,7 +321,7 @@ async fn handle_proxy(
             body: body_bytes.clone(),
         };
 
-        let ttl = settings.cache_ttl_secs(content_type);
+        let ttl = settings.cache_ttl_secs(sniffed_mime.unwrap_or(content_type));
         if let Err(e) = service
             .cache_store()
             .set_response(&cache_key, &cached, ttl)
@@ -818,8 +863,46 @@ fn log_mime_discrepancy(crypt_id: &str, forced_mime: Option<&str>, real_mime: Op
     }
 }
 
+/// Los magic bytes son la única fuente que no puede mentir. Se emite cuando el cuerpo contradice
+/// el `Content-Type` declarado o el MIME que el cliente espera (`?mime=`/extensión); el tipo
+/// detectado es además el que fija el TTL de caché.
+fn log_mime_sniff_mismatch(
+    crypt_id: &str,
+    declared: &str,
+    expected: Option<&str>,
+    sniffed: Option<&str>,
+) {
+    let Some(sniffed) = sniffed else {
+        return;
+    };
+    let declared_lies = !mime::agrees(declared, sniffed);
+    let expected_lies = expected
+        .filter(|expected| mime::is_binary(expected))
+        .is_some_and(|expected| !mime::agrees(expected, sniffed));
+    if !declared_lies && !expected_lies {
+        return;
+    }
+    tracing::warn!(
+        event = "mime_sniff_mismatch",
+        crypt_id = %crypt_id,
+        declared_mime = %mime::essence(declared),
+        expected_mime = %expected.map(mime::essence).unwrap_or("-"),
+        detected_mime = %sniffed,
+        "los magic bytes del cuerpo no coinciden con el MIME declarado o esperado"
+    );
+}
+
+/// Un cuerpo cacheado que contradice el MIME esperado no se reutiliza: el origen pudo servir un
+/// challenge anti-bot con `image/jpeg` y esa entrada no debe sobrevivir al TTL.
+fn contradicts_expected(expected: Option<&str>, body: &[u8]) -> bool {
+    let Some(expected) = expected.filter(|expected| mime::is_binary(expected)) else {
+        return false;
+    };
+    mime::sniff(body).is_some_and(|detected| !mime::agrees(expected, detected))
+}
+
 fn normalize_mime(value: &str) -> &str {
-    value.split(';').next().unwrap_or(value).trim()
+    mime::essence(value)
 }
 
 // Derive a MIME type from the requested URL's path extension so wrapped-mode fallbacks
@@ -882,13 +965,33 @@ pub(crate) fn validate_crypt_id(crypt_id: &str) -> bool {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{infer_mime_from_url, must_not_forward_header, normalize_mime};
+    use super::{
+        contradicts_expected, infer_mime_from_url, must_not_forward_header, normalize_mime,
+    };
 
     #[test]
     fn normaliza_el_mime_para_comparar_sin_parametros_ni_mayusculas() {
         assert_eq!(normalize_mime(" text/HTML ; charset=utf-8"), "text/HTML");
         assert_eq!(normalize_mime("image/jpeg"), "image/jpeg");
         assert_eq!(normalize_mime(""), "");
+    }
+
+    #[test]
+    fn un_mime_binario_esperado_rechaza_un_cuerpo_html() {
+        let html = b"<!DOCTYPE html><html><body>challenge</body></html>";
+        assert!(contradicts_expected(Some("image/jpeg"), html));
+        assert!(contradicts_expected(Some("application/pdf"), html));
+        assert!(!contradicts_expected(
+            Some("image/jpeg"),
+            b"\xFF\xD8\xFF\xE0"
+        ));
+        // Un hint textual no activa el fallback: el layout no se rompe igual.
+        assert!(!contradicts_expected(Some("text/html"), html));
+        assert!(!contradicts_expected(None, html));
+        assert!(!contradicts_expected(
+            Some("image/jpeg"),
+            b"bytes sin firma"
+        ));
     }
 
     #[test]

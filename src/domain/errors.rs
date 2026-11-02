@@ -69,6 +69,14 @@ pub enum ProxyError {
         reason: String,
     },
 
+    /// El cuerpo del origen no es del tipo que el cliente esperaba (`?mime=` o extensión): el
+    /// caso típico es un challenge anti-bot servido como `image/jpeg`. En modo `wrapped` se
+    /// resuelve sirviendo el fallback; en `transparent` solo se registra el WARN.
+    #[error(
+        "El cuerpo no coincide con el MIME esperado: esperado={expected}, detectado={detected}"
+    )]
+    MimeMismatch { expected: String, detected: String },
+
     #[error("Timeout del origen: {timeout_ms}ms (url={url})")]
     UpstreamTimeout { url: String, timeout_ms: u64 },
 
@@ -158,6 +166,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => 500,
             Self::PayloadTooLarge { .. } => 413,
             Self::UpstreamError { .. } => 502,
+            Self::MimeMismatch { .. } => 502,
             Self::UpstreamTimeout { .. } => 504,
             Self::ScriptTimeout { .. } => 500,
             Self::ScriptMemoryLimit { .. } => 500,
@@ -191,6 +200,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => "integrity_check_failed",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::MimeMismatch { .. } => "mime_mismatch",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::ScriptTimeout { .. } => "script_timeout",
             Self::ScriptMemoryLimit { .. } => "script_memory_limit",
@@ -224,6 +234,7 @@ impl ProxyError {
             | Self::WebhookTimeout { .. }
             | Self::WebhookFailed { .. }
             | Self::UpstreamTimeout { .. }
+            | Self::MimeMismatch { .. }
             | Self::Unauthorized { .. }
             | Self::Forbidden { .. }
             | Self::PreviewDisabled { .. }
@@ -256,6 +267,7 @@ impl ProxyError {
                 "El origen no responde"
             }
             Self::UpstreamTimeout { .. } => "El origen no responde a tiempo",
+            Self::MimeMismatch { .. } => "El origen no entrega el recurso esperado",
             Self::RenderUnavailable { .. } => "Servicio de render no disponible",
             Self::RenderTimeout { .. } => "El render no responde a tiempo",
             _ => "Error interno del servidor",
@@ -348,6 +360,10 @@ impl ProxyError {
             Self::UpstreamTimeout { url, timeout_ms } => {
                 vec![("url", url.clone()), ("timeout_ms", timeout_ms.to_string())]
             }
+            Self::MimeMismatch { expected, detected } => vec![
+                ("expected_mime", expected.clone()),
+                ("detected_mime", detected.clone()),
+            ],
             Self::ScriptTimeout {
                 timeout_ms,
                 elapsed_ms,

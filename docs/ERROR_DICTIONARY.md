@@ -52,6 +52,7 @@ de `/mt/` y `/pv/` del puerto del proxy (`interfaces/preview_handler.rs`), mater
 | `integrity_check_failed` | `IntegrityCheckFailed` | El hash del script o del fallback no coincide              | 500         | ERROR        | `crypt_id`†, `resource_type`, `expected_hash`, `actual_hash`| 5xx           |
 | `payload_too_large`      | `PayloadTooLarge`      | El cuerpo excede `max_response_size_bytes` (100 MB)        | 413         | WARN         | `crypt_id`†, `content_length`, `max_allowed`                | 5xx‡          |
 | `upstream_error`         | `UpstreamError`        | Fallo de transporte hacia el origen (conexión/TLS rechazados, no timeout) | 502 | ERROR | `crypt_id`†, `url`, `upstream_status`, `reason`  | 5xx           |
+| `mime_mismatch`          | `MimeMismatch`         | El cuerpo del origen contradice el MIME esperado (`?mime=`/extensión binaria): típicamente un challenge anti-bot servido como `image/jpeg` | 502 | WARN | `crypt_id`†, `expected_mime`, `detected_mime` | degradación (`wrapped` → fallback 200); en `transparent` solo se registra y se entrega el body del origen |
 | `upstream_timeout`       | `UpstreamTimeout`      | El origen no respondió antes de `UPSTREAM_TIMEOUT_SECS` (30 s) | 504  | WARN         | `crypt_id`†, `url`, `timeout_ms`                            | 5xx           |
 | `script_timeout`         | `ScriptTimeout`        | La ejecución de Lua excede `timeout_ms`                    | 500         | WARN         | `crypt_id`†, `timeout_ms`, `elapsed_ms`                     | degradación   |
 | `script_memory_limit`    | `ScriptMemoryLimit`    | El script excede `memory_limit_mb`                         | 500         | WARN         | `crypt_id`†, `memory_limit_mb`, `used_mb`                   | degradación   |
@@ -131,6 +132,7 @@ Conviven en `tracing` con los códigos anteriores y usan el mismo contrato de `e
 | `request_completed`   | INFO  | Al terminar cada request de `/aq/`                             | `method`, `path`, `status`, `x_cache`, `elapsed_ms` | **emitido** — `interfaces/proxy_handler.rs::proxy_handler` (wrapper Axum); el callback `logging()` de Pingora sigue en Fase 3 |
 | `rate_limit_degraded` | WARN  | Valkey indisponible; decide el contador en-proceso `LocalRateLimiter`  | `crypt_id`, `limit`, `window_seconds` | **emitido** — `infrastructure/valkey_cache.rs` |
 | `mime_discrepancy`    | WARN  | `?mime=` forzado difiere del `Content-Type` real del origen     | `crypt_id`, `forced_mime`, `real_mime` | **emitido** — `interfaces/proxy_handler.rs::log_mime_discrepancy` (respuesta del origen y aciertos de caché) |
+| `mime_sniff_mismatch` | WARN  | Los magic bytes del cuerpo contradicen el `Content-Type` declarado o el MIME esperado | `crypt_id`, `declared_mime`, `expected_mime`, `detected_mime` | **emitido** — `interfaces/proxy_handler.rs::log_mime_sniff_mismatch` (respuesta del origen y aciertos de caché). El TTL se calcula con `detected_mime` |
 | `invalid_config`      | WARN  | `PUT /api/v1/clients/config` fuera de cota, con dominios prohibidos o con un hash fuera de formato | `internal_id`†, `field`, `reason` | **emitido** — vía `log_domain_error` |
 | `crypt_id_rotated`    | INFO  | Rotación de `crypt_id` consumada                               | `internal_id`, `old_crypt_id`, `new_crypt_id` | **emitido** — `infrastructure/couchdb_repo.rs`, en `rotate_crypt_id` |
 
@@ -243,6 +245,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => 500,
             Self::PayloadTooLarge { .. } => 413,
             Self::UpstreamError { .. } => 502,
+            Self::MimeMismatch { .. } => 502,
             Self::UpstreamTimeout { .. } => 504,
             Self::ScriptTimeout { .. } => 500,
             Self::ScriptMemoryLimit { .. } => 500,
@@ -267,6 +270,7 @@ impl ProxyError {
             Self::IntegrityCheckFailed { .. } => "integrity_check_failed",
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::MimeMismatch { .. } => "mime_mismatch",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
             Self::ScriptTimeout { .. } => "script_timeout",
             Self::ScriptMemoryLimit { .. } => "script_memory_limit",
@@ -291,6 +295,7 @@ impl ProxyError {
             | Self::WebhookTimeout { .. }
             | Self::WebhookFailed { .. }
             | Self::UpstreamTimeout { .. }
+            | Self::MimeMismatch { .. }
             | Self::Unauthorized { .. } => Level::WARN,
 
             Self::InvalidCryptId { .. }

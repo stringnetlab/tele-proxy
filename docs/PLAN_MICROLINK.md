@@ -45,7 +45,11 @@ Integrar en la portación a Pingora en curso (Fase 3 de `docs/spec.md`) para no 
 5. **Sniff de content-type con lectura de 1 byte / magic bytes** antes de fijar TTL por MIME y
    elegir fallback (`src/application/fallback.rs`): hoy se depende del `Content-Type` declarado
    y del hint `mime`; validar contra los primeros bytes (metascraper descarta "HTML disfrazado
-   de imagen"; html-get hace lo mismo con PDFs).
+   de imagen"; html-get hace lo mismo con PDFs). **Implementado**: `domain::mime::sniff` reconoce
+   PNG/JPEG/GIF/WebP/AVIF/HEIC/BMP/TIFF/ICO/SVG/PDF/WOFF/HTML/JSON; el TTL usa el tipo detectado,
+   se emite WARN `mime_sniff_mismatch` cuando el declarado miente, en modo `wrapped` un body que
+   contradice un hint binario (`image/*`, `application/pdf`) resuelve por fallback, y los
+   candidatos stale/globales que contradicen el MIME esperado se descartan.
 
 ### Fase C — Lua: coste de arranque y reciclaje
 
