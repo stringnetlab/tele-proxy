@@ -216,6 +216,11 @@ paths:
         extraer el contenido principal (`content=1`) vía readability + Markdown, y siempre reporta
         si la respuesta parecía una pantalla antibot.
 
+        Si el fetch directo devuelve un desafío anti-bot o un documento sin título, descripción ni
+        imagen, escala al render del sidecar (`/content`) y reemplaza el resultado solo si aporta
+        estrictamente más metadatos. Un sidecar no configurado o caído degrada al fetch, nunca a un
+        error de `/mt/`.
+
         Reutiliza la cadena anti-SSRF de `/aq/` (validación estricta, whitelist del cliente,
         resolución DNS segura y pinning de la IP). Responde en formato JSend: `{ status, statusCode,
         data }`. Las respuestas se cachean (`X-Cache`) según el `ttl` y `force` pedidos y el

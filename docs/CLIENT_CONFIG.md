@@ -390,7 +390,7 @@ variables del sidecar en `docs/ENVIRONMENT.md` § Preview.
 | Campo | Tipo | Default | Descripción |
 |---|---|---|---|
 | `enabled` | `bool` | `false` | Interruptor de `/pv/` (render). **Fail-safe**: si el documento no trae la sección, nace deshabilitado y `/pv/` responde `403 preview_disabled`. No afecta a `/mt/`. |
-| `meta_enabled` | `bool` | `true` | Interruptor de `/mt/` (metadatos). Separado de `enabled`: los metadatos son fetch + parseo barato y no dependen del sidecar, así que apagar el render no los apaga. |
+| `meta_enabled` | `bool` | `true` | Interruptor de `/mt/` (metadatos). Separado de `enabled`: la vía normal es fetch + parseo barato y no depende del sidecar. Si el fetch devuelve un shell anti-bot, `/mt/` puede escalar al render **solo cuando `enabled` también está activo**; apagar `enabled` mantiene `/mt/` estrictamente fetch-only. |
 | `capabilities.meta` | `bool` | `true` | Segunda comprobación de `/mt/`, junto a `meta_enabled`. |
 | `capabilities.content` | `bool` | `true` | Permite la extracción de contenido principal (`content=1` en `/mt/`); solo aplica a respuestas HTML. |
 | `capabilities.screenshot` | `bool` | `false` | Permite `/pv/?format=screenshot`. |

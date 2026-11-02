@@ -11,7 +11,7 @@ use crate::domain::models::{ClientConfig, ClientKind};
 use crate::domain::preview::config::PreviewConfig;
 use crate::domain::preview::result::PreviewData;
 use crate::domain::validators::{extract_domain, host_allowed, validate_url_strict};
-use crate::infrastructure::preview::fetch::PreviewFetcher;
+use crate::infrastructure::preview::fetch::{FetchedResponse, PreviewFetcher};
 use crate::infrastructure::preview::renderer::{RenderFormat, RenderOutput, RenderRequest};
 
 /// Parámetros de una petición `/mt/` ya validados y normalizados por el handler.
@@ -157,7 +157,51 @@ impl ProxyService {
             .fetch(url, &config.whitelist, config.wildcard)
             .await?;
 
-        let data = build_preview(&fetched, &config.preview, opts.want_content);
+        let mut data = build_preview(&fetched, &config.preview, opts.want_content);
+
+        // Puerta de usabilidad html-get: el fetch directo puede devolver un desafío anti-bot o un
+        // shell de SPA sin metadatos. Solo en ese caso se escala al sidecar (más caro) y se
+        // conserva el render únicamente si aporta estrictamente más campos que el fetch.
+        if config.preview.enabled && should_try_render(&data) {
+            if let Some(renderer) = self.renderer().filter(|renderer| renderer.is_configured()) {
+                match renderer
+                    .rendered_html(
+                        &fetched.final_url,
+                        config.preview.max_render_timeout_ms,
+                        config.preview.screenshot.default_viewport,
+                    )
+                    .await
+                {
+                    Ok(html) if !html.trim().is_empty() => {
+                        let rendered_response = FetchedResponse {
+                            status: 200,
+                            final_url: fetched.final_url.clone(),
+                            content_type: Some("text/html; charset=utf-8".to_string()),
+                            headers: Vec::new(),
+                            cookies: Vec::new(),
+                            body: html.into_bytes(),
+                        };
+                        let rendered =
+                            build_preview(&rendered_response, &config.preview, opts.want_content);
+                        if preview_quality(&rendered) > preview_quality(&data) {
+                            tracing::info!(
+                                url = %fetched.final_url,
+                                "El render aportó más metadatos que el fetch; se usa el HTML renderizado"
+                            );
+                            data = rendered;
+                        }
+                    }
+                    Ok(_) => {}
+                    // Fail-soft: sin sidecar o con un render fallido se devuelve lo extraído del
+                    // fetch; `/mt/` nunca depende del render para responder.
+                    Err(e) => tracing::info!(
+                        error = %e,
+                        url = %fetched.final_url,
+                        "El render de escalado no está disponible; se devuelve el fetch"
+                    ),
+                }
+            }
+        }
 
         let ttl = opts
             .ttl
@@ -260,10 +304,78 @@ impl ProxyService {
     }
 }
 
+/// Señal de que el fetch directo no entregó contenido útil: desafío anti-bot declarado o un
+/// documento sin ninguno de los tres campos que definen un preview (título, descripción, imagen).
+fn should_try_render(data: &PreviewData) -> bool {
+    data.antibot.detected
+        || (data.title.is_none() && data.description.is_none() && data.image.is_none())
+}
+
+/// Compara dos extracciones para no reemplazar un fetch correcto con un render que aporta menos.
+/// Cada campo presente suma uno; una respuesta sin anti-bot suma uno adicional.
+fn preview_quality(data: &PreviewData) -> u8 {
+    let fields = [
+        data.title.is_some(),
+        data.description.is_some(),
+        data.image.is_some(),
+        data.site_name.is_some(),
+        data.author.is_some(),
+        data.date.is_some(),
+        data.open_graph.is_some(),
+        data.twitter.is_some(),
+        data.json_ld.is_some(),
+    ];
+    fields.into_iter().filter(|present| *present).count() as u8
+        + if data.antibot.detected { 0 } else { 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::preview::extract::ContentKind;
+
+    #[test]
+    fn escala_al_render_solo_ante_un_shell_o_antibot() {
+        let limpio = PreviewData {
+            title: Some("Hola".into()),
+            ..PreviewData::default()
+        };
+        assert!(!should_try_render(&limpio));
+
+        assert!(should_try_render(&PreviewData::default()));
+
+        let bloqueado = PreviewData {
+            title: Some("Attention Required".into()),
+            antibot: crate::domain::preview::antibot::AntibotInfo {
+                detected: true,
+                provider: Some("cloudflare".into()),
+                technique: Some("javascript".into()),
+            },
+            ..PreviewData::default()
+        };
+        assert!(should_try_render(&bloqueado));
+    }
+
+    #[test]
+    fn el_render_solo_reemplaza_si_aporta_estrictamente_mas() {
+        let fetch = PreviewData {
+            title: Some("A".into()),
+            ..PreviewData::default()
+        };
+        // Mismo número de campos: el render no sustituye al fetch.
+        let render_igual = PreviewData {
+            description: Some("B".into()),
+            ..PreviewData::default()
+        };
+        assert_eq!(preview_quality(&fetch), preview_quality(&render_igual));
+
+        let render_mejor = PreviewData {
+            title: Some("A".into()),
+            image: Some(crate::domain::preview::media::MediaInfo::default()),
+            ..PreviewData::default()
+        };
+        assert!(preview_quality(&render_mejor) > preview_quality(&fetch));
+    }
 
     #[test]
     fn content_kind_delegado() {

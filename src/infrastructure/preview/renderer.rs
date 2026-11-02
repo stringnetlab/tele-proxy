@@ -76,6 +76,15 @@ struct GotoOptions {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ContentBody<'a> {
+    url: &'a str,
+    timeout: u64,
+    goto_options: GotoOptions,
+    viewport: Viewport,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Viewport {
     width: u32,
     height: u32,
@@ -224,6 +233,66 @@ impl BrowserlessRenderer {
         Ok(RenderOutput {
             bytes: bytes.to_vec(),
             content_type: req.format.content_type(),
+        })
+    }
+
+    /// `/content`: HTML tras ejecutar JavaScript. Lo usa `/mt/` como escalado cuando el fetch
+    /// directo devuelve un shell (anti-bot o sin metadatos). Mismo fail-soft que `render()`.
+    pub async fn rendered_html(
+        &self,
+        url: &str,
+        timeout_ms: u64,
+        viewport: [u32; 2],
+    ) -> Result<String, ProxyError> {
+        let Some(base) = self.base_url.as_ref() else {
+            return Err(ProxyError::RenderUnavailable {
+                reason: "sidecar de render no configurado".to_string(),
+            });
+        };
+        let base = base.trim_end_matches('/');
+        let endpoint = self.with_token(&format!("{base}/content"));
+        let body = ContentBody {
+            url,
+            timeout: timeout_ms,
+            goto_options: GotoOptions {
+                wait_until: "networkidle2",
+            },
+            viewport: Viewport {
+                width: viewport[0],
+                height: viewport[1],
+            },
+        };
+
+        let response = self
+            .http
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| self.map_error(url, timeout_ms, e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ProxyError::RenderUnavailable {
+                reason: format!("el sidecar respondió {}", status.as_u16()),
+            });
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ProxyError::RenderUnavailable {
+                reason: format!("no se pudo leer el HTML renderizado: {e}"),
+            })?;
+        if bytes.len() as u64 > self.max_output_bytes {
+            return Err(ProxyError::PreviewPayloadTooLarge {
+                content_length: bytes.len() as u64,
+                max_allowed: self.max_output_bytes,
+            });
+        }
+
+        String::from_utf8(bytes.to_vec()).map_err(|e| ProxyError::RenderUnavailable {
+            reason: format!("el HTML renderizado no es UTF-8: {e}"),
         })
     }
 
