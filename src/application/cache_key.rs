@@ -17,6 +17,21 @@ pub fn fallback_cache_key(mime: &str) -> String {
     format!("px:defaults:{}", mime)
 }
 
+/// Copia cacheada del `fallback_urls` configurado, por cliente y versión de config. Vive bajo el
+/// prefijo `px:{internal_id}:` para que `purge_client_responses` la borre como el resto de
+/// respuestas del cliente; la versión invalida la copia cuando cambia la URL o el hash.
+pub fn client_fallback_cache_key(
+    internal_id: &str,
+    config_version: u64,
+    mime_hint: Option<&str>,
+) -> String {
+    let hint_hash = sha256_hex(mime_hint.unwrap_or("*/*"));
+    format!(
+        "px:{}:{}:fallback:{}",
+        internal_id, config_version, hint_hash
+    )
+}
+
 /// Clave de caché de preview. `capability` distingue el endpoint (`mt` metadatos/contenido,
 /// `pv` render) porque sus cuerpos cacheados no son intercambiables. `params` es la forma
 /// **canónica** de los parámetros de la petición (ya ordenados y normalizados por el handler) para
@@ -40,8 +55,13 @@ pub fn preview_rate_limit_key(crypt_id: &str, capability: &str) -> String {
 }
 
 pub fn sha256_hex(input: &str) -> String {
+    sha256_hex_bytes(input.as_bytes())
+}
+
+/// Hash del cuerpo de un recurso, para verificar el `sha256:` de `fallback_urls`.
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(bytes);
     // digest 0.11 dropped the LowerHex impl on the output array, so hex-encode manually.
     hasher
         .finalize()
@@ -130,6 +150,26 @@ mod tests {
             preview_rate_limit_key("abc", "meta"),
             preview_rate_limit_key("abc", "screenshot")
         );
+    }
+
+    #[test]
+    fn client_fallback_key_cae_bajo_el_prefijo_del_cliente() {
+        let image = client_fallback_cache_key("client_1", 4, Some("image/png"));
+        let any = client_fallback_cache_key("client_1", 4, None);
+        assert!(image.starts_with("px:client_1:4:fallback:"));
+        assert_ne!(image, any, "distinto MIME → distinta copia");
+        assert_ne!(
+            image,
+            client_fallback_cache_key("client_1", 5, Some("image/png")),
+            "subir config_version invalida la copia"
+        );
+    }
+
+    #[test]
+    fn sha256_de_bytes_coincide_con_el_de_texto() {
+        assert_eq!(sha256_hex_bytes(b"test"), sha256_hex("test"));
+        assert_eq!(sha256_hex_bytes(b"\x89PNG"), sha256_hex_bytes(b"\x89PNG"));
+        assert_ne!(sha256_hex_bytes(b"a"), sha256_hex_bytes(b"b"));
     }
 
     #[test]
