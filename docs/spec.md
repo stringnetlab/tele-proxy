@@ -162,7 +162,7 @@ Implementar `impl ProxyHttp for ProxyService` en `src/application/proxy_service.
 
 ### Fase 5: Manejo de Errores, Fallbacks y API de Control
 
-- [ ] Cadena de 3 niveles: **1)** `px:{internal_id}:{ver}:{sha256}:stale` en Valkey -> **2)** `px:defaults:{mime}` global -> **3)** recurso embebido (`include_bytes!`) según MIME. Configurar además `error_handling.fallback_urls` (fetch validado por el mismo pipeline anti-SSRF) y `scripting.code_hash`, que hoy están declarados pero sin uso.
+- [x] Cadena de fallback: **1)** `px:{internal_id}:{ver}:{sha256}:stale` en Valkey -> **2)** `error_handling.fallback_urls` configurado (fetch por `FallbackFetcher` con anti-SSRF + pinning, verificado por status/MIME/`sha256:` y cacheado por cliente) -> **3)** `px:defaults:{mime}` global -> **4)** recurso embebido (`include_bytes!`) según MIME. `scripting.code_hash` se verifica antes de ejecutar (punto anterior).
 - [ ] API de control `axum` corriendo como `BackgroundService` de Pingora (`pingora_core::services::background::background_service("control-api", …)`), en el puerto `HTTP_CONTROL_PORT`, apagándose con el `ShutdownWatch`.
 - [ ] Middleware de autenticación Bearer (hash SHA-256 del token contra CouchDB) para `/api/v1/`.
 - [ ] Endpoints: `GET /api/v1/clients/config`, `PUT /api/v1/clients/config`, `POST /api/v1/clients/rotate-id`, `GET /health`. **No existe** `POST /api/v1/clients` (los clientes se provisionan fuera de este servicio); la documentación de despliegue no debe prometerlo.

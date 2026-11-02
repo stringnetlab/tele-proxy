@@ -11,6 +11,10 @@ pub const STALE_CACHE_TTL_SECS_RANGE: (u64, u64) = (60, 604_800);
 pub const LUA_TIMEOUT_MS_RANGE: (u64, u64) = (1, 60_000);
 pub const LUA_MEMORY_LIMIT_MB_RANGE: (u32, u32) = (1, 1_024);
 pub const WEBHOOK_TIMEOUT_MS_RANGE: (u64, u64) = (1, 60_000);
+/// Deadline del fetch de un `fallback_urls` configurado. Separado de `webhook_timeout_ms` porque
+/// no es una salida del sandbox sino el último recurso de un `/aq/` que ya falló: tiene que ser
+/// corto para no alargar un error hasta el timeout del cliente.
+pub const FALLBACK_TIMEOUT_MS_RANGE: (u64, u64) = (1, 60_000);
 /// TTL de la caché de respuestas. El mínimo es 1 porque un `SETEX` con TTL 0 es un error en
 /// Valkey, no un "no cachear".
 pub const CACHE_TTL_SECS_RANGE: (u64, u64) = (1, 604_800);
@@ -59,6 +63,8 @@ pub struct RuntimeSettings {
     pub lua_memory_limit_mb: u32,
     #[serde(default = "defaults_webhook_timeout_ms")]
     pub webhook_timeout_ms: u64,
+    #[serde(default = "defaults_fallback_timeout_ms")]
+    pub fallback_timeout_ms: u64,
     /// `MODO=desarrollo`: los errores HTTP exponen el motivo interno y `details`. Editable solo
     /// por rol `admin` con entrada de auditoría: activarlo revela información interna.
     #[serde(default)]
@@ -95,6 +101,9 @@ fn defaults_lua_memory_limit_mb() -> u32 {
 fn defaults_webhook_timeout_ms() -> u64 {
     5_000
 }
+fn defaults_fallback_timeout_ms() -> u64 {
+    5_000
+}
 
 /// Campos opcionales: es a la vez el cuerpo del `PATCH` de la API y la forma tolerante de leer el
 /// documento (un campo ausente o añadido en una release futura toma su valor por defecto en vez
@@ -124,6 +133,8 @@ pub struct RuntimeSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbose_errors: Option<bool>,
 }
 
@@ -143,6 +154,7 @@ impl RuntimeSettingsPatch {
             lua_timeout_ms: Some(settings.lua_timeout_ms),
             lua_memory_limit_mb: Some(settings.lua_memory_limit_mb),
             webhook_timeout_ms: Some(settings.webhook_timeout_ms),
+            fallback_timeout_ms: Some(settings.fallback_timeout_ms),
             verbose_errors: Some(settings.verbose_errors),
         }
     }
@@ -201,6 +213,7 @@ impl RuntimeSettings {
             lua_timeout_ms: defaults_lua_timeout_ms(),
             lua_memory_limit_mb: defaults_lua_memory_limit_mb(),
             webhook_timeout_ms: defaults_webhook_timeout_ms(),
+            fallback_timeout_ms: defaults_fallback_timeout_ms(),
             verbose_errors: false,
         }
     }
@@ -257,6 +270,9 @@ impl RuntimeSettings {
         if let Some(value) = patch.webhook_timeout_ms {
             next.webhook_timeout_ms = value;
         }
+        if let Some(value) = patch.fallback_timeout_ms {
+            next.fallback_timeout_ms = value;
+        }
         if let Some(value) = patch.verbose_errors {
             next.verbose_errors = value;
         }
@@ -311,6 +327,11 @@ impl RuntimeSettings {
             "webhook_timeout_ms",
             self.webhook_timeout_ms,
             WEBHOOK_TIMEOUT_MS_RANGE,
+        )?;
+        require_in_range(
+            "fallback_timeout_ms",
+            self.fallback_timeout_ms,
+            FALLBACK_TIMEOUT_MS_RANGE,
         )?;
 
         // Va a la cabecera `User-Agent` del origen: un salto de línea ahí sería inyección de
@@ -384,6 +405,7 @@ mod tests {
         assert_eq!(s.lua_timeout_ms, 200);
         assert_eq!(s.lua_memory_limit_mb, 50);
         assert_eq!(s.webhook_timeout_ms, 5_000);
+        assert_eq!(s.fallback_timeout_ms, 5_000);
         assert!(s.upstream_user_agent.is_empty());
         assert!(!s.verbose_errors);
         s.validate().expect("los defaults deben ser válidos");

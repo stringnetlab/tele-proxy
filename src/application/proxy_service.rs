@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use crate::domain::errors::ProxyError;
 use crate::domain::runtime_settings::RuntimeSettings;
-use crate::domain::services::{CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+use crate::domain::services::{
+    CacheStore, ConfigFetcher, DnsResolver, FallbackFetcher, LuaExecutor,
+};
 use crate::infrastructure::preview::renderer::BrowserlessRenderer;
 
 use super::settings_store::SettingsStore;
@@ -13,6 +15,9 @@ pub struct ProxyService {
     cache_store: Arc<dyn CacheStore>,
     dns_resolver: Arc<dyn DnsResolver>,
     lua_executor: Arc<dyn LuaExecutor>,
+    /// Salida de red de los `error_handling.fallback_urls`. Se inyecta desde el arranque para que
+    /// el pipeline anti-SSRF sea el mismo que el del webhook (mismo resolver validado).
+    fallback_fetcher: Arc<dyn FallbackFetcher>,
     degraded_mode: Arc<AtomicBool>,
     settings: Arc<SettingsStore>,
     /// Sidecar de render (browserless). `None` cuando no se configuró `BROWSERLESS_URL`: `/pv/`
@@ -26,6 +31,7 @@ impl ProxyService {
         cache_store: Arc<dyn CacheStore>,
         dns_resolver: Arc<dyn DnsResolver>,
         lua_executor: Arc<dyn LuaExecutor>,
+        fallback_fetcher: Arc<dyn FallbackFetcher>,
         settings: Arc<SettingsStore>,
     ) -> Self {
         Self {
@@ -33,6 +39,7 @@ impl ProxyService {
             cache_store,
             dns_resolver,
             lua_executor,
+            fallback_fetcher,
             degraded_mode: Arc::new(AtomicBool::new(false)),
             settings,
             renderer: None,
@@ -83,6 +90,10 @@ impl ProxyService {
 
     pub fn lua_executor(&self) -> &Arc<dyn LuaExecutor> {
         &self.lua_executor
+    }
+
+    pub fn fallback_fetcher(&self) -> &Arc<dyn FallbackFetcher> {
+        &self.fallback_fetcher
     }
 
     pub fn is_degraded(&self) -> bool {

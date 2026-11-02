@@ -34,7 +34,7 @@ Generado a partir del código fuente actual (`src/`), el `Cargo.toml`, `docker-c
 | Serialización | postcard | postcard | Ninguna: `bincode` se eliminó de la documentación |
 | `X-Cache` | `HIT` (`proxy_handler.rs:330`), `MISS`/`BYPASS` (`:200`) y `FALLBACK` (`:299`) como literales dispersos | `CacheDirective::as_str()` compartido por el header y el campo `x_cache` del `logging()` | Alineado: `BYPASS` está en el código y en `api_contract.yaml:443`. Queda extraer el enum (Fase 3) para que header y access log no puedan divergir |
 | MIME efectivo | `?mime=` → extensión → `octet-stream` | inserta `Accept` como 3er paso | `Accept` no se lee en ningún archivo |
-| `fallback_urls`, `scripting.code_hash` | `code_hash` se verifica con `sha256_hex` antes de ejecutar (digest distinto ⇒ `integrity_check_failed`, cuerpo sin transformar); `fallback_urls` sigue sin lectura | fallback remoto validado + verificación de integridad | Implementar o retirar `fallback_urls` del modelo; el `code_hash` queda cerrado |
+| `fallback_urls`, `scripting.code_hash` | `code_hash` se verifica con `sha256_hex` antes de ejecutar (digest distinto ⇒ `integrity_check_failed`, cuerpo sin transformar); `fallback_urls` se descarga por `FallbackFetcher` (anti-SSRF + pinning, sin redirects), se valida `2xx` + cuerpo no vacío + MIME + SHA-256 y se cachea por cliente | fallback remoto validado + verificación de integridad | **Cerrado**: ambos niveles verifican integridad |
 | Arranque | 2 listeners `TcpListener` + `tokio::spawn` | `Server::run_forever()` con `BackgroundService` | Reorganizar `main.rs` |
 | Validación de `PUT /config` | `validate_config_update` rechaza en 400 antes de escribir en CouchDB | igual, en el `BackgroundService` de control | Cerrado (slice E); `specs/06_api_control.feature` ya no está `@pending` |
 | Logs de error | `log_domain_error` emite `event` = `error_code`, `status`, `fields` y nivel por variante; `ApiError` entra el span de la petición | `write_json_error` en el camino proxy, sin duplicar el de `logging()` | Cerrado; queda el call site de Fase 3 |
@@ -245,14 +245,17 @@ flowchart TD
 
   MIME --> L1{"Nivel 1 · stale<br/>px:{internal_id}:{ver}:{sha256(url)}:stale"}
   L1 -->|"hit"| S1["X-Fallback-Source: client-cache"]
-  L1 -->|"miss"| L2{"Nivel 2 · Valkey global<br/>px:defaults:{mime}"}
-  L2 -->|"hit"| S2["X-Fallback-Source: global-cache"]
-  L2 -->|"miss"| L3["Nivel 3 · embebido por MIME<br/>image/* -> SVG placeholder (image/svg+xml)<br/>*json* -> JSON · text/html -> HTML<br/>otro -> JSON"]
-  L3 --> S3["X-Fallback-Source: embedded"]
+  L1 -->|"miss"| L2{"Nivel 2 · fallback_urls configurado<br/>patrón exacto > type/* > */*"}
+  L2 -->|"2xx + hash + MIME válidos (o copia cacheada)"| S2["X-Fallback-Source: configured"]
+  L2 -->|"sin patrón / rechazado"| L3{"Nivel 3 · Valkey global<br/>px:defaults:{mime}"}
+  L3 -->|"hit"| S3["X-Fallback-Source: global-cache"]
+  L3 -->|"miss"| L4["Nivel 4 · embebido por MIME<br/>image/* -> SVG placeholder (image/svg+xml)<br/>*json* -> JSON · text/html -> HTML<br/>otro -> JSON"]
+  L4 --> S4["X-Fallback-Source: embedded"]
 
   S1 --> RESP["200 OK + X-Cache: FALLBACK + nosniff"]
   S2 --> RESP
   S3 --> RESP
+  S4 --> RESP
 ```
 
 Notas de comportamiento sobre el MIME:

@@ -378,7 +378,7 @@ Cada cliente es un documento JSON en la base `tele_proxy_configs` de CouchDB, ge
 | `max_scripting_body_bytes` | 1 MB – 50 MB. Cuerpos mayores entran a Lua en bypass (se sirven sin transformar) |
 
 Límites del sandbox (variables de entorno): `LUA_TIMEOUT_MS` (default 200), `LUA_MEMORY_LIMIT_MB`
-(50), `WEBHOOK_TIMEOUT_MS` (5 000). Ver [Scripting Lua](#scripting-lua).
+(50), `WEBHOOK_TIMEOUT_MS` (5 000), `FALLBACK_TIMEOUT_MS` (5 000). Ver [Scripting Lua](#scripting-lua).
 
 #### `error_handling` — errores y fallbacks
 
@@ -397,9 +397,14 @@ Límites del sandbox (variables de entorno): `LUA_TIMEOUT_MS` (default 200), `LU
 | `transparent` | Reenvía el error del upstream tal cual (status, headers, body). No se usan `fallback_urls`. |
 | `wrapped` | Si el upstream falla y existe un fallback para el MIME de la respuesta, se sirve el fallback en su lugar. |
 
-`fallback_urls` usa como clave un patrón de MIME (`type/subtype` o `type/*`). La `url` se valida
-con el mismo pipeline anti-SSRF (http/https, sin credenciales, sin IPs privadas). El `hash`
-garantiza la integridad del contenido servido.
+`fallback_urls` usa como clave un patrón de MIME (`type/subtype`, `type/*` o `*/*`); se elige el más
+específico. La `url` se obtiene con el mismo pipeline anti-SSRF que el proxy (http/https, sin
+credenciales, sin IPs privadas, DNS validado y sin seguir redirects) y el `hash` (`sha256:…`)
+garantiza la integridad del contenido servido. Solo se acepta la respuesta si el status es 2xx, el
+cuerpo no está vacío y sus magic bytes coinciden con el MIME esperado; si no, se registra
+`fallback_configured_rejected` y se continúa con `px:defaults:{mime}` o el recurso embebido. El
+fallback remoto se cachea por cliente y versión de configuración, y su timeout se ajusta con
+`FALLBACK_TIMEOUT_MS`.
 
 #### `header_rules` — modificación de headers de respuesta
 
@@ -607,6 +612,7 @@ Lista canónica en `docs/ENVIRONMENT.md`. Resumen:
 | `LUA_TIMEOUT_MS` | `200` | 1 – 60 000 (fuera de rango: el proceso no arranca) |
 | `LUA_MEMORY_LIMIT_MB` | `50` | — |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | 1 – 60 000 |
+| `FALLBACK_TIMEOUT_MS` | `5000` | 1 – 60 000 |
 | `MAX_RESPONSE_SIZE_BYTES` | `104857600` (100 MB) | — |
 | `CONFIG_CACHE_TTL_SECONDS` | `300` | — |
 | `CONFIG_CACHE_MAX_CAPACITY` | `10000` | — |

@@ -180,7 +180,7 @@ auditoría `settings_update` en el API.
 - Campos: `upstream_user_agent`, `upstream_timeout_secs`, `max_response_bytes`,
   `cacheable_size_bytes` (≤ `max_response_bytes`), `stale_cache_ttl_secs`, `cache_ttl_images_secs`,
   `cache_ttl_assets_secs`, `cache_ttl_default_secs`, `lua_timeout_ms`, `lua_memory_limit_mb`,
-  `webhook_timeout_ms`, `verbose_errors`.
+  `webhook_timeout_ms`, `fallback_timeout_ms`, `verbose_errors`.
 
 ## 8. Modelos TypeScript (mínimos)
 
@@ -202,7 +202,7 @@ interface RuntimeSettings {
   max_response_bytes: number; cacheable_size_bytes: number; stale_cache_ttl_secs: number;
   cache_ttl_images_secs: number; cache_ttl_assets_secs: number; cache_ttl_default_secs: number;
   lua_timeout_ms: number; lua_memory_limit_mb: number; webhook_timeout_ms: number;
-  verbose_errors: boolean;
+  fallback_timeout_ms: number; verbose_errors: boolean;
 }
 type RuntimeSettingsPatch = Partial<RuntimeSettings>;
 ```

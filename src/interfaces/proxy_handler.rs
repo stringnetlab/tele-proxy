@@ -8,7 +8,7 @@ use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use serde::Deserialize;
 
 use crate::application::cache_key::response_cache_key;
-use crate::application::fallback::{FallbackService, FallbackSource};
+use crate::application::fallback::{FallbackContext, FallbackService, FallbackSource};
 use crate::application::proxy_service::ProxyService;
 use crate::domain::errors::{log_domain_error, ProxyError};
 use crate::domain::header_rules::{self, RuleContext};
@@ -192,6 +192,7 @@ async fn handle_proxy(
             return try_fallback_or_error(
                 &service,
                 &config,
+                &settings,
                 &query.url,
                 fallback_mime,
                 &request_headers,
@@ -221,6 +222,7 @@ async fn handle_proxy(
         return try_fallback_or_error(
             &service,
             &config,
+            &settings,
             &query.url,
             fallback_mime,
             &request_headers,
@@ -264,6 +266,7 @@ async fn handle_proxy(
             return try_fallback_or_error(
                 &service,
                 &config,
+                &settings,
                 &query.url,
                 fallback_mime,
                 &request_headers,
@@ -461,6 +464,7 @@ async fn apply_lua_scripting(
 async fn try_fallback_or_error(
     service: &ProxyService,
     config: &crate::domain::models::ClientConfig,
+    settings: &crate::domain::runtime_settings::RuntimeSettings,
     url: &str,
     mime_hint: Option<&str>,
     request_headers: &HeaderMap,
@@ -472,16 +476,22 @@ async fn try_fallback_or_error(
 
     match FallbackService::resolve(
         service.cache_store().as_ref(),
-        &config.internal_id,
-        config.config_version,
-        url,
-        mime_hint,
+        service.fallback_fetcher().as_ref(),
+        &FallbackContext {
+            internal_id: &config.internal_id,
+            config_version: config.config_version,
+            url,
+            mime_hint,
+            fallback_urls: &config.error_handling.fallback_urls,
+            ttl_seconds: settings.stale_cache_ttl_secs,
+        },
     )
     .await
     {
         Some(fallback) => {
             let x_fallback = match fallback.source {
                 FallbackSource::ClientCache => "client-cache",
+                FallbackSource::Configured => "configured",
                 FallbackSource::GlobalCache => "global-cache",
                 FallbackSource::Embedded => "embedded",
             };
@@ -515,7 +525,12 @@ async fn try_fallback_or_error(
             headers.insert("X-Cache", HeaderValue::from_static("FALLBACK"));
             headers.insert("X-Fallback-Source", HeaderValue::from_static(x_fallback));
 
-            tracing::info!(source = x_fallback, url = %url, "Sirviendo respuesta de fallback");
+            tracing::info!(
+                event = "fallback_served",
+                source = x_fallback,
+                url = %url,
+                "Sirviendo respuesta de fallback"
+            );
 
             build_response(StatusCode::OK, headers, fallback.cached.body)
         }

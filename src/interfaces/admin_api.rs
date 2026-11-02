@@ -902,7 +902,9 @@ mod tests {
     use crate::application::admin_service::AdminService;
     use crate::application::identity::VerifiedIdentity;
     use crate::application::proxy_service::ProxyService;
-    use crate::domain::services::{CacheStore, ConfigFetcher, DnsResolver, LuaExecutor};
+    use crate::domain::services::{
+        CacheStore, ConfigFetcher, DnsResolver, FallbackFetcher, LuaExecutor,
+    };
     use axum::extract::FromRequestParts;
     use std::sync::Arc;
 
@@ -987,6 +989,17 @@ mod tests {
         }
     }
 
+    struct StubFallbackFetcher;
+    #[async_trait::async_trait]
+    impl FallbackFetcher for StubFallbackFetcher {
+        async fn fetch(
+            &self,
+            _: &str,
+        ) -> Result<crate::domain::models::CachedResponse, ProxyError> {
+            unimplemented!("stub de test")
+        }
+    }
+
     struct StubSettingsRepo;
     #[async_trait::async_trait]
     impl crate::domain::services::SettingsRepository for StubSettingsRepo {
@@ -1029,6 +1042,7 @@ mod tests {
                 Arc::new(StubCache),
                 Arc::new(StubDns),
                 Arc::new(StubLua),
+                Arc::new(StubFallbackFetcher),
                 Arc::new(crate::application::settings_store::SettingsStore::new(
                     crate::domain::runtime_settings::RuntimeSettings::defaults(),
                 )),
