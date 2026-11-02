@@ -143,20 +143,28 @@ del token, nunca el token en claro.
 ## Whitelist de Dominios
 
 ```json
-"whitelist": ["shutterstock.com", "gettyimages.com", "8.8.8.8"]
+"whitelist": ["shutterstock.com", "cdn.gettyimages.com:8443", "8.8.8.8"]
 ```
 
 | Restricción | Valor |
 |---|---|
 | Máximo de entradas | 100 |
-| Formato | Hostname desnudo (sin esquema, puerto, path, credenciales ni fragmentos) |
+| Formato | `host` o `host:puerto` (sin esquema, path, credenciales ni fragmento); IP pública opcional |
+| Puertos | Una entrada sin puerto permite **cualquier** puerto; con puerto, solo el puerto efectivo (443/80 por defecto) |
 | IPs privadas | Rechazadas (RFC 1918, loopback, link-local, CGNAT, documentación, etc.) |
-| IPs públicas | Permitidas como entradas |
-| Matching | Sufijo, case-insensitive: `cdn.shutterstock.com` matchea `shutterstock.com` |
+| IPs públicas | Permitidas como entradas; IPv6 entre corchetes (`[2606:4700::1111]:443`) |
+| Matching | Sufijo, case-insensitive: `cdn.shutterstock.com` matchea `shutterstock.com`. Las IP literales se comparan exactas |
 
 **Validación**: cada entrada debe ser un hostname válido (máx. 253 bytes, etiquetas de máx. 63 bytes,
-TLD alfabético) o una IP pública. Se rechazan: `localhost`, `shutterstock.com:8080`,
-`https://shutterstock.com`, `user:pass@shutterstock.com`, IPs privadas (`127.0.0.1`, `10.x`, etc.).
+TLD alfabético), una IP pública o cualquiera de esos con `:puerto` (1–65535). Se rechazan:
+`localhost`, `https://shutterstock.com`, `user:pass@shutterstock.com`, `shutterstock.com:0`,
+`shutterstock.com:http`, IPs privadas (`127.0.0.1`, `10.x`, etc.).
+
+**Puerto de salida**: `cdn.example.com:8443` solo autoriza peticiones a
+`https://cdn.example.com:8443/...`; `https://cdn.example.com/...` usa el puerto efectivo 443 y cae
+con `403 domain_not_whitelisted`. Es la forma de fijar el egress a un puerto concreto de un host
+público (p. ej. evitar que la whitelist abra un puerto de administración). Aplica igual al proxy
+`/aq/`, a `/mt/` y `/pv/` y a los webhooks de `proxy.http_request`.
 
 Notas:
 

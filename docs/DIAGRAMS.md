@@ -142,7 +142,7 @@ flowchart TB
   subgraph DO["domain (núcleo puro, sin IO)"]
     MD["models.rs<br/>ClientConfig · CachedResponse · ProxyContext · ErrorMode"]
     SV["services.rs = PUERTOS<br/>ConfigFetcher · CacheStore · DnsResolver · LuaExecutor"]
-    VA["validators.rs<br/>is_private_ip · validate_url_strict · domain_matches_whitelist"]
+    VA["validators.rs<br/>is_private_ip · validate_url_strict · host_matches_whitelist"]
     ER["errors.rs<br/>ProxyError -> status HTTP + JSON"]
   end
 

@@ -67,13 +67,17 @@ Integrar en la portación a Pingora en curso (Fase 3 de `docs/spec.md`) para no 
    configurados por `FallbackFetcher` (anti-SSRF + pinning, sin redirects), exigiendo `2xx`, cuerpo
    no vacío, MIME coherente y `sha256:` correcto antes de servirlos; la copia verificada se cachea
    por cliente. Es el nivel 2 de la cascada (stale → configurado → global → embebido).
-9. **Saneado de subrecursos privados en bodies HTML reescritos**: el anti-SSRF valida la
-   resolución DNS, pero un body servido puede contener `src/href/url()` apuntando a
-   `localhost`/IPs internas — añadir el rewriter equivalente a `isLocalAddress → remove` de
-   html-get en el pipeline post-respuesta (encaja natural en `header_rules`/Lua como regla
-   global).
-10. **Egress allowlist con `host:port` explícito** (puertos por defecto, IPv6) en el validador
-    de `fallback_urls` y webhooks: browserless resuelve SSRF a nivel de puerto, no solo de host.
+9. **Saneado de subrecursos privados en bodies HTML reescritos** — **no aplicable todavía**: el
+   proxy no reescribe bodies HTML (`PLAN_PREVIEW` D7 descartó la reescritura de subrecursos hacia
+   `/aq/`). El pipeline solo transforma cabeceras, `Location` de redirects y el cuerpo vía Lua. Si
+   se implanta la reescritura, el saneado equivalente a `isLocalAddress → remove` de html-get debe
+   aplicarse a ese body, no a cualquier HTML de origen.
+10. ~~**Egress allowlist con `host:port` explícito**~~ — **implementado**. Las entradas de
+    `whitelist` admiten `host:puerto` (y `[ipv6]:puerto`); el matching usa el puerto efectivo
+    (`port_or_known_default`, 443/80) en `/aq/`, `/mt/`, `/pv/` y en los webhooks de
+    `proxy.http_request`. Una entrada sin puerto mantiene el comportamiento anterior (cualquier
+    puerto). Los `fallback_urls` siguen sin whitelist por diseño: los elige el operador y pasan
+    el anti-SSRF completo.
 
 ### Fase E — Observabilidad y decisión
 
