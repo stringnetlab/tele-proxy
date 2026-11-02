@@ -22,6 +22,7 @@ use tele_proxy::domain::services::{AdminRepository, SettingsRepository};
 use tele_proxy::domain::validators::{validate_allowed_domain_list, validate_cors_allowed_origins};
 use tele_proxy::infrastructure::couchdb_repo::CouchDbRepository;
 use tele_proxy::infrastructure::dns_resolver::SecureDnsResolver;
+use tele_proxy::infrastructure::fallback_fetcher::ValidatingFallbackFetcher;
 use tele_proxy::infrastructure::local_rate_limiter::LocalRateLimiter;
 use tele_proxy::infrastructure::preview::renderer::BrowserlessRenderer;
 use tele_proxy::infrastructure::valkey_cache::{ValkeyCacheStore, ValkeySessionStore};
@@ -51,6 +52,9 @@ struct AppConfig {
     lua_timeout_ms: u64,
     lua_memory_limit_mb: u32,
     webhook_timeout_ms: u64,
+    /// Deadline del fetch de un `fallback_urls` configurado (baseline de
+    /// `runtime_settings.fallback_timeout_ms`).
+    fallback_timeout_ms: u64,
     /// `MODO=desarrollo`: errores HTTP verbosos con motivo interno y `details`. Cualquier otro
     /// valor (o ausente) mantiene los errores escuetos de producción.
     modo_desarrollo: bool,
@@ -107,6 +111,7 @@ impl AppConfig {
                 .parse()
                 .map_err(|e| format!("Invalid LUA_MEMORY_LIMIT_MB: {}", e))?,
             webhook_timeout_ms: parse_in_range("WEBHOOK_TIMEOUT_MS", "5000", 1u64, 60_000u64)?,
+            fallback_timeout_ms: parse_in_range("FALLBACK_TIMEOUT_MS", "5000", 1u64, 60_000u64)?,
             modo_desarrollo: std::env::var("MODO")
                 .map(|value| value.eq_ignore_ascii_case("desarrollo"))
                 .unwrap_or(false),
@@ -250,6 +255,7 @@ fn runtime_settings_from_env(config: &AppConfig) -> RuntimeSettings {
         lua_timeout_ms: config.lua_timeout_ms,
         lua_memory_limit_mb: config.lua_memory_limit_mb,
         webhook_timeout_ms: config.webhook_timeout_ms,
+        fallback_timeout_ms: config.fallback_timeout_ms,
         verbose_errors: config.modo_desarrollo,
         ..RuntimeSettings::defaults()
     }
@@ -441,6 +447,12 @@ async fn main() {
         Arc::clone(&settings_store),
         webhook_service::MAX_RESPONSE_BYTES,
     ));
+    // Los `fallback_urls` configurados usan el mismo resolver validado: son la tercera ruta de
+    // salida a Internet y `docs/spec.md` exige que ninguna resuelva por su cuenta.
+    let fallback_fetcher = Arc::new(ValidatingFallbackFetcher::new(
+        Arc::clone(&dns_resolver) as Arc<_>,
+        Arc::clone(&settings_store),
+    ));
 
     let lua_executor = Arc::new(SandboxedLuaEngine::new(
         Arc::clone(&settings_store),
@@ -467,6 +479,7 @@ async fn main() {
             Arc::clone(&cache_store) as Arc<dyn tele_proxy::domain::services::CacheStore>,
             Arc::clone(&dns_resolver) as Arc<_>,
             lua_executor,
+            fallback_fetcher,
             Arc::clone(&settings_store),
         )
         .with_degraded_flag(cache_degraded)
@@ -657,6 +670,7 @@ mod tests {
             lua_timeout_ms: 200,
             lua_memory_limit_mb: 50,
             webhook_timeout_ms: 5_000,
+            fallback_timeout_ms: 5_000,
             modo_desarrollo: false,
             upstream_user_agent: String::new(),
             browserless_url: String::new(),

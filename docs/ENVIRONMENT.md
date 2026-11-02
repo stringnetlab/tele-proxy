@@ -136,9 +136,10 @@ y en el secret store de Dokploy.
 | `LUA_TIMEOUT_MS` | Deadline de ejecución Lua | `200` | No | **activa** — parseada y validada por `parse_in_range` (`main.rs:57`, la función en `main.rs:75`); alimenta el baseline de `runtime_settings.lua_timeout_ms`, recargable en caliente |
 | `LUA_MEMORY_LIMIT_MB` | Límite de memoria del sandbox | `50` | No | **activa** — baseline de `runtime_settings.lua_memory_limit_mb`, recargable en caliente |
 | `WEBHOOK_TIMEOUT_MS` | Timeout de `proxy.http_request` | `5000` | No | **activa** — parseada por `parse_in_range` (`main.rs:61`); baseline de `runtime_settings.webhook_timeout_ms`, que es el techo de `WebhookRequest.timeout_ms` (`application/webhook_service.rs`) y el deadline del puente Lua->tokio (`application/lua_engine.rs`). Recargable en caliente |
+| `FALLBACK_TIMEOUT_MS` | Deadline del fetch de un `error_handling.fallback_urls` configurado | `5000` | No | **activa** — parseada por `parse_in_range`; baseline de `runtime_settings.fallback_timeout_ms` (`infrastructure/fallback_fetcher.rs`). Separada de `WEBHOOK_TIMEOUT_MS`: es el último recurso de un `/aq/` que ya falló y debe ser corta. Rango `1..=60000`, recargable en caliente |
 
 > **Valores congelados → `runtime_settings` recargables.** `UPSTREAM_USER_AGENT`, `LUA_TIMEOUT_MS`,
-> `LUA_MEMORY_LIMIT_MB`, `WEBHOOK_TIMEOUT_MS`, `MAX_RESPONSE_SIZE_BYTES`,
+> `LUA_MEMORY_LIMIT_MB`, `WEBHOOK_TIMEOUT_MS`, `FALLBACK_TIMEOUT_MS`, `MAX_RESPONSE_SIZE_BYTES`,
 > `MAX_CACHEABLE_SIZE_BYTES` y `MODO` (→ `verbose_errors`) ya no quedan fijados en
 > el arranque: ahora son el **baseline** del documento `runtime_settings` de CouchDB y su valor
 > efectivo se cambia en caliente con `PATCH /api/v1/admin/settings` (ver `api_contract.yaml`). El

@@ -41,6 +41,7 @@ services:
       - LUA_TIMEOUT_MS=${LUA_TIMEOUT_MS:-200}
       - LUA_MEMORY_LIMIT_MB=${LUA_MEMORY_LIMIT_MB:-50}
       - WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}
+      - FALLBACK_TIMEOUT_MS=${FALLBACK_TIMEOUT_MS:-5000}
       # Techos de bytes: baseline de runtime_settings, recargables en caliente por el panel.
       # Fuera de rango el arranque falla (docs/ENVIRONMENT.md § Validaciones).
       - MAX_RESPONSE_SIZE_BYTES=${MAX_RESPONSE_SIZE_BYTES:-104857600}

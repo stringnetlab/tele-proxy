@@ -1544,6 +1544,14 @@ components:
           minimum: 1
           maximum: 60000
           default: 5000
+        fallback_timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 5000
+          description: |
+            Deadline del fetch de un `error_handling.fallback_urls` configurado. Independiente de
+            `webhook_timeout_ms`; debe ser corto para no alargar el error de `/aq/`.
         verbose_errors:
           type: boolean
           default: false
@@ -1569,4 +1577,5 @@ components:
         lua_timeout_ms: { type: integer, minimum: 1, maximum: 60000 }
         lua_memory_limit_mb: { type: integer, minimum: 1, maximum: 1024 }
         webhook_timeout_ms: { type: integer, minimum: 1, maximum: 60000 }
+        fallback_timeout_ms: { type: integer, minimum: 1, maximum: 60000 }
         verbose_errors: { type: boolean }

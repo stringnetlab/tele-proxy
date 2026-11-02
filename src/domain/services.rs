@@ -120,6 +120,16 @@ pub trait WebhookFetcher: Send + Sync {
     async fn fetch(&self, request: &WebhookRequest) -> Result<WebhookResponse, ProxyError>;
 }
 
+/// Salida de red para un `error_handling.fallback_urls` configurado. Va por un puerto propio, no
+/// por `WebhookFetcher`, porque aquí no hay whitelist de cliente: la URL la fija el operador en el
+/// `PUT` y solo tiene que sobrevivir al anti-SSRF (esquema, IP privada literal y pinning DNS).
+/// Devuelve un `CachedResponse` con el `content-type` del origen (único header que se sirve) para
+/// que el llamador lo valide con hash/magic bytes y lo reutilice como entrada de caché.
+#[async_trait]
+pub trait FallbackFetcher: Send + Sync {
+    async fn fetch(&self, url: &str) -> Result<CachedResponse, ProxyError>;
+}
+
 /// Persistencia de la administración global: operadores (`AdminUser`) y gestión CRUD de
 /// clientes desde el panel. Los tests usan implementaciones manuales del trait (el proyecto no
 /// depende de mockall; véase el patrón de `interfaces/control_api.rs`).
