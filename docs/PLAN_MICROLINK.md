@@ -62,10 +62,11 @@ Integrar en la portación a Pingora en curso (Fase 3 de `docs/spec.md`) para no 
 
 ### Fase D — Seguridad: fallbacks y saneado de bodies
 
-8. **Puerta de usabilidad en la cadena de fallback** (`src/application/fallback.rs`): un
-   fallback solo reemplaza la respuesta si es *realmente válida* (status < 400, content-type
-   coherente, hash); evitar servir "cáscaras de bloqueo" como html-get evita el shell vacío de
-   Chromium.
+8. ~~**Puerta de usabilidad en la cadena de fallback**~~ — **implementado**. `FallbackService`
+   valida los cuerpos cacheados con magic bytes y descarga los `error_handling.fallback_urls`
+   configurados por `FallbackFetcher` (anti-SSRF + pinning, sin redirects), exigiendo `2xx`, cuerpo
+   no vacío, MIME coherente y `sha256:` correcto antes de servirlos; la copia verificada se cachea
+   por cliente. Es el nivel 2 de la cascada (stale → configurado → global → embebido).
 9. **Saneado de subrecursos privados en bodies HTML reescritos**: el anti-SSRF valida la
    resolución DNS, pero un body servido puede contener `src/href/url()` apuntando a
    `localhost`/IPs internas — añadir el rewriter equivalente a `isLocalAddress → remove` de

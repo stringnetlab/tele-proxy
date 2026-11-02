@@ -268,6 +268,37 @@ Feature: Respuestas de Error Consistentes
     Then el servicio debe descartar la respuesta del origen
     And debe servir el fallback de imagen con "X-Cache: FALLBACK"
     And no debe reutilizar un fallback stale o global cuyo cuerpo contradiga el MIME esperado
+
+  Scenario: Fallback configurado válido se sirve y se cachea por cliente
+    Given el cliente tiene "error_handling.fallback_urls" con la entrada "image/png"
+    And la entrada declara un "hash" sha256 que coincide con el cuerpo remoto
+    When el origen falla y no hay stale utilizable
+    Then el servicio obtiene la URL del fallback con el mismo pipeline anti-SSRF (sin redirects)
+    And valida que el status sea 2xx, el cuerpo no esté vacío y los magic bytes coincidan con "image/png"
+    And sirve la respuesta con "X-Cache: FALLBACK" y "X-Fallback-Source: configured"
+    And la cachea bajo "px:{internal_id}:{config_version}:fallback:{sha256 del mime}"
+    And registra un log INFO con "event": "fallback_served" y "source": "configured"
+
+  Scenario: Fallback configurado que no supera las puertas se descarta
+    Given el cliente tiene "error_handling.fallback_urls" con la entrada "image/png"
+    When la URL configurada responde 500, un cuerpo vacío, un MIME contradictorio o un hash distinto
+    Then el servicio descarta esa respuesta y registra un log WARN con "event": "fallback_configured_rejected"
+    And continúa con el siguiente nivel de la cascada ("px:defaults:{mime}" o el embebido)
+
+  Scenario: Prioridad de patrones en "fallback_urls"
+    Given el cliente declara entradas para "image/png", "image/*" y "*/*"
+    When se busca el fallback de un recurso "image/png"
+    Then se elige la entrada de "image/png"
+    And si no existe, se elige la de "image/*"
+    And si tampoco existe, se elige la de "*/*"
+    And sin MIME esperado solo es aplicable "*/*"
+
+  Scenario: Fallback remoto rechazado por el validador de URL
+    Given una entrada de "fallback_urls" apunta a una IP privada, a un esquema no http(s) o incluye credenciales
+    When el servicio intenta obtenerla
+    Then no se realiza la petición
+    And se registra "fallback_configured_rejected" con el motivo
+    And se continúa con el siguiente nivel de la cascada
 ```
 
 > **Estado de `mime_discrepancy`**: implementado en el handler Axum. La respuesta conserva el
@@ -345,11 +376,13 @@ Para que una fase o el proyecto completo se considere "Terminado", debe cumplir:
    es **< 80 MB** (con Pingora; el límite histórico de 50 MB pertenecía a la etapa Axum+reqwest) y se
    levanta con el `docker-compose.yml` proporcionado, tras crear a mano la base `tele_proxy_configs`.
 5. **Logs**: En configuración de producción, solo se emiten logs de nivel `WARN` o `ERROR` en formato
-   JSON estructurado. Dos excepciones en `INFO`, ambas del diccionario de `docs/ERROR_DICTIONARY.md`:
-   `event: request_completed` (logging de acceso) y `event: crypt_id_rotated` (pista de auditoría de
-   la rotación; si se filtrara por nivel, el escenario «Rotación de crypt_id» no dejaría evidencia).
-   Cada entrada usa el nombre del diccionario en `event` y sus campos — incluido `internal_id` en la
-   rotación, que es el único identificador que sobrevive al cambio de `crypt_id`.
+   JSON estructurado. Tres excepciones en `INFO`, todas del diccionario de `docs/ERROR_DICTIONARY.md`:
+   `event: request_completed` (logging de acceso), `event: crypt_id_rotated` (pista de auditoría de
+   la rotación; si se filtrara por nivel, el escenario «Rotación de crypt_id» no dejaría evidencia) y
+   `event: fallback_served` (deja constancia de qué nivel de la cascada sirvió el cuerpo, dato que el
+   cliente solo ve como `X-Fallback-Source`). Cada entrada usa el nombre del diccionario en `event` y
+   sus campos — incluido `internal_id` en la rotación, que es el único identificador que sobrevive al
+   cambio de `crypt_id`.
 6. **Commits**: Cada funcionalidad tiene su propio commit atómico con mensajes convencionales
    (`feat:`, `test:`, `fix:`).
 7. **Evidencia**: Un `exit 0` del envoltorio no cierra el criterio: se debe pegar/leer el log real de

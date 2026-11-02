@@ -290,12 +290,40 @@ original del upstream se degrada transparentemente.
 
 | Campo | Formato | Descripción |
 |---|---|---|
-| key (MIME pattern) | `type/subtype` o `type/*` | Patrón de MIME que activa este fallback |
+| key (MIME pattern) | `type/subtype`, `type/*` o `*/*` | Patrón que activa este fallback |
 | `url` | URL válida (http/https, sin credenciales, sin fragmentos, sin IPs privadas) | URL del recurso de fallback |
 | `hash` | `sha256:<64 hex>` | Hash SHA-256 del contenido del fallback (integridad) |
 
-**Validación de URLs de fallback**: mismas reglas anti-SSRF que la whitelist — solo http/https,
-sin credenciales, sin fragmentos, sin IPs privadas en el host.
+**Selección del patrón**: coincidencia exacta (`image/png`) > comodín de familia (`image/*`) >
+global (`*/*`). Sin MIME conocido (ni `?mime=` ni extensión reconocible) solo encaja `*/*`.
+
+**Cuándo se sirve** (`mode: "wrapped"`): el recurso se descarga en la primera petición que lo
+necesita y solo reemplaza al error si cumple **todo**:
+
+- el origen del fallback responde `2xx` (los redirects no se siguen: un `3xx` se descarta);
+- el cuerpo no está vacío;
+- sus magic bytes no contradicen el MIME esperado (un HTML servido como `image/png` se descarta);
+- el SHA-256 del cuerpo coincide con `hash` (`sha256:<64 hex>`, comparación sin distinguir mayúsculas).
+
+Si algo falla, el proxy registra un WARN y continúa con el siguiente nivel de la cascada, de modo
+que un fallback mal configurado nunca empeora el error original. El recurso se sirve con
+`X-Cache: FALLBACK` y `X-Fallback-Source: configured`.
+
+**Validación de URLs de fallback**: al `PUT` se aplican las mismas reglas anti-SSRF que a la
+whitelist — solo http/https, sin credenciales, sin fragmentos, sin IPs privadas literales. En
+tiempo de ejecución la URL pasa además por resolución DNS validada y *pinning* de la conexión a la
+IP autorizada, sin seguir redirects. La URL puede estar fuera de la whitelist del cliente: la eligió
+el operador, no el tráfico.
+
+**Caché**: la copia verificada se guarda por cliente y versión de config
+(`px:{internal_id}:{config_version}:fallback:{sha256(mime_hint)}`) durante
+`runtime_settings.stale_cache_ttl_secs` (1 día por defecto). Subir `config_version` (cualquier
+`PUT` de config) la invalida. El fetch tiene su propio deadline,
+`runtime_settings.fallback_timeout_ms` (5 s por defecto, techo 60 s), separado del timeout del
+origen y del webhook.
+
+**Orden completo de la cascada** (wrapped): copia stale de la misma URL → `fallback_urls`
+configurado → caché global `px:defaults:{mime}` → recurso embebido.
 
 Notas:
 

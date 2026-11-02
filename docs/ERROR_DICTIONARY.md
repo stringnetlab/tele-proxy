@@ -135,13 +135,19 @@ Conviven en `tracing` con los códigos anteriores y usan el mismo contrato de `e
 | `mime_sniff_mismatch` | WARN  | Los magic bytes del cuerpo contradicen el `Content-Type` declarado o el MIME esperado | `crypt_id`, `declared_mime`, `expected_mime`, `detected_mime` | **emitido** — `interfaces/proxy_handler.rs::log_mime_sniff_mismatch` (respuesta del origen y aciertos de caché). El TTL se calcula con `detected_mime` |
 | `invalid_config`      | WARN  | `PUT /api/v1/clients/config` fuera de cota, con dominios prohibidos o con un hash fuera de formato | `internal_id`†, `field`, `reason` | **emitido** — vía `log_domain_error` |
 | `crypt_id_rotated`    | INFO  | Rotación de `crypt_id` consumada                               | `internal_id`, `old_crypt_id`, `new_crypt_id` | **emitido** — `infrastructure/couchdb_repo.rs`, en `rotate_crypt_id` |
+| `fallback_served`     | INFO  | Se sirve el cuerpo de un fallback tras un error del origen o del pipeline | `source` (`client_cache`/`configured`/`global_cache`/`embedded`), `url` | **emitido** — `interfaces/proxy_handler.rs::try_fallback_or_error`; el origen de la decisión también viaja en `X-Fallback-Source` |
+| `fallback_configured_rejected` | WARN | Un `error_handling.fallback_urls` no supera las puertas (status, cuerpo vacío, MIME contradictorio, hash distinto o fallo de fetch) y se cae al siguiente nivel | `pattern`, `fallback_url`, `reason` | **emitido** — `application/fallback.rs::reject_configured` |
 
 > `crypt_id_rotated` se emite **después** del `PUT` a CouchDB y de invalidar la caché: si alguno de
 > esos pasos falla, la rotación no se consumó y no hay pista que registrar. `internal_id` es
 > obligatorio en el evento porque es el único identificador que sobrevive al cambio de `crypt_id`.
 
-> Estos dos últimos niveles son la excepción documentada en `docs/BDD.md` (DoD 5): en producción solo
-> se emiten `WARN`/`ERROR`, más `request_completed` y `crypt_id_rotated` en `INFO`.
+> `fallback_configured_rejected` es el único rastro de un fallback que se descartó: el cliente recibe
+> el siguiente nivel de la cascada (o el error original) sin saber por qué se rechazó. `reason` no
+> incluye la URL con credenciales porque el validador ya las prohíbe en `fallback_urls`.
+
+> `WARN`/`ERROR` son la excepción documentada en `docs/BDD.md` (DoD 5): en producción solo se emiten
+> `WARN`/`ERROR`, más `request_completed`, `crypt_id_rotated` y `fallback_served` en `INFO`.
 
 ## Implementación en Rust
 

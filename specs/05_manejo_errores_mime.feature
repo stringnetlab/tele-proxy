@@ -61,3 +61,38 @@ Feature: Respuestas de Error Consistentes
     Then el servicio debe descartar la respuesta del origen
     And debe servir el fallback de imagen con "X-Cache: FALLBACK"
     And no debe reutilizar un fallback stale o global cuyo cuerpo contradiga el MIME esperado
+
+  @domain
+  Scenario: Fallback configurado válido se sirve y se cachea por cliente
+    Given el cliente tiene "error_handling.fallback_urls" con la entrada "image/png"
+    And la entrada declara un "hash" sha256 que coincide con el cuerpo remoto
+    When el origen falla y no hay stale utilizable
+    Then el servicio obtiene la URL del fallback con el mismo pipeline anti-SSRF (sin redirects)
+    And valida que el status sea 2xx, el cuerpo no esté vacío y los magic bytes coincidan con "image/png"
+    And sirve la respuesta con "X-Cache: FALLBACK" y "X-Fallback-Source: configured"
+    And la cachea bajo "px:{internal_id}:{config_version}:fallback:{sha256 del mime}"
+    And registra un log INFO con "event": "fallback_served" y "source": "configured"
+
+  @domain
+  Scenario: Fallback configurado que no supera las puertas se descarta
+    Given el cliente tiene "error_handling.fallback_urls" con la entrada "image/png"
+    When la URL configurada responde 500, un cuerpo vacío, un MIME contradictorio o un hash distinto
+    Then el servicio descarta esa respuesta y registra un log WARN con "event": "fallback_configured_rejected"
+    And continúa con el siguiente nivel de la cascada ("px:defaults:{mime}" o el embebido)
+
+  @domain
+  Scenario: Prioridad de patrones en "fallback_urls"
+    Given el cliente declara entradas para "image/png", "image/*" y "*/*"
+    When se busca el fallback de un recurso "image/png"
+    Then se elige la entrada de "image/png"
+    And si no existe, se elige la de "image/*"
+    And si tampoco existe, se elige la de "*/*"
+    And sin MIME esperado solo es aplicable "*/*"
+
+  @domain
+  Scenario: Fallback remoto rechazado por el validador de URL
+    Given una entrada de "fallback_urls" apunta a una IP privada, a un esquema no http(s) o incluye credenciales
+    When el servicio intenta obtenerla
+    Then no se realiza la petición
+    And se registra "fallback_configured_rejected" con el motivo
+    And se continúa con el siguiente nivel de la cascada
