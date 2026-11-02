@@ -1,0 +1,3 @@
+# Los scripts se ejecutan con `sh` dentro de contenedores Linux: un CRLF rompe el shebang,
+# `set -eu` y las comparaciones de magic bytes.
+*.sh text eol=lf
