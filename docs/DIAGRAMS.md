@@ -41,8 +41,8 @@ Generado a partir del código fuente actual (`src/`), el `Cargo.toml`, `docker-c
 | Log del fallo de arranque | `tracing::error!` antes de `std::process::exit(1)` (`main.rs:121`) | idéntico; `RUST_STYLE_GUIDE.md:109` prohíbe `eprintln!` | Cerrado (slice C) |
 | Rango de variables de entorno | `parse_in_range` aborta si `LUA_TIMEOUT_MS` o `WEBHOOK_TIMEOUT_MS` salen de `1..=60000` (`main.rs:57`, `main.rs:61`) | la tabla § Validaciones completa (`MAX_*`, `PROXY_WORKER_THREADS`) | Cerrado para las dos variables **activas** del sandbox; cada `designada` se valida al cablearse |
 | Auditoría de rotación | `event = "crypt_id_rotated"` con `internal_id`, `old_crypt_id`, `new_crypt_id` | igual (BDD DoD 5) | Cerrado (slice C) |
-| Log de acceso | no se emite `request_completed`: el handler Axum no cierra cada request con el evento | `logging()` emite `request_completed` con `method`/`path`/`status`/`x_cache`/`elapsed_ms` | Bloqueado en Fase 3 |
-| `mime_discrepancy` | no se emite: `?mime=` se respeta sin comparar con el `Content-Type` real | WARN cuando difieren | Pendiente, junto con el paso de `Accept` |
+| Log de acceso | el wrapper Axum emite `request_completed` con `method`/`path`/`status`/`x_cache`/`elapsed_ms` | `logging()` emite el mismo evento dentro del span del request | Cerrado en Axum; la paridad con `logging()` queda en Fase 3 |
+| `mime_discrepancy` | se emite WARN al comparar `?mime=` con el `Content-Type` real (origen y caché) | WARN cuando difieren | Cerrado |
 
 
 ---

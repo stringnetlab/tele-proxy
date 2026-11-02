@@ -255,10 +255,11 @@ Feature: Respuestas de Error Consistentes
     And debe registrar un log WARN con "event": "mime_discrepancy"
 ```
 
-> **Estado de `mime_discrepancy`**: es un requisito de especificación todavía no implementado en el
-> handler. El comportamiento de las dos primeras líneas (respetar el `Content-Type` real del origen e
-> inyectar `nosniff`) sí está vigente; falta el log WARN. Hay que cerrar las dos cosas en la misma
-> fase para que este escenario pase.
+> **Estado de `mime_discrepancy`**: implementado en el handler Axum. La respuesta conserva el
+> `Content-Type` real del origen e inyecta `nosniff`; cuando `?mime=` difiere (ignorando
+> parámetros y mayúsculas) se emite el WARN con `crypt_id`, `forced_mime` y `real_mime`, tanto
+> al procesar la respuesta del origen como al servir un acierto de caché. El escenario ya no
+> está `@pending`.
 
 ## Feature 6: API de Control y Auditoría (`/api/v1/`)
 

@@ -128,9 +128,9 @@ Conviven en `tracing` con los códigos anteriores y usan el mismo contrato de `e
 
 | `event`               | Nivel | Cuándo                                                        | Campos                          | Estado |
 | --------------------- | ----- | ------------------------------------------------------------- | ------------------------------- | ------ |
-| `request_completed`   | INFO  | `logging()` al terminar cada request del proxy                 | `method`, `path`, `status`, `x_cache`, `elapsed_ms` | pendiente — call site en Fase 3 |
+| `request_completed`   | INFO  | Al terminar cada request de `/aq/`                             | `method`, `path`, `status`, `x_cache`, `elapsed_ms` | **emitido** — `interfaces/proxy_handler.rs::proxy_handler` (wrapper Axum); el callback `logging()` de Pingora sigue en Fase 3 |
 | `rate_limit_degraded` | WARN  | Valkey indisponible; decide el contador en-proceso `LocalRateLimiter`  | `crypt_id`, `limit`, `window_seconds` | **emitido** — `infrastructure/valkey_cache.rs` |
-| `mime_discrepancy`    | WARN  | `?mime=` forzado difiere del `Content-Type` real del origen     | `crypt_id`, `forced_mime`, `real_mime` | pendiente — `?mime=` se aplica sin comparar |
+| `mime_discrepancy`    | WARN  | `?mime=` forzado difiere del `Content-Type` real del origen     | `crypt_id`, `forced_mime`, `real_mime` | **emitido** — `interfaces/proxy_handler.rs::log_mime_discrepancy` (respuesta del origen y aciertos de caché) |
 | `invalid_config`      | WARN  | `PUT /api/v1/clients/config` fuera de cota, con dominios prohibidos o con un hash fuera de formato | `internal_id`†, `field`, `reason` | **emitido** — vía `log_domain_error` |
 | `crypt_id_rotated`    | INFO  | Rotación de `crypt_id` consumada                               | `internal_id`, `old_crypt_id`, `new_crypt_id` | **emitido** — `infrastructure/couchdb_repo.rs`, en `rotate_crypt_id` |
 
@@ -743,8 +743,8 @@ Verificadas leyendo `src/domain/errors.rs` y `src/interfaces/control_api.rs`; ca
 | - | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------ |
 | 6 | no hay mapeo a `BError`                                                                        | `impl From<ProxyError> for BError` en `application/proxy_service.rs`                          | Fase 3 (`src/` aún no importa `pingora`) |
 | 7 | los 4xx del proxy los produce el handler Axum (`interfaces/proxy_handler.rs`), que bufferiza el cuerpo | short-circuit en `request_filter` + `write_json_error`                                   | Fase 3        |
-| 8 | no existe un punto que emita `request_completed` al cerrar cada request | `logging()` emite el evento INFO con `method`/`path`/`status`/`x_cache`/`elapsed_ms` (BDD DoD 5)  | Fase 3        |
-| 9 | `?mime=` se aplica sin comparar con el `Content-Type` recibido                     | WARN `mime_discrepancy` con `forced_mime` y `real_mime` cuando difieran                           | sin bloqueo   |
+| 8 | el handler Axum emite `request_completed`; el motor Pingora aún no tiene el callback `logging()` | `logging()` emite el evento INFO con `method`/`path`/`status`/`x_cache`/`elapsed_ms` (BDD DoD 5)  | Fase 3 (solo la paridad Pingora) |
+| 9 | ~~`?mime=` se aplica sin comparar con el `Content-Type` recibido~~ → **cerrado** | WARN `mime_discrepancy` con `forced_mime` y `real_mime` cuando difieran                           | — |
 
 ### Dónde se equivocaba este documento
 
