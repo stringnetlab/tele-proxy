@@ -225,7 +225,7 @@ Headers relevantes de la respuesta:
 |---|---|---|
 | `X-Cache` | `HIT` / `MISS` / `FALLBACK` / `BYPASS` | Estado de la caché para esta respuesta |
 | `X-Content-Type-Options` | `nosniff` | Protección MIME fija |
-| `X-Proxy-By` | `tele.velone.ai` | Identificación del proxy |
+| `X-Proxy-By` | `teleproxy.velone.ai` | Identificación del proxy |
 | `X-Degraded-Mode` | `true` | El modo degradado está activo (CouchDB o Valkey caído; rate limit por proceso) |
 | `Retry-After` | segundos | Con `429 Too Many Requests`: espera antes de reintentar |
 
