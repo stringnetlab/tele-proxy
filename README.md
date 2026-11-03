@@ -8,6 +8,10 @@ y scripting con Lua sandboxed por cliente.
 
 **Dominio de referencia de despliegue**: `https://teleproxy.velone.ai`
 
+**Panel de administración**: `https://admteleproxy.velone.ai` — aplicación Nette server-rendered
+que actúa como BFF con login exclusivo por Google OAuth; el navegador nunca llama al API de
+control y la cookie de sesión del API no sale del servidor. Ver `docs/SPEC_ADMIN_UI.md`.
+
 > **Estado del proyecto**: las Fases 1 y 2 (cimientos DDD y seguridad DNS anti-SSRF) están
 > completas. El motor de proxy se está portando de Axum+`reqwest` a Pingora (Fase 3, en curso);
 > hoy `/aq/` lo sirve el handler Axum con el mismo contrato de seguridad. Ver
@@ -111,12 +115,13 @@ src/
     └── control_api.rs       # API de control /api/v1/ (auth Bearer)
 ```
 
-### Modelo de seguridad de dos niveles
+### Modelo de seguridad de tres niveles
 
 | Nivel | Ruta | Auth | Protección |
 |---|---|---|---|
 | Público | `GET /aq/<crypt_id>/?url=...` | No | Whitelist + rate limit + anti-SSRF. `crypt_id` es un nanoid de 12 caracteres, rotable. |
-| Control | `/api/v1/*` | Bearer (hash SHA-256 contra CouchDB) | Solo loopback en el compose (`127.0.0.1:8081`). Un token solo ve su propio cliente. |
+| Control de cliente | `/api/v1/clients/*` | Bearer (hash SHA-256 contra CouchDB) | Un token solo ve su propio cliente. En el compose, el puerto de control se publica solo en loopback (`127.0.0.1:8081`). |
+| Control de administración | `/api/v1/admin/*` | Cookie `teleproxy_admin` de una sesión Google + `X-Admin-UI` | Solo lo consume el panel (BFF) server-side; las mutaciones sin `X-Admin-UI` se rechazan. El panel no ofrece login por token. |
 
 ### Flujo de una petición `/aq/`
 
@@ -466,7 +471,12 @@ configuración.
 
 ## API de control
 
-Autenticación: `Authorization: Bearer <token>` en todos los endpoints. El token se hashea
+El mismo binario expone dos superficies de administración en el puerto de control: la API de
+cliente (Bearer token) y la API de administración global (sesión Google del panel).
+
+### API de cliente
+
+Autenticación: `Authorization: Bearer <token>`. El token se hashea
 con SHA-256 y se busca en CouchDB (view `by_token_hash`); cada token solo accede a su propio
 `internal_id`. En el compose, el puerto 8081 se publica **solo en loopback** — es un endpoint
 de administración.
@@ -480,8 +490,32 @@ Base URL en producción: `http://127.0.0.1:8081` (o túnel SSH al servidor).
 | `POST` | `/api/v1/clients/rotate-id` | Rota el `crypt_id` (genera uno nuevo y devuelve el anterior inmediatamente útil para migración) |
 | `GET` | `/health` | Healthcheck: `200 OK` |
 
-> No existe `POST /api/v1/clients`: el aprovisionamiento de clientes nuevos se hace fuera de
-> este servicio (directamente en CouchDB).
+> No existe `POST /api/v1/clients` en la API de cliente: el alta se hace desde el panel vía
+> `/api/v1/admin/clients` (o directamente contra la API de administración en automatizaciones).
+
+### API de administración
+
+Consumida por el panel `admin-teleproxy` (BFF) **server-side**; el navegador no la llama.
+Autenticación con la cookie `teleproxy_admin` de una sesión Google, más `X-Admin-UI: 1` en
+todas las peticiones (CSRF por header en las mutaciones). El login del panel es exclusivamente
+Google OAuth.
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `GET` | `/api/v1/admin/auth/google/url` | URL de autorización de Google (state de un solo uso) |
+| `GET` | `/api/v1/admin/auth/google/callback` | Canje del `code` y alta de la sesión |
+| `POST` | `/api/v1/admin/auth/logout` | Cierre de sesión |
+| `GET` | `/api/v1/admin/me` | Identidad del administrador |
+| `GET` / `POST` | `/api/v1/admin/admins` | Listado y alta de administradores |
+| `PATCH` / `DELETE` | `/api/v1/admin/admins/{email}` | Activar/desactivar y baja |
+| `GET` / `POST` | `/api/v1/admin/clients` | Listado paginado y alta |
+| `GET` / `PATCH` / `DELETE` | `/api/v1/admin/clients/{id}` | Detalle, edición y baja |
+| `POST` | `/api/v1/admin/clients/{id}/rotate-token` | Rotar bearer token (se entrega una sola vez) |
+| `POST` | `/api/v1/admin/clients/{id}/rotate-id` | Rotar `crypt_id` |
+| `GET` / `PATCH` | `/api/v1/admin/settings` | Ajustes globales en caliente |
+
+Detalle funcional y modelo de sesión del panel: `docs/SPEC_ADMIN_UI.md`. Contrato canónico:
+`docs/api_contract.yaml`.
 
 ### Ejemplos
 
@@ -725,6 +759,7 @@ degradan al body original en lugar de romper la respuesta.
 | `docs/BDD.md` + `specs/*.feature` | Escenarios de comportamiento (Gherkin) |
 | `docs/RUST_STYLE_GUIDE.md` | Convenciones de código Rust del proyecto |
 | `docs/api_contract.yaml` | Contrato OpenAPI de la API de control |
+| `docs/SPEC_ADMIN_UI.md` | Especificación del panel de administración (Nette BFF, login Google, sesión y seguridad) |
 | `docs/PLAN_MICROLINK.md` | Plan de mejoras derivado del análisis de html-get, browserless, metascraper y skills |
 | `docs/PLAN_PREVIEW.md` | Plan de la API de preview (`/pv/`): metadatos, OpenGraph, oEmbed, contenido, screenshot y PDF |
 | `config/dns_resolvers.json` | Cadena de resolvedores DoT compilada en el binario |
